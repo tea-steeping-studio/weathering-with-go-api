@@ -22,20 +22,22 @@ type Location struct {
 
 // Current represents current weather conditions
 type Current struct {
-	Temperature   float64   `json:"temperature"`
-	FeelsLike     float64   `json:"feels_like"`
-	Humidity      int       `json:"humidity"`
-	Pressure      float64   `json:"pressure"`
-	Visibility    float64   `json:"visibility"`
-	WindSpeed     float64   `json:"wind_speed"`
-	WindDirection int       `json:"wind_direction"`
-	WindGust      float64   `json:"wind_gust,omitempty"`
-	Condition     string    `json:"condition"`
-	Description   string    `json:"description"`
-	Icon          string    `json:"icon"`
-	UVIndex       float64   `json:"uv_index"`
-	CloudCover    int       `json:"cloud_cover"`
-	LastUpdated   time.Time `json:"last_updated"`
+	Temperature   float64 `json:"temperature"`
+	FeelsLike     float64 `json:"feels_like"`
+	Humidity      int     `json:"humidity"`
+	Pressure      float64 `json:"pressure"`
+	Visibility    float64 `json:"visibility"`
+	WindSpeed     float64 `json:"wind_speed"`
+	WindDirection int     `json:"wind_direction"`
+	WindGust      float64 `json:"wind_gust,omitempty"`
+	Condition     string  `json:"condition"`
+	Description   string  `json:"description"`
+	Icon          string  `json:"icon"`
+	// UVIndex       float64   `json:"uv_index"`
+	MaxTemp     float64   `json:"max_temperature"`
+	MinTemp     float64   `json:"min_temperature"`
+	CloudCover  int       `json:"cloud_cover"`
+	LastUpdated time.Time `json:"last_updated"`
 }
 
 // Forecast represents weather forecast for a specific day

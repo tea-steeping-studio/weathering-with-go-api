@@ -154,6 +154,7 @@ func (w *WeatherService) convertCurrentWeatherResponse(owm models.OpenWeatherMap
 			WindSpeed:     owm.Wind.Speed,
 			WindDirection: owm.Wind.Deg,
 			WindGust:      owm.Wind.Gust,
+			Visibility:    float64(owm.Visibility),
 			Condition:     condition,
 			Description:   strings.Title(description),
 			Icon:          icon,

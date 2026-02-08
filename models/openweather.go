@@ -2,19 +2,20 @@ package models
 
 // OpenWeatherMapResponse represents the response from OpenWeatherMap API
 type OpenWeatherMapResponse struct {
-	Coord   Coordinates `json:"coord"`
-	Weather []Weather   `json:"weather"`
-	Base    string      `json:"base"`
-	Main    Main        `json:"main"`
-	Wind    Wind        `json:"wind"`
-	Clouds  Clouds      `json:"clouds"`
-	Rain    Rain        `json:"rain,omitempty"`
-	Snow    Snow        `json:"snow,omitempty"`
-	Dt      int64       `json:"dt"`
-	Sys     Sys         `json:"sys"`
-	ID      int         `json:"id"`
-	Name    string      `json:"name"`
-	Cod     int         `json:"cod"`
+	Coord      Coordinates `json:"coord"`
+	Weather    []Weather   `json:"weather"`
+	Base       string      `json:"base"`
+	Main       Main        `json:"main"`
+	Visibility int         `json:"visibility"`
+	Wind       Wind        `json:"wind"`
+	Clouds     Clouds      `json:"clouds"`
+	Rain       Rain        `json:"rain,omitempty"`
+	Snow       Snow        `json:"snow,omitempty"`
+	Dt         int64       `json:"dt"`
+	Sys        Sys         `json:"sys"`
+	ID         int         `json:"id"`
+	Name       string      `json:"name"`
+	Cod        int         `json:"cod"`
 }
 
 // Coordinates represents geographical coordinates
@@ -87,15 +88,15 @@ type OpenWeatherMapForecastResponse struct {
 
 // ForecastItem represents a single forecast item
 type ForecastItem struct {
-	Dt      int64   `json:"dt"`
-	Main    Main    `json:"main"`
-	Weather []Weather `json:"weather"`
-	Clouds  Clouds  `json:"clouds"`
-	Wind    Wind    `json:"wind"`
-	Rain    Rain    `json:"rain,omitempty"`
-	Snow    Snow    `json:"snow,omitempty"`
+	Dt      int64       `json:"dt"`
+	Main    Main        `json:"main"`
+	Weather []Weather   `json:"weather"`
+	Clouds  Clouds      `json:"clouds"`
+	Wind    Wind        `json:"wind"`
+	Rain    Rain        `json:"rain,omitempty"`
+	Snow    Snow        `json:"snow,omitempty"`
 	Sys     ForecastSys `json:"sys"`
-	DtTxt   string  `json:"dt_txt"`
+	DtTxt   string      `json:"dt_txt"`
 }
 
 // ForecastSys represents forecast system information
@@ -113,3 +114,4 @@ type City struct {
 	Sunrise  int64       `json:"sunrise"`
 	Sunset   int64       `json:"sunset"`
 }
+
