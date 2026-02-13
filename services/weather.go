@@ -84,7 +84,7 @@ func (w *WeatherService) GetCurrentWeather(location, units string, apikey string
 }
 
 // GetWeatherForecast fetches weather forecast data for a given location
-func (w *WeatherService) GetWeatherForecast(location, units string, days int) (*models.WeatherData, error) {
+func (w *WeatherService) GetWeatherForecast(location, units string, days int, apikey string) (*models.WeatherData, error) {
 	if location == "" {
 		return nil, fmt.Errorf("location cannot be empty")
 	}
@@ -101,7 +101,11 @@ func (w *WeatherService) GetWeatherForecast(location, units string, days int) (*
 	endpoint := fmt.Sprintf("%s%s", OpenWeatherMapBaseURL, ForecastEndpoint)
 	params := url.Values{}
 	params.Add("q", location)
-	params.Add("appid", w.APIKey)
+	if apikey == "" {
+		params.Add("appid", w.APIKey)
+	} else {
+		params.Add("appid", apikey)
+	}
 	params.Add("units", units)
 
 	fullURL := fmt.Sprintf("%s?%s", endpoint, params.Encode())

@@ -32,6 +32,6 @@ func TestValidateMissingAPIKey(t *testing.T) {
 	t.Setenv("OPENWEATHERMAP_API_KEY", "")
 	cfg := Load()
 	if err := cfg.Validate(); err == nil {
-		t.Fatalf("expected Validate to fail without API key")
+		t.Fatalf("expected Validate to warn about missing API key")
 	}
 }

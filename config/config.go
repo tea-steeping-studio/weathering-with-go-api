@@ -31,7 +31,9 @@ func Load() *Config {
 	if apiKey == "" && BuildTimeAPIKey != "" {
 		apiKey = BuildTimeAPIKey
 	}
-	log.Print("====> current api key is: [" + apiKey + "]")
+	if apiKey != "" {
+		log.Print("====> current api key is: [" + apiKey + "]")
+	}
 
 	if Environment == "" {
 		Environment = getEnv("ENVIRONMENT", "development")
@@ -55,7 +57,7 @@ func (c *Config) Validate() error {
 	if c.OpenWeatherMapAPIKey == "" {
 		return &ConfigError{
 			Field:   "OPENWEATHERMAP_API_KEY",
-			Message: "OpenWeatherMap API key is required. Get one at https://openweathermap.org/api",
+			Message: "OpenWeatherMap API key is required unless provided per request",
 		}
 	}
 

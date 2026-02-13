@@ -37,7 +37,10 @@ func (h *WeatherHandler) GetCurrentWeather(c *gin.Context) {
 		return
 	}
 
-	apikey := c.DefaultQuery("key", "")
+	apikey := c.GetHeader("X-API-Key")
+	if apikey == "" {
+		apikey = c.DefaultQuery("key", "")
+	}
 
 	weatherData, err := h.weatherService.GetCurrentWeather(location, units, apikey)
 	if err != nil {
@@ -74,7 +77,12 @@ func (h *WeatherHandler) GetWeatherForecast(c *gin.Context) {
 		return
 	}
 
-	weatherData, err := h.weatherService.GetWeatherForecast(location, units, days)
+	apikey := c.GetHeader("X-API-Key")
+	if apikey == "" {
+		apikey = c.DefaultQuery("key", "")
+	}
+
+	weatherData, err := h.weatherService.GetWeatherForecast(location, units, days, apikey)
 	if err != nil {
 		utils.SendError(c, utils.HandleWeatherAPIError(err))
 		return
@@ -106,9 +114,11 @@ func (h *WeatherHandler) PostCurrentWeather(c *gin.Context) {
 		return
 	}
 
-	keys := req.Keys
+	if req.Keys == "" {
+		req.Keys = c.GetHeader("X-API-Key")
+	}
 
-	weatherData, err := h.weatherService.GetCurrentWeather(req.Location, units, keys)
+	weatherData, err := h.weatherService.GetCurrentWeather(req.Location, units, req.Keys)
 	if err != nil {
 		utils.SendError(c, utils.HandleWeatherAPIError(err))
 		return
@@ -150,7 +160,11 @@ func (h *WeatherHandler) PostWeatherForecast(c *gin.Context) {
 		return
 	}
 
-	weatherData, err := h.weatherService.GetWeatherForecast(req.Location, units, days)
+	if req.Keys == "" {
+		req.Keys = c.GetHeader("X-API-Key")
+	}
+
+	weatherData, err := h.weatherService.GetWeatherForecast(req.Location, units, days, req.Keys)
 	if err != nil {
 		utils.SendError(c, utils.HandleWeatherAPIError(err))
 		return

@@ -17,7 +17,7 @@ func main() {
 
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
-		log.Fatalf("Configuration error: %v", err)
+		log.Printf("Configuration warning: %v", err)
 	}
 
 	// Set gin mode based on environment
