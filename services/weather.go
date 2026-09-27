@@ -906,6 +906,11 @@ func mapForecastSlot(item models.ForecastItem, presence models.ForecastPayloadIt
 			Humidity:  &humidity,
 			SeaLevel:  presence.Main.SeaLevel,
 			GrndLevel: presence.Main.GrndLevel,
+			// temp_kf is documented on this endpoint's slots and was suppressed for a
+			// long time on a false claim that it was not, so a slot that reports one
+			// carries it and a slot that reports none is null rather than a permanent
+			// null either way.
+			TempKF: presence.Main.TempKF,
 		}
 	}
 
@@ -929,9 +934,11 @@ func mapForecastSlot(item models.ForecastItem, presence models.ForecastPayloadIt
 	if presence.Snow != nil {
 		slot.Snow = &models.ForecastSnowBlock{ThreeHour: presence.Snow.ThreeHour}
 	}
+	// pod is a pointer, so a body of "sys":{} reports a block with a null pod rather
+	// than a fabricated empty string, which is the same rule the condition, description
+	// and icon members were converted to null for.
 	if presence.Sys != nil {
-		sys := item.Sys
-		slot.Sys = &sys
+		slot.Sys = &models.ForecastSlotSys{Pod: presence.Sys.Pod}
 	}
 
 	return slot

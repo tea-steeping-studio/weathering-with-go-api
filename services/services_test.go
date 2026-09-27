@@ -1014,13 +1014,13 @@ func TestForecastDayPartialMainBlockReportsZeroForTheMembersItLacks(t *testing.T
 			t.Fatalf("expected a fabricated 0 for the missing slot main.%s, got %v", name, *got)
 		}
 	}
-	// The members this endpoint does not document are a different case and stay null:
-	// temp_kf is not documented for a three hour slot, and sea_level and grnd_level come
-	// only from points near sea level or the ground. Their null is a statement about the
-	// schema rather than about this body, which is the opposite of the five zeroes above
-	// and the reason the two are not treated alike.
+	// temp_kf, sea_level and grnd_level are the members the fixture's main block did
+	// not carry, so they are null, which is the same statement as the five zeroes above
+	// rather than the opposite of it: the block is there and those three readings are
+	// not. The other two are a different case and would be null for a body that sent
+	// them: they come only from points near sea level or the ground.
 	if slot.Main.TempKF != nil {
-		t.Fatalf("expected a null temp_kf, which this endpoint does not document for a slot, got %v", *slot.Main.TempKF)
+		t.Fatalf("expected a null temp_kf, which this main block did not carry, got %v", *slot.Main.TempKF)
 	}
 	if slot.Main.SeaLevel != nil || slot.Main.GrndLevel != nil {
 		t.Fatalf("expected null sea_level and grnd_level for a body that sent none, got %v and %v",
@@ -1300,6 +1300,139 @@ func TestCurrentFromForecastNullsTheLegacyBlockBesideAnAbsentUpstreamBlock(t *te
 	requireInt(t, "the humidity on a complete slot", reported.Current.Humidity, 70)
 	requireFloat(t, "the wind speed on a complete slot", reported.Current.WindSpeed, 5.0)
 	requireInt(t, "the cloud cover on a complete slot", reported.Current.CloudCover, 80)
+}
+
+// temp_kf is documented on this endpoint's slots, and the route suppressed it for the
+// whole life of the branch on an allowlist entry claiming the opposite. A slot that
+// reports a factor has to carry it, and a slot that reports none has to be null rather
+// than a permanent null either way: those are the two states the field was missing.
+//
+// The measured zero is here on purpose. 0 is a real factor, and a mapper that read the
+// decode struct's zero for a slot that sent nothing would report 0 for both cases and
+// the second would pass.
+func TestForecastSlotCarriesTheKelvinFactorTheUpstreamSent(t *testing.T) {
+	slotWith := func(tempKF any) string {
+		main := map[string]any{"temp": 18.0, "pressure": 1012, "humidity": 70}
+		if tempKF != nil {
+			main["temp_kf"] = tempKF
+		}
+		return mustSlotJSON(t, map[string]any{
+			"dt":      1772000000,
+			"main":    main,
+			"weather": []any{map[string]any{"main": "Rain", "description": "light rain", "icon": "10d"}},
+			"clouds":  map[string]any{"all": 80},
+			"wind":    map[string]any{"speed": 5.0, "deg": 90},
+		})
+	}
+
+	reported := mapForecastBody(t, forecastBody(t, slotWith(0.42)), 5)
+	main := reported.Forecast[0].Hourly[0].Main
+	if main == nil {
+		t.Fatal("expected the main block the upstream did send to be reported on the slot")
+	}
+	requireFloat(t, "the slot temp_kf", main.TempKF, 0.42)
+
+	// A measured 0 is a reading, and a non-nil pointer to zero is what says so.
+	zero := mapForecastBody(t, forecastBody(t, slotWith(0)), 5)
+	if main := zero.Forecast[0].Hourly[0].Main; main == nil || main.TempKF == nil {
+		t.Fatalf("expected a measured 0 temp_kf to serialise as 0, got %#v", main)
+	} else if *main.TempKF != 0 {
+		t.Fatalf("expected a measured 0 temp_kf to serialise as 0, got %v", *main.TempKF)
+	}
+
+	// The upstream sent no factor, so the member is null. The key is still there: a
+	// dropped key would answer a different question than a null one.
+	absent := mapForecastBody(t, forecastBody(t, slotWith(nil)), 5)
+	main = absent.Forecast[0].Hourly[0].Main
+	if main == nil {
+		t.Fatal("expected the main block the upstream did send to be reported on the slot")
+	}
+	if main.TempKF != nil {
+		t.Fatalf("expected a null temp_kf for a slot that sent none, got %v", *main.TempKF)
+	}
+	// On the wire the key is there and says null. Present matters as much as null:
+	// a dropped key would answer a different question, and this route drops keys only
+	// where the endpoint does not document the member.
+	rendered, err := json.Marshal(absent.Forecast[0].Hourly[0].Main)
+	if err != nil {
+		t.Fatalf("failed to render the slot main block: %v", err)
+	}
+	var block map[string]any
+	if err := json.Unmarshal(rendered, &block); err != nil {
+		t.Fatalf("failed to decode the rendered slot main block: %v", err)
+	}
+	if value, present := block["temp_kf"]; !present {
+		t.Fatalf("expected a temp_kf key on the slot main block, got %v", block)
+	} else if value != nil {
+		t.Fatalf("expected the slot temp_kf key to be null, got %#v", value)
+	}
+}
+
+// pod is the last member of this response family that reported "" where it meant "the
+// upstream sent the block with no value in it". A body of "sys":{} is a slot whose
+// sys block is there and whose pod nobody measured, and as a plain string it came back
+// as "". This is the rule the condition, description and icon members were already
+// converted to null for, on the same upstream block.
+//
+// The three states stay three: no sys block at all is a null block, an empty block is a
+// block of nulls, and a pod is a pod.
+func TestForecastSlotSysReportsAnEmptyBlockAsNullPod(t *testing.T) {
+	slotWith := func(sys map[string]any) string {
+		slot := map[string]any{
+			"dt":      1772000000,
+			"main":    map[string]any{"temp": 18.0, "pressure": 1012, "humidity": 70},
+			"weather": []any{map[string]any{"main": "Rain", "description": "light rain", "icon": "10d"}},
+			"clouds":  map[string]any{"all": 80},
+			"wind":    map[string]any{"speed": 5.0, "deg": 90},
+		}
+		if sys != nil {
+			slot["sys"] = sys
+		}
+		return mustSlotJSON(t, slot)
+	}
+
+	// The ordinary case: a pod is a pod.
+	reported := mapForecastBody(t, forecastBody(t, slotWith(map[string]any{"pod": "d"})), 5)
+	if sys := reported.Forecast[0].Hourly[0].Sys; sys == nil {
+		t.Fatal("expected the sys block the upstream did send to be reported on the slot")
+	} else if sys.Pod == nil || *sys.Pod != "d" {
+		t.Fatalf("expected the slot pod d, got %v", sys.Pod)
+	}
+
+	// The empty string is a real reading and stays it: a measured "" is not the same
+	// statement as no measurement, and taking the decode field's address here would
+	// have thrown this case away along with the one above.
+	empty := mapForecastBody(t, forecastBody(t, slotWith(map[string]any{"pod": ""})), 5)
+	if sys := empty.Forecast[0].Hourly[0].Sys; sys == nil || sys.Pod == nil {
+		t.Fatalf("expected a measured empty pod to serialise as \"\", got %#v", sys)
+	} else if *sys.Pod != "" {
+		t.Fatalf("expected a measured empty pod to serialise as \"\", got %q", *sys.Pod)
+	}
+
+	// The upstream sent a sys block with no pod in it. The block is there, so it is
+	// reported, and its one member is null rather than a fabricated empty string.
+	absent := mapForecastBody(t, forecastBody(t, slotWith(map[string]any{})), 5)
+	sys := absent.Forecast[0].Hourly[0].Sys
+	if sys == nil {
+		t.Fatal("expected a sys block for a slot the upstream sent one for, got null")
+	}
+	if sys.Pod != nil {
+		t.Fatalf("expected a null pod for an empty sys block, got %q", *sys.Pod)
+	}
+	rendered, err := json.Marshal(sys)
+	if err != nil {
+		t.Fatalf("failed to render the slot sys block: %v", err)
+	}
+	if !strings.Contains(string(rendered), `"pod":null`) {
+		t.Fatalf("expected a null pod key in %s", rendered)
+	}
+
+	// No sys block at all is the third state, and it is a null block rather than a
+	// block of nulls.
+	none := mapForecastBody(t, forecastBody(t, slotWith(nil)), 5)
+	if sys := none.Forecast[0].Hourly[0].Sys; sys != nil {
+		t.Fatalf("expected no sys block for a slot that sent none, got %#v", sys)
+	}
 }
 
 // The mapper is handed a payload shorter than the upstream list, which cannot

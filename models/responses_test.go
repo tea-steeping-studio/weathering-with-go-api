@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // jsonMemberPaths returns every JSON member name of a decode struct, with nested
@@ -58,14 +59,44 @@ func jsonMemberName(field reflect.StructField) string {
 // jsonMemberStruct unwraps a pointer to a struct that has JSON members of its own
 // and reports it as one. Everything else, including an empty struct used to mark a
 // block that is only tracked for presence, is a leaf.
+//
+// time.Time is a leaf by name rather than by shape. It is a struct with eleven exported
+// members, so the walk would descend into it and report loc, wall and the rest as if a
+// body carried them, but it marshals as a single RFC3339 string and carries no JSON
+// member of its own at all.
 func jsonMemberStruct(t reflect.Type) (reflect.Type, bool) {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
+	}
+	if t == timeType {
+		return nil, false
 	}
 	if t.Kind() != reflect.Struct || t.NumField() == 0 {
 		return nil, false
 	}
 	return t, true
+}
+
+// timeType is the one struct that is a leaf by name. See jsonMemberStruct.
+var timeType = reflect.TypeOf(time.Time{})
+
+// withoutLegacyVocabulary removes from a walk the members that are this project's own
+// vocabulary rather than names the upstream sends. The legacy blocks are siblings of
+// the faithful mirror inside one response struct, so a walk of the whole struct picks
+// them up and the "invented a name" check would fail on every one of them.
+//
+// It is a named list rather than a rule, because the legacy vocabulary is exactly a
+// list and a member added to it has to be added here too: that is the point of naming
+// it, the same as naming the allowlist entries above.
+func withoutLegacyVocabulary(paths map[string]bool) {
+	for prefix, vocabulary := range map[string]reflect.Type{
+		"location": reflect.TypeOf(Location{}),
+		"current":  reflect.TypeOf(Current{}),
+	} {
+		for name := range jsonMemberPaths(vocabulary) {
+			delete(paths, prefix+"."+name)
+		}
+	}
 }
 
 // A member added to the upstream decode struct and not to the pointer-shaped
@@ -201,10 +232,10 @@ func TestForecastPayloadCoversDecodedFields(t *testing.T) {
 			strings.Join(uncovered, ", "))
 	}
 
-	// The payload must not invent a name the upstream never sends. Three are
-	// deliberate: city, clouds and sys are tracked for presence, and the walk
+	// The payload must not invent a name the upstream never sends. Two are
+	// deliberate: city and clouds are tracked for presence, and the walk
 	// reports the upstream block as its members rather than as a member of its own.
-	for _, name := range []string{"city", "list.clouds", "list.sys"} {
+	for _, name := range []string{"city", "list.clouds"} {
 		delete(payload, name)
 	}
 	var invented []string
@@ -216,6 +247,173 @@ func TestForecastPayloadCoversDecodedFields(t *testing.T) {
 	sort.Strings(invented)
 	if len(invented) > 0 {
 		t.Errorf("ForecastPayload declares members the upstream never sends: %s", strings.Join(invented, ", "))
+	}
+}
+
+// The payload guard above is not enough, and its own error message is why. A member
+// added to the upstream struct and allowlisted rather than declared leaves the payload
+// check green, and the response then drops the member silently: the guard says "add it
+// to ForecastPayload", a developer adds it there, and hourly[] still has no such key.
+// This compares the faithful response body against the upstream, so a member that
+// reaches neither is named at the type that is missing it.
+//
+// The faithful body is ForecastResponse plus the members of one raw slot, because that
+// is where the upstream's list[] is reported: a walk of the response type alone treats
+// forecast[] as a leaf, and the slots are most of what this check is about. The slots
+// are collected under the upstream's own "list" prefix, since what is compared is one
+// slot's member list against the upstream's and not the path each is served at. The
+// day rollup is not walked at all: it is a derivation and reports no upstream name of
+// its own, so a walk of it would be entirely invented names.
+func TestForecastResponseCoversUpstreamMembers(t *testing.T) {
+	upstream := jsonMemberPaths(reflect.TypeOf(OpenWeatherMapForecastResponse{}))
+	collectJSONMemberPaths(reflect.TypeOf(ForecastItem{}), "list", upstream)
+	// The array itself is not a member of either body: the walk reports the upstream's
+	// list[] as the leaf "list" and the response's forecast[] as the leaf "forecast", so
+	// the two names are removed here and the members underneath are what is compared.
+	delete(upstream, "list")
+
+	response := jsonMemberPaths(reflect.TypeOf(ForecastResponse{}))
+	collectJSONMemberPaths(reflect.TypeOf(ForecastSlot{}), "list", response)
+	withoutLegacyVocabulary(response)
+	delete(response, "request_time")
+	// The day rollup, served at the key the walk reported as a leaf.
+	delete(response, "forecast")
+
+	if len(upstream) == 0 {
+		t.Fatal("the upstream walk found no members, so this check would pass on anything")
+	}
+	if len(response) == 0 {
+		t.Fatal("the response walk found no members, so this check would pass on anything")
+	}
+
+	var missing []string
+	for name := range upstream {
+		if response[name] || forecastPayloadNarrowed[name] != "" {
+			continue
+		}
+		missing = append(missing, name)
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Errorf("OpenWeatherMapForecastResponse declares members the faithful forecast body omits and the allowlist does not cover: %s\n"+
+			"add each one to the response type that reports it, or allowlist it with the reason it is deliberately narrower",
+			strings.Join(missing, ", "))
+	}
+
+	// Every allowlisted member is a claim about the response, and the two kinds of claim
+	// are opposite. An "always sent" entry says the response reports the member from
+	// the decode struct instead of from a presence view, so the response has to declare
+	// it; without that check, adding a member to the upstream struct and allowlisting it
+	// silences both guards at once and the response drops the member silently. A "not
+	// documented here" entry says the opposite: the endpoint has no such member, so the
+	// response omits the key, and a response that declared it would be inventing one.
+	var unbacked, overreported []string
+	for name, reason := range forecastPayloadNarrowed {
+		if reason == forecastNoHourWindow {
+			if response[name] {
+				overreported = append(overreported, name)
+			}
+			continue
+		}
+		if !response[name] {
+			unbacked = append(unbacked, name)
+		}
+	}
+	sort.Strings(unbacked)
+	if len(unbacked) > 0 {
+		t.Errorf("the allowlist claims the faithful forecast body reports these upstream members, and it does not: %s\n"+
+			"add each one to the response type that reports it, or drop the allowlist entry and declare it in the payload",
+			strings.Join(unbacked, ", "))
+	}
+	sort.Strings(overreported)
+	if len(overreported) > 0 {
+		t.Errorf("the allowlist says this endpoint does not document these members, and the faithful forecast body reports them anyway: %s\n"+
+			"drop each one from the response type, or declare the endpoint as documenting it and bind it in the payload",
+			strings.Join(overreported, ", "))
+	}
+
+	// The faithful body must not invent a name the upstream never sends. None are
+	// expected: every key in it is a key in the /data/2.5/forecast schema or a member
+	// of one of its blocks, which the walk reports as their members rather than as a
+	// block of its own.
+	var invented []string
+	for name := range response {
+		if !upstream[name] {
+			invented = append(invented, name)
+		}
+	}
+	sort.Strings(invented)
+	if len(invented) > 0 {
+		t.Errorf("the faithful forecast body declares members the upstream never sends: %s", strings.Join(invented, ", "))
+	}
+}
+
+// The same pair as the seven day route's two guards, on the current route. Both are
+// needed, and the payload guard's error message is the reason: a member added to the
+// upstream struct and allowlisted rather than declared leaves the payload check green
+// while the response drops the member. A member added to the payload and forgotten in
+// the response type is the same failure one step later along.
+func TestCurrentResponseCoversUpstreamMembers(t *testing.T) {
+	upstream := jsonMemberPaths(reflect.TypeOf(OpenWeatherMapResponse{}))
+	response := jsonMemberPaths(reflect.TypeOf(CurrentWeatherResponse{}))
+	withoutLegacyVocabulary(response)
+	delete(response, "request_time")
+	// timezone is bound by the payload and declared nowhere else: OpenWeatherMapResponse
+	// does not carry it because no legacy field is derived from it, and an unused decode
+	// field is worse than a missing one. The payload guard is what covers it.
+	delete(response, "timezone")
+
+	if len(upstream) == 0 {
+		t.Fatal("the upstream walk found no members, so this check would pass on anything")
+	}
+	if len(response) == 0 {
+		t.Fatal("the response walk found no members, so this check would pass on anything")
+	}
+
+	var missing []string
+	for name := range upstream {
+		if response[name] || currentPayloadNarrowed[name] != "" {
+			continue
+		}
+		missing = append(missing, name)
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Errorf("OpenWeatherMapResponse declares members the faithful current body omits and the allowlist does not cover: %s\n"+
+			"add each one to the response type that reports it, or allowlist it with the reason it is deliberately narrower",
+			strings.Join(missing, ", "))
+	}
+
+	// Every allowlisted member is a claim that the response reports it from the decode
+	// struct rather than from a presence view, so the response has to declare it. Both
+	// keys this route does not document are declared here, unlike the forecast route:
+	// the shared RainBlock and SnowBlock carry the 3h window with omitempty, so a nil
+	// pointer drops the key and a key that could only ever be null is never emitted.
+	var unbacked []string
+	for name := range currentPayloadNarrowed {
+		if !response[name] {
+			unbacked = append(unbacked, name)
+		}
+	}
+	sort.Strings(unbacked)
+	if len(unbacked) > 0 {
+		t.Errorf("the allowlist claims the faithful current body reports these upstream members, and it does not: %s\n"+
+			"add each one to the response type that reports it, or drop the allowlist entry and declare it in the payload",
+			strings.Join(unbacked, ", "))
+	}
+
+	// The faithful body must not invent a name the upstream never sends. None are
+	// expected once the legacy vocabulary is out of the way: every remaining key is a
+	// key in the /data/2.5/weather schema.
+	var invented []string
+	for name := range response {
+		if !upstream[name] {
+			invented = append(invented, name)
+		}
+	}
+	sort.Strings(invented)
+	if len(invented) > 0 {
+		t.Errorf("the faithful current body declares members the upstream never sends: %s", strings.Join(invented, ", "))
 	}
 }
 
@@ -233,15 +431,22 @@ const (
 	// forecastNoHourWindow names a member this endpoint does not document. The
 	// response omits the key entirely rather than reporting it null.
 	forecastNoHourWindow = "not documented for /data/2.5/forecast, which reports the 3h precipitation window only"
-	// forecastNoKelvinFactor names main.temp_kf, which the current weather endpoint
-	// documents and the three hour endpoint does not.
-	forecastNoKelvinFactor = "not documented for a /data/2.5/forecast slot, so the day and slot blocks report it as null"
 )
 
 // forecastPayloadNarrowed lists every JSON member OpenWeatherMapForecastResponse
 // declares that ForecastPayload deliberately does not, each with the reason. An
-// entry is a claim that the upstream always sends the member, so remove the entry
-// and let the test fail if that ever stops being true.
+// entry is a claim that the upstream always sends the member, so remove the entry and
+// let the test fail if that ever stops being true.
+//
+// There is no entry for list.main.temp_kf, and its absence is the point. It was
+// allowlisted with the reason "not documented for a /data/2.5/forecast slot, so the
+// day and slot blocks report it as null", which is false: the OpenWeatherMap
+// documentation for /data/2.5/forecast does document list.main.temp_kf. A false claim
+// in an allowlist is worse than no claim at all, because it silences the guard that
+// would have caught it and suppresses the field: every slot reported a permanent null
+// whatever the upstream sent. The member is declared in ForecastPayloadMain and read
+// by the slot mapper now, and this list carries only claims about members the upstream
+// is documented as sending.
 var forecastPayloadNarrowed = map[string]string{
 	"cod":             forecastEnvelopeSent,
 	"message":         forecastEnvelopeSent,
@@ -265,7 +470,6 @@ var forecastPayloadNarrowed = map[string]string{
 	"list.main.temp_max":   forecastSlotSent,
 	"list.main.pressure":   forecastSlotSent,
 	"list.main.humidity":   forecastSlotSent,
-	"list.main.temp_kf":    forecastNoKelvinFactor,
 	"list.clouds.all":      forecastSlotSent,
 	"list.wind.speed":      forecastSlotSent,
 	"list.wind.deg":        forecastSlotSent,
@@ -285,6 +489,7 @@ var forecastPayloadNarrowed = map[string]string{
 // now, so there is nothing left to allowlist on them: the payload is the full mirror
 // of every block the response reports, and the only remaining entries are claims
 // about members the upstream documents as unconditionally sent.
+//
 // oneCallUpstreamPaths is the full member list of the /data/3.0/onecall decode
 // struct, with the four arrays and the current block walked out into their members.
 // Both guards below start from it, so they cannot disagree about what the upstream

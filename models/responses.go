@@ -264,12 +264,6 @@ type FeelsLikePoint struct {
 // The members the upstream did not send are null, so a slot that measures a zero
 // and a slot that was never told about the quantity are different readings.
 //
-// Sys is the one place a response type here points at an upstream struct rather
-// than a pointer shaped one: pod is a string the endpoint sends whenever the sys
-// block is there, so the pointer on this field is the whole of the presence
-// signal, and a second pointer for a string the endpoint does document would add
-// nothing.
-//
 // Rain and Snow use the forecast precipitation types rather than the shared ones,
 // so the 1h window is absent here rather than null: this endpoint documents the
 // 3h window only, and a key it does not document carries no information. See
@@ -284,8 +278,21 @@ type ForecastSlot struct {
 	Pop        *float64           `json:"pop"`
 	Rain       *ForecastRainBlock `json:"rain"`
 	Snow       *ForecastSnowBlock `json:"snow"`
-	Sys        *ForecastSys       `json:"sys"`
+	Sys        *ForecastSlotSys   `json:"sys"`
 	DtTxt      string             `json:"dt_txt"`
+}
+
+// ForecastSlotSys is the sys block of a /data/2.5/forecast slot, which is a different
+// block from the /data/2.5/weather one and carries only pod.
+//
+// It used to be the upstream decode type, whose Pod is a plain string, and that made
+// pod the last member of this response family that reported "" where it meant "the
+// upstream sent the block without a value in it". A body of "sys":{} is not a slot
+// whose pod is the empty string. The pointer is the whole of the presence signal here,
+// and the outer pointer on ForecastSlot.Sys stays the signal that the block was there
+// at all, so the three states remain three: no block, a block of nulls, a pod.
+type ForecastSlotSys struct {
+	Pod *string `json:"pod"`
 }
 
 // ForecastDay is one entry of the forecast route's forecast[] array, in the
@@ -427,6 +434,14 @@ type ForecastResponse struct {
 // pop is treated as conditional because the endpoint does not send it on every
 // slot, and the daily rollup excludes the slots that carry none from pop, pop_min
 // and pop_mean alike.
+//
+// ForecastItem.Sys is read by nobody, for the reason models.Rain and models.Snow
+// are still decoded on the current route: the decode struct's job is to be a mirror
+// of the upstream schema, and a member dropped from it because no mapper wants it
+// would be a member the guards could no longer see. Its zero is also a real reading,
+// since the endpoint sends a pod whenever the sys block is there, so nothing in this
+// type could have done the job better. Do not read pod from it: a body of "sys":{}
+// decodes to an empty string there, which is a fabrication.
 type ForecastPayload struct {
 	// City carries no members on purpose. Every member the block reports is
 	// unconditionally sent, so the mapper reads those values from the upstream
@@ -437,31 +452,45 @@ type ForecastPayload struct {
 
 // ForecastPayloadItem is the presence view of one three hour slot. Its members are
 // the slots' conditional ones; dt, dt_txt, weather, the always sent members of
-// main, wind and clouds, and sys.pod are read from the upstream struct.
+// main, wind and clouds, and the always sent members of sys are read from the
+// upstream struct.
 type ForecastPayloadItem struct {
 	Main       *ForecastPayloadMain   `json:"main"`
 	Wind       *ForecastPayloadWind   `json:"wind"`
 	Clouds     *struct{}              `json:"clouds"`
 	Rain       *ForecastPayloadPrecip `json:"rain"`
 	Snow       *ForecastPayloadPrecip `json:"snow"`
-	Sys        *struct{}              `json:"sys"`
+	Sys        *ForecastPayloadSys    `json:"sys"`
 	Pop        *float64               `json:"pop"`
 	Visibility *int                   `json:"visibility"`
 }
 
 // ForecastPayloadMain holds the main block members of a slot that are conditional
 // rather than guaranteed: sea_level and grnd_level come only from points near sea
-// level or the ground. temp_kf is not declared here because /data/2.5/forecast does
-// not document it for a slot, so the response reports it null.
+// level or the ground, and temp_kf is not always sent.
+//
+// temp_kf was allowlisted here as a member the endpoint does not document, which is
+// not what the OpenWeatherMap documentation says: /data/2.5/forecast documents
+// list.main.temp_kf. The claim was false and it cost the field: every slot reported
+// a permanent null whatever the upstream sent. Declaring it is what lets a slot
+// report the real factor and null only when the upstream omitted it.
 type ForecastPayloadMain struct {
-	SeaLevel  *int `json:"sea_level"`
-	GrndLevel *int `json:"grnd_level"`
+	SeaLevel  *int     `json:"sea_level"`
+	GrndLevel *int     `json:"grnd_level"`
+	TempKF    *float64 `json:"temp_kf"`
 }
 
 // ForecastPayloadWind holds wind.gust on a slot, which some regions report and
 // others omit. speed and deg are read from the upstream struct.
 type ForecastPayloadWind struct {
 	Gust *float64 `json:"gust"`
+}
+
+// ForecastPayloadSys holds sys.pod, which the endpoint sends whenever the sys block
+// is there but is not guaranteed to be in it. A body of "sys":{} is a block the
+// upstream sent with no pod in it, which is not a pod of "".
+type ForecastPayloadSys struct {
+	Pod *string `json:"pod"`
 }
 
 // ForecastPayloadPrecip holds the 3h window both rain and snow report on this
