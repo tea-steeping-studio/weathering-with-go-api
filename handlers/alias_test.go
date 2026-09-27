@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -10,18 +11,22 @@ import (
 
 // forecastAliasJSON is the /data/2.5/forecast body the alias table reads the
 // forecast route from. It is a variant rather than the shared forecastJSON because
-// that fixture cannot make two of the four forecast rows observable: it carries no
+// that fixture cannot make three of the four forecast rows observable: it carries no
 // pop on either slot, so the day reports chance_of_rain and pop as null together and
 // the pair has no number to compare, and it carries rain on one slot and no snow at
 // all, so the day's snow is null and rain plus snow is not a sum of two numbers.
 //
 // The two slots here report different volumes of different things and different
 // probabilities, so the day reports both precipitation blocks as numbers and one
-// probability that is neither slot's. The probabilities are 0.25 and 0.5 because
-// those are values whose *100 is exact in binary floating point, so the percentage
-// the table derives by truncation is the percentage the mapper produced by rounding,
-// and the row tests the alias rather than the rounding rule. See aliasPercent for why
-// that is a limitation of the row rather than a strength of it.
+// probability that is neither slot's. The day's probability is the higher of the two,
+// so slot 0 carries 0.29 and slot 3 carries 0.12.
+//
+// 0.29 is the probability that makes the rounding row mean something. 0.29*100 is
+// 28.999999999999996 in binary floating point, so a mapper that truncates answers 28
+// for a day the upstream called 29 percent, and a mapper that rounds answers 29. A
+// probability whose percentage is exact in binary floating point, such as 0.25 or
+// 0.5, would let both rules through and the row would assert nothing about the
+// rounding at all. See aliasPercent.
 func forecastAliasJSON(t *testing.T) string {
 	t.Helper()
 	return forecastRouteBody(t,
@@ -31,7 +36,7 @@ func forecastAliasJSON(t *testing.T) string {
 			"clouds":  map[string]any{"all": 80},
 			"wind":    map[string]any{"speed": 5.0, "deg": 90},
 			"rain":    map[string]any{"3h": 1.2},
-			"pop":     0.25,
+			"pop":     0.29,
 		}),
 		forecastSlot(3, map[string]any{
 			"main":    map[string]any{"temp": 19.0, "feels_like": 18.0, "temp_min": 16.0, "temp_max": 22.0, "pressure": 1011, "humidity": 65},
@@ -39,7 +44,7 @@ func forecastAliasJSON(t *testing.T) string {
 			"clouds":  map[string]any{"all": 0},
 			"wind":    map[string]any{"speed": 3.0, "deg": 100},
 			"snow":    map[string]any{"3h": 0.8},
-			"pop":     0.5,
+			"pop":     0.12,
 		}),
 	)
 }
@@ -55,19 +60,21 @@ const (
 	// aliasSame is the plain case: the faithful value is the legacy value.
 	aliasSame aliasCombine = iota
 	// aliasPercent is a probability the legacy vocabulary reports as a whole
-	// percentage. The rule is written here the way the table writes it, as a
-	// truncation, and the fixture is built so the truncation and the mapper's
-	// rounding cannot differ.
+	// percentage, so the row compares that percentage against the faithful
+	// probability scaled the way the mapper scales it.
 	//
-	// That is a limitation of the row and worth stating plainly. Both mappers round
-	// rather than truncate, because 0.29 is 28.999999999999996 in binary floating
-	// point, so a plain int() call would answer 28 for a day the upstream called 29
-	// percent. A fixture carrying a probability whose percentage is not exactly
-	// representable would therefore fail this row for a reason that has nothing to do
-	// with the alias. The rule the mappers follow is math.Round and the row is worth
-	// restating in those terms; until it is, the probabilities in forecastAliasJSON
-	// and in the shared sevenDayJSON are chosen to keep the two rules
-	// indistinguishable.
+	// The rule is int(math.Round(pop*100)) and it has to be that, rounding and not
+	// truncation. Both mappers round, and the reason is the one this whole plan
+	// exists for: 0.29*100 is 28.999999999999996 in binary floating point, so a plain
+	// int() call answers 28 for a day the upstream called 29 percent. A percentage
+	// that is quietly wrong by one is the same class of defect as the permanent
+	// chance_of_rain of 0 this project was built to fix, and it is one nobody can see
+	// from the response.
+	//
+	// Both probability rows are therefore driven by a fixture whose pop is 0.29, so
+	// that a mapper rounding to truncation fails the row rather than passing it. A
+	// pop whose percentage is exact in binary floating point, which is what these
+	// fixtures used to carry, cannot tell the two rules apart and pins neither.
 	aliasPercent
 	// aliasSum is a total the legacy vocabulary reports as one number and the
 	// faithful one reports as two blocks of volumes. A null block contributes nothing,
@@ -104,6 +111,13 @@ var aliasRows = []aliasRow{
 	{aliasForecastRoute, "data.forecast[0].chance_of_rain", []string{"data.forecast[0].pop"}, aliasPercent},
 	{aliasForecastRoute, "data.forecast[0].max_temperature", []string{"data.forecast[0].temp.max"}, aliasSame},
 	{aliasForecastRoute, "data.forecast[0].min_temperature", []string{"data.forecast[0].temp.min"}, aliasSame},
+	// The brief for this row reads "data.forecast[0].rain + data.forecast[0].snow",
+	// which is not expressible: those two paths are objects, not numbers. On this
+	// route the faithful day reports each as a block with a 3h window inside it,
+	// ForecastRainBlock and ForecastSnowBlock, because /data/2.5/forecast documents
+	// the 3h window and not the 1h one. The row therefore reads the 3h members,
+	// which is the same sum the mapper performs. Do not "fix" this back to the
+	// brief's paths: the arithmetic is right, the paths in the brief were not.
 	{aliasForecastRoute, "data.forecast[0].precipitation", []string{"data.forecast[0].rain.3h", "data.forecast[0].snow.3h"}, aliasSum},
 
 	// /forecast/7day. The faithful One Call data is namespaced under one key, because
@@ -178,7 +192,7 @@ func aliasFaithful(t *testing.T, data map[string]any, spec aliasRow) any {
 	t.Helper()
 	switch spec.combine {
 	case aliasPercent:
-		return float64(int(aliasNumber(t, spec, digAlias(t, data, spec.faithful[0])) * 100))
+		return float64(int(math.Round(aliasNumber(t, spec, digAlias(t, data, spec.faithful[0])) * 100)))
 	case aliasSum:
 		total := 0.0
 		contributing := 0
@@ -231,27 +245,38 @@ func aliasLabel(spec aliasRow) string {
 // present, plausible and wrong, which a caller cannot tell from a field that is
 // right, and a missing field at least announces itself.
 //
-// The three routes answer from two servers and never from the network. Each route is
-// fetched once and every row for it is read from that one body, because a row that
-// fetched a copy of its own could pass against a cached body and fail against a fresh
-// one and tell nobody which of the two it had seen.
+// The three routes answer from three servers and never from the network: the shared
+// stub for /current, and one server per forecast route because each of those two
+// needs a fixture the shared one does not carry. Each route is fetched once and every
+// row for it is read from that one body, because a row that fetched a copy of its
+// own could pass against a cached body and fail against a fresh one and tell nobody
+// which of the two it had seen.
 func TestLegacyAliasesMatchFaithfulFields(t *testing.T) {
-	// The shared stub serves the current and the seven day fixtures. The forecast
-	// route gets its own server because its fixture is the variant built above.
+	// /current needs no variant: the shared fixture's currentWeatherJSON carries
+	// every reading the seven rows below read.
 	shared := newStubbedRouter(t, &upstreamStub{})
 
 	bodies := map[string]map[string]any{}
-	for _, route := range []string{aliasCurrentRoute, aliasSevenDayRoute} {
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/weather"+route+"?location=London,UK&units=metric", nil)
-		w := httptest.NewRecorder()
-		shared.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("%s: expected 200 got %d body=%s", route, w.Code, w.Body.String())
-		}
-		bodies[route] = decodeData(t, w.Body)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/weather"+aliasCurrentRoute+"?location=London,UK&units=metric", nil)
+	w := httptest.NewRecorder()
+	shared.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("%s: expected 200 got %d body=%s", aliasCurrentRoute, w.Code, w.Body.String())
 	}
+	bodies[aliasCurrentRoute] = decodeData(t, w.Body)
+
+	// /forecast uses the variant built above, because the shared forecastJSON carries
+	// no pop and no snow and so can make three of the four rows unobservable.
 	forecastData, _ := requestForecastRoute(t, newForecastRouteRouter(t, forecastAliasJSON(t)))
 	bodies[aliasForecastRoute] = forecastData
+
+	// /forecast/7day uses sevenDayRouteFullJSON rather than the shared sevenDayJSON,
+	// for the pop alone. The shared fixture reports 0.25 on every day, and 0.25*100
+	// is 25 exactly in binary floating point, so rounding and truncating agree on it
+	// and the probability row would pass against either mapper. The full fixture
+	// already reports 0.29, which is the value that tells the two rules apart, so this
+	// reuses an existing fixture rather than adding another variant.
+	bodies[aliasSevenDayRoute] = requestSevenDayRoute(t, newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t)))
 
 	for _, spec := range aliasRows {
 		t.Run(aliasLabel(spec), func(t *testing.T) {
