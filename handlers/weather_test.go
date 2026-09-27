@@ -191,3 +191,55 @@ func TestCurrentRouteReportsMeasuredZeroRain(t *testing.T) {
 		t.Fatalf("expected a measured rain.1h of 0, got %#v", oneHour)
 	}
 }
+
+// currentRouteBody renders a /data/2.5/weather body carrying exactly one visibility
+// state, so the three states can be driven from one place. An empty reading omits the
+// member, which is not the same as sending it as 0.
+func currentRouteBody(reading string) string {
+	return `{"coord":{"lon":-0.1257,"lat":51.5085},"weather":[{"id":802,"main":"Clouds","description":"scattered clouds","icon":"03d"}],"base":"stations","main":{"temp":15.5,"feels_like":14.8,"temp_min":14.0,"temp_max":17.0,"pressure":1013,"humidity":72,"temp_kf":0.6},` +
+		reading +
+		`"wind":{"speed":3.6,"deg":230},"clouds":{"all":40},"dt":1772000000,"sys":{"type":2,"id":5081,"country":"GB","sunrise":1771960000,"sunset":1772010000},"id":2643743,"timezone":0,"name":"London","cod":200}`
+}
+
+// The endpoint documents visibility but does not always send it, and the two states
+// are three: absent, measured as 0, and a real reading. OpenWeatherMapResponse holds
+// the member as a plain int, so the decode cannot tell the first two apart and a
+// mapper reading it from there reports a fabricated 0 metres for a body that sent
+// nothing. The two vocabularies then agree on the fabrication, which is why this was
+// invisible until the alias table needed a body that reported a real visibility.
+func TestCurrentRouteDistinguishesAbsentZeroAndMeasuredVisibility(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		reading string
+		want    any
+	}{
+		// The upstream sent no visibility at all. There is no answer, and the answer
+		// is null: 0 here would be a reading of 0 metres nobody made, and it would
+		// sit beside a legacy block carrying the same 0.
+		{"absent", "", nil},
+		// The upstream measured 0 metres. That is a real reading and stays 0, in both
+		// vocabularies, which is the pair a value type cannot hold.
+		{"measured zero", `"visibility":0,`, 0.0},
+		// A real reading, carried through unchanged.
+		{"measured", `"visibility":10000,`, 10000.0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := requestCurrentRoute(t, newCurrentRouteRouter(t, currentRouteBody(tc.reading)))
+
+			// The faithful key is present either way. Only the value distinguishes
+			// absence, so a dropped key would be a different thing and is not allowed
+			// to pass for one.
+			faithful, ok := data["visibility"]
+			if !ok {
+				t.Fatalf("expected a visibility key, got %#v", data)
+			}
+			if faithful != tc.want {
+				t.Fatalf("expected faithful visibility %#v, got %#v", tc.want, faithful)
+			}
+			legacy := block(t, data, "current")["visibility"]
+			if legacy != tc.want {
+				t.Fatalf("expected legacy current.visibility %#v, got %#v", tc.want, legacy)
+			}
+		})
+	}
+}

@@ -672,7 +672,6 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 	temp, feelsLike := owm.Main.Temp, owm.Main.FeelsLike
 	tempMin, tempMax := owm.Main.TempMin, owm.Main.TempMax
 	pressure, humidity := owm.Main.Pressure, owm.Main.Humidity
-	visibility := owm.Visibility
 	speed, deg := owm.Wind.Speed, owm.Wind.Deg
 	cloudCover := owm.Clouds.All
 	dt := owm.Dt
@@ -680,7 +679,7 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 	sunrise, sunset := owm.Sys.Sunrise, owm.Sys.Sunset
 	// The legacy current block reads the same locals by address, so the two
 	// vocabularies cannot disagree about a value the upstream measured.
-	pressureFloat, visibilityFloat := float64(pressure), float64(visibility)
+	pressureFloat := float64(pressure)
 	// UTC, for the same reason as the seven day route's current block: the same body
 	// must serialise the same way on two hosts.
 	dtTime := time.Unix(dt, 0).UTC()
@@ -736,7 +735,7 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 		Weather:    owm.Weather,
 		Base:       owm.Base,
 		Main:       main,
-		Visibility: visibility,
+		Visibility: payload.Visibility,
 		Wind:       wind,
 		Clouds:     clouds,
 		Rain:       rain,
@@ -760,10 +759,19 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 			Pressure:      &pressureFloat,
 			WindSpeed:     &speed,
 			WindDirection: &deg,
-			Visibility:    &visibilityFloat,
-			// The gust is the one legacy member this route reads from the payload rather
-			// than from the decode struct, and the reason is in the doc comment above.
-			WindGust:    payloadWindGust(payload),
+			// The gust and the visibility are the two members this route reads from
+			// the payload rather than from the decode struct, and for the same reason
+			// each time: the decode field is a value where a member the upstream never
+			// sent and a member it measured as 0 are the same value, and taking its
+			// address fabricated the 0. Every other key here is the upstream's own
+			// value, taken from the same locals the faithful block is built from.
+			WindGust: payloadWindGust(payload),
+			// Visibility is an int on the faithful block and a float here, so it is
+			// widened rather than reinterpreted by the same helper the forecast route
+			// uses for its slot visibility. An absent reading stays absent through the
+			// conversion, so it is null on both sides rather than a 0 either of them
+			// measured.
+			Visibility:  floatPtr(payload.Visibility),
 			Condition:   &condition,
 			Description: &description,
 			Icon:        &icon,

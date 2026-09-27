@@ -129,6 +129,13 @@ const (
 // that CurrentWeatherPayload deliberately does not, each with the reason. An entry
 // is a claim that the upstream always sends the member, so remove the entry and let
 // the test fail if that ever stops being true.
+//
+// visibility is not here any more and its removal is the point of the exercise: it
+// was allowlisted as alwaysSent, which was a claim the upstream does not honour. A
+// body that omits visibility decoded to 0 and both vocabularies reported a
+// fabricated 0, and the two agreed with each other so nothing noticed. The payload
+// declares it now, and the test still passes without the allowlist entry, which is
+// what an allowlist entry is supposed to be checked against.
 var currentPayloadNarrowed = map[string]string{
 	"coord.lon":       alwaysSent,
 	"coord.lat":       alwaysSent,
@@ -140,7 +147,6 @@ var currentPayloadNarrowed = map[string]string{
 	"main.temp_max":   alwaysSent,
 	"main.pressure":   alwaysSent,
 	"main.humidity":   alwaysSent,
-	"visibility":      alwaysSent,
 	"wind.speed":      alwaysSent,
 	"wind.deg":        alwaysSent,
 	"clouds.all":      alwaysSent,

@@ -120,10 +120,18 @@ type SysBlock struct {
 // The first group is a faithful mirror of the /data/2.5/weather schema, in
 // upstream field order. coord and weather reuse the upstream types, which carry
 // no omitempty and are fully populated whenever that endpoint answers at all.
-// visibility, dt, id, cod, base and name are always sent by that endpoint, so
-// they are plain values: none of their zeroes is a reading a real response makes.
-// timezone is a pointer to match the pointer-shaped payload it is read from, so
-// the faithful schema states one nullability rule rather than two.
+// dt, id, cod, base and name are always sent by that endpoint, so they are plain
+// values: none of their zeroes is a reading a real response makes. timezone is a
+// pointer to match the pointer-shaped payload it is read from, so the faithful
+// schema states one nullability rule rather than two.
+//
+// visibility is a pointer for the same reason, and it is the one member of this
+// group that was a value until the alias table caught it being wrong. The endpoint
+// documents visibility but does not always send it, and OpenWeatherMapResponse holds
+// it as a plain int, so an absent member decoded to 0 and this type reported a
+// fabricated 0 beside a legacy current.visibility carrying the same fabricated 0.
+// The two agreed, so nothing noticed. Every other route already read the payload
+// pointer for this member; this one read the decode struct.
 //
 // The second group is the legacy vocabulary, unchanged, so existing consumers keep
 // working. The legacy blocks keep their own omitempty, which means a legacy key
@@ -138,7 +146,7 @@ type CurrentWeatherResponse struct {
 	Weather    []Weather    `json:"weather"`
 	Base       string       `json:"base"`
 	Main       *MainBlock   `json:"main"`
-	Visibility int          `json:"visibility"`
+	Visibility *int         `json:"visibility"`
 	Wind       *WindBlock   `json:"wind"`
 	Clouds     *CloudsBlock `json:"clouds"`
 	Rain       *RainBlock   `json:"rain"`
@@ -160,7 +168,7 @@ type CurrentWeatherResponse struct {
 // conditional members the mapper cannot recover from OpenWeatherMapResponse: the
 // main, wind, clouds and sys blocks as pointers, main.sea_level,
 // main.grnd_level, main.temp_kf, wind.gust, the rain and snow blocks with their
-// 1h windows, and timezone.
+// 1h windows, visibility, and timezone.
 //
 // It exists beside OpenWeatherMapResponse because that struct is a non-pointer
 // decode target, where a member the upstream measured as 0 and a member it never
@@ -180,6 +188,11 @@ type CurrentWeatherResponse struct {
 // timezone is bound here and nowhere else. OpenWeatherMapResponse does not carry
 // it because no legacy field is derived from it, and an unused decode field is
 // worse than a missing one.
+//
+// visibility is bound here for the opposite reason: the decode struct does carry
+// it, as a plain int, and that is exactly why the mapper must not read it from
+// there. An absent member is a 0 there, and 0 metres of visibility is a reading
+// a real response makes, so the two states are indistinguishable.
 type CurrentWeatherPayload struct {
 	Main *currentPayloadMain `json:"main"`
 	Wind *currentPayloadWind `json:"wind"`
@@ -191,6 +204,10 @@ type CurrentWeatherPayload struct {
 	Sys    *struct{}             `json:"sys"`
 	Rain   *currentPayloadPrecip `json:"rain"`
 	Snow   *currentPayloadPrecip `json:"snow"`
+	// Visibility is the visibility in metres. The endpoint documents it but does not
+	// always send it, so it is declared here rather than read from the decode struct
+	// where an absent member is a 0 that reads as 0 metres.
+	Visibility *int `json:"visibility"`
 	// Timezone is the UTC offset the upstream reports, in seconds.
 	Timezone *int `json:"timezone"`
 }
