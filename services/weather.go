@@ -352,13 +352,14 @@ func (w *WeatherService) resolveAPIKey(apikey string) string {
 // the difference between a measured zero and an absent member, comes from
 // payload.
 //
-// A rain or snow block the upstream omitted is nil, and the window this endpoint
-// does not document is omitted from the block. The legacy blocks keep their own
-// omitempty, so an absent gust stays absent in current.wind_gust while the
-// faithful wind.gust reports it null. The legacy current block's
-// max_temperature and min_temperature stay at 0, as they have always been on
-// this route: changing them is a change to the legacy vocabulary, not a
-// faithfulness fix.
+// A block the upstream did not send is left nil, so an absent block and a block
+// whose members are all null stay two different things, and the window this
+// endpoint does not document is omitted from a precipitation block. The legacy
+// blocks keep their own omitempty, so an absent gust stays absent in
+// current.wind_gust while the faithful wind.gust reports it null. The legacy
+// current block's max_temperature and min_temperature stay at 0, as they have
+// always been on this route: changing them is a change to the legacy vocabulary,
+// not a faithfulness fix.
 func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, payload models.CurrentWeatherPayload) *models.CurrentWeatherResponse {
 	var condition, description, icon string
 	if len(owm.Weather) > 0 {
@@ -380,6 +381,42 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 	sysType, sysID := owm.Sys.Type, owm.Sys.ID
 	sunrise, sunset := owm.Sys.Sunrise, owm.Sys.Sunset
 
+	var main *models.MainBlock
+	if payload.Main != nil {
+		main = &models.MainBlock{
+			Temp:      &temp,
+			FeelsLike: &feelsLike,
+			TempMin:   &tempMin,
+			TempMax:   &tempMax,
+			Pressure:  &pressure,
+			Humidity:  &humidity,
+			SeaLevel:  payload.Main.SeaLevel,
+			GrndLevel: payload.Main.GrndLevel,
+			TempKF:    payload.Main.TempKF,
+		}
+	}
+	var wind *models.WindBlock
+	if payload.Wind != nil {
+		wind = &models.WindBlock{
+			Speed: &speed,
+			Deg:   &deg,
+			Gust:  payload.Wind.Gust,
+		}
+	}
+	var clouds *models.CloudsBlock
+	if payload.Clouds != nil {
+		clouds = &models.CloudsBlock{All: &cloudCover}
+	}
+	var sys *models.SysBlock
+	if payload.Sys != nil {
+		sys = &models.SysBlock{
+			Type:    &sysType,
+			ID:      &sysID,
+			Country: &country,
+			Sunrise: &sunrise,
+			Sunset:  &sunset,
+		}
+	}
 	var rain *models.RainBlock
 	if payload.Rain != nil {
 		rain = &models.RainBlock{OneHour: payload.Rain.OneHour}
@@ -390,41 +427,21 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 	}
 
 	return &models.CurrentWeatherResponse{
-		Coord:   models.Coordinates{Lon: lon, Lat: lat},
-		Weather: owm.Weather,
-		Base:    owm.Base,
-		Main: &models.MainBlock{
-			Temp:      &temp,
-			FeelsLike: &feelsLike,
-			TempMin:   &tempMin,
-			TempMax:   &tempMax,
-			Pressure:  &pressure,
-			Humidity:  &humidity,
-			SeaLevel:  payload.Main.SeaLevel,
-			GrndLevel: payload.Main.GrndLevel,
-			TempKF:    payload.Main.TempKF,
-		},
+		Coord:      models.Coordinates{Lon: lon, Lat: lat},
+		Weather:    owm.Weather,
+		Base:       owm.Base,
+		Main:       main,
 		Visibility: visibility,
-		Wind: &models.WindBlock{
-			Speed: &speed,
-			Deg:   &deg,
-			Gust:  payload.Wind.Gust,
-		},
-		Clouds: &models.CloudsBlock{All: &cloudCover},
-		Rain:   rain,
-		Snow:   snow,
-		Dt:     dt,
-		Sys: &models.SysBlock{
-			Type:    &sysType,
-			ID:      &sysID,
-			Country: &country,
-			Sunrise: &sunrise,
-			Sunset:  &sunset,
-		},
-		ID:       owm.ID,
-		Timezone: payload.Timezone,
-		Name:     name,
-		Cod:      owm.Cod,
+		Wind:       wind,
+		Clouds:     clouds,
+		Rain:       rain,
+		Snow:       snow,
+		Dt:         dt,
+		Sys:        sys,
+		ID:         owm.ID,
+		Timezone:   payload.Timezone,
+		Name:       name,
+		Cod:        owm.Cod,
 		Location: models.Location{
 			Name:      name,
 			Country:   country,

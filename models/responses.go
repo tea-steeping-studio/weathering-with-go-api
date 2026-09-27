@@ -51,21 +51,23 @@ type CloudsBlock struct {
 	All *int `json:"all"`
 }
 
-// RainBlock represents the rain block of the /data/2.5 endpoints. Both members
-// are pointers, so their omitempty drops only a window the upstream did not send
-// and cannot discard a measured zero: a window that measures 0 still serialises
-// as 0. The window the route's endpoint does not document is omitted entirely,
-// because /data/2.5/weather reports 1h and /data/2.5/forecast reports 3h.
+// RainBlock represents the rain block of the /data/2.5 endpoints. OneHour is a
+// documented window, so it carries no omitempty: an absent reading reports null
+// and a block upstream reported with no window in it does not look like a block
+// that was never sent. ThreeHour is the window /data/2.5/weather does not
+// document, so it is tagged omitempty, which on a pointer field drops only nil and
+// can never discard a measured zero.
 type RainBlock struct {
-	OneHour   *float64 `json:"1h,omitempty"`
+	OneHour   *float64 `json:"1h"`
 	ThreeHour *float64 `json:"3h,omitempty"`
 }
 
 // SnowBlock represents the snow block of the /data/2.5 endpoints. It tags its
-// members omitempty for the same reason as RainBlock: the fields are pointers, so
-// only an absent window is dropped and a measured zero still serialises as 0.
+// members for the same reasons as RainBlock: OneHour has no omitempty because the
+// window is documented, and ThreeHour has it because this endpoint does not
+// document that window.
 type SnowBlock struct {
-	OneHour   *float64 `json:"1h,omitempty"`
+	OneHour   *float64 `json:"1h"`
 	ThreeHour *float64 `json:"3h,omitempty"`
 }
 
@@ -86,9 +88,8 @@ type SysBlock struct {
 // no omitempty and are fully populated whenever that endpoint answers at all.
 // visibility, dt, id, cod, base and name are always sent by that endpoint, so
 // they are plain values: none of their zeroes is a reading a real response makes.
-// timezone is a pointer because models.OpenWeatherMapResponse has no field for
-// it; the service binds it from the payload, so it is null only if the upstream
-// omits it.
+// timezone is a pointer to match the pointer-shaped payload it is read from, so
+// the faithful schema states one nullability rule rather than two.
 //
 // The second group is the legacy vocabulary, unchanged, so existing consumers keep
 // working. The legacy blocks keep their own omitempty, which means a legacy key
@@ -121,10 +122,11 @@ type CurrentWeatherResponse struct {
 }
 
 // CurrentWeatherPayload is a pointer-shaped mirror of the /data/2.5/weather body
-// and the authority on which members the upstream actually sent. Only the members
-// whose presence cannot be recovered from OpenWeatherMapResponse are declared
-// here: main.sea_level, main.grnd_level, main.temp_kf, wind.gust, the rain and
-// snow blocks with their 1h windows, and timezone.
+// and the authority on which members the upstream actually sent. It declares the
+// conditional members the mapper cannot recover from OpenWeatherMapResponse: the
+// main, wind, clouds and sys blocks as pointers, main.sea_level,
+// main.grnd_level, main.temp_kf, wind.gust, the rain and snow blocks with their
+// 1h windows, and timezone.
 //
 // It exists beside OpenWeatherMapResponse because that struct is a non-pointer
 // decode target, where a member the upstream measured as 0 and a member it never
@@ -133,23 +135,36 @@ type CurrentWeatherResponse struct {
 // the mapper takes values from the upstream struct and presence from here. A newly
 // documented upstream field has to be added to both types, because a field missing
 // from this one is reported as null even when the upstream did send it.
+// TestCurrentPayloadCoversDecodedFields is the guard on that, and its allowlist
+// names every JSON member this type deliberately narrows.
+//
+// Precipitation is taken from here and not from owm: models.Rain and models.Snow
+// are still decoded on every fetch and read by nobody, because their non-pointer
+// windows cannot tell a measured zero from an absent one. Do not read them, and do
+// not add a third copy of them here.
 //
 // timezone is bound here and nowhere else. OpenWeatherMapResponse does not carry
 // it because no legacy field is derived from it, and an unused decode field is
 // worse than a missing one.
 type CurrentWeatherPayload struct {
-	Main currentPayloadMain    `json:"main"`
-	Wind currentPayloadWind    `json:"wind"`
-	Rain *currentPayloadPrecip `json:"rain"`
-	Snow *currentPayloadPrecip `json:"snow"`
-	// Timezone is the UTC offset the upstream reports in seconds. It is a pointer
-	// so a response reports null rather than a fabricated zero if it is absent.
+	Main *currentPayloadMain `json:"main"`
+	Wind *currentPayloadWind `json:"wind"`
+	// Clouds and Sys carry no members on purpose. Every member they report is
+	// unconditionally sent, so the mapper reads those values from
+	// OpenWeatherMapResponse and needs only the pointer to know the block was
+	// there at all.
+	Clouds *struct{}             `json:"clouds"`
+	Sys    *struct{}             `json:"sys"`
+	Rain   *currentPayloadPrecip `json:"rain"`
+	Snow   *currentPayloadPrecip `json:"snow"`
+	// Timezone is the UTC offset the upstream reports, in seconds.
 	Timezone *int `json:"timezone"`
 }
 
 // currentPayloadMain holds the main block members that are conditional rather
 // than guaranteed: sea_level and grnd_level come only from points near sea level
-// or the ground, and temp_kf is not always sent.
+// or the ground, and temp_kf is not always sent. The rest of main is read from
+// OpenWeatherMapResponse.
 type currentPayloadMain struct {
 	SeaLevel  *int     `json:"sea_level"`
 	GrndLevel *int     `json:"grnd_level"`
@@ -157,13 +172,15 @@ type currentPayloadMain struct {
 }
 
 // currentPayloadWind holds wind.gust, which some regions report and others omit.
+// speed and deg are read from OpenWeatherMapResponse.
 type currentPayloadWind struct {
 	Gust *float64 `json:"gust"`
 }
 
 // currentPayloadPrecip holds the 1h window both rain and snow report on this
 // endpoint. A nil block means upstream sent no block at all, which is not the
-// same as a block whose window measures 0.
+// same as a block whose window measures 0. The 3h window is not declared here
+// because /data/2.5/weather does not document it; see RainBlock.
 type currentPayloadPrecip struct {
 	OneHour *float64 `json:"1h"`
 }

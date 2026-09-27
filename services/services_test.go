@@ -7,7 +7,7 @@ import (
 	"weathering-with-go/models"
 )
 
-func TestConvertCurrentWeatherResponse(t *testing.T) {
+func TestMapCurrentWeather(t *testing.T) {
 	svc := NewWeatherService("dummy")
 	owm := models.OpenWeatherMapResponse{
 		Coord:   models.Coordinates{Lat: 1.23, Lon: 4.56},
