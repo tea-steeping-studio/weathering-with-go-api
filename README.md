@@ -18,7 +18,7 @@ A modern, high-performance weather API built with Go and the Gin web framework. 
 
 ### Prerequisites
 
-- Go 1.25 or higher
+- Go 1.25.1 or higher (the `go` directive in `go.mod` rejects 1.25.0)
 - OpenWeatherMap API key (free at [openweathermap.org](https://openweathermap.org/api))
 
 ### Installation
@@ -232,12 +232,13 @@ curl "http://localhost:8080/api/v1/weather/forecast?location=Tokyo,JP&units=metr
 Abridged: the `hourly` array of each day — the raw three-hour slots behind the rollup — is shown empty
 here. See [Derived daily values on /weather/forecast](#derived-daily-values-on-weatherforecast).
 
-The `current` block is derived from the first three-hour slot in the same upstream response, so it costs
-no extra OpenWeatherMap call. Two consequences: it can be up to 3 hours old, which is why
-`last_updated` is the slot timestamp rather than the request time, and its `max_temperature` and
-`min_temperature` are that slot's own `main.temp_max` and `main.temp_min`, which OpenWeatherMap
-documents as extremes in the city at the moment of calculation rather than the day's extremes. Use
-`/weather/current` when you need a live reading.
+The `current` block on this route is derived from the first three-hour slot of the same upstream
+response, so it costs no extra OpenWeatherMap call. Two consequences: it is a slot's readings rather
+than a live observation, so `last_updated` is that slot's timestamp and can sit either side of
+`request_time` (this example's is 90 minutes ahead, because `list` starts at the next three-hour
+boundary); and its `max_temperature` and `min_temperature` are that slot's own `main.temp_max` and
+`main.temp_min`, which OpenWeatherMap documents as extremes in the city at the moment of calculation
+rather than the day's extremes. Use `/weather/current` when you need a live reading.
 
 #### POST /weather/forecast
 Get weather forecast using JSON request body.
@@ -295,8 +296,7 @@ curl -i "http://localhost:8080/api/v1/weather/forecast/7day?location=Tokyo,JP&un
         "wind_deg": 190,
         "wind_gust": 5.2,
         "weather": [{ "id": 802, "main": "Clouds", "description": "scattered clouds", "icon": "03d" }]
-      },
-      "daily": []
+      }
     },
     "location": {
       "name": "Tokyo",
@@ -343,14 +343,15 @@ curl -i "http://localhost:8080/api/v1/weather/forecast/7day?location=Tokyo,JP&un
 }
 ```
 
-Abridged: the `onecall.daily` array is shown empty here. `onecall` is the faithful One Call 3.0
-response; the `location`, `current`, `forecast` and `request_time` keys beside it are the legacy
-vocabulary. See [Response schema](#response-schema).
+Abridged: the `onecall.daily` array is elided here rather than shown empty — it has no `omitempty`,
+so an upstream that sent no day at all would render it as `null`, never `[]`. `onecall` is the faithful
+One Call 3.0 response; the `location`, `current`, `forecast` and `request_time` keys beside it are the
+legacy vocabulary. See [Response schema](#response-schema).
 
 The `current` block comes from the `current` object in the same One Call response, so it is genuinely
-current and also costs no extra call. One Call reports no daily extremes in that block, so
-`max_temperature` and `min_temperature` are `null` here. The day's own extremes are on the
-`onecall.daily` entries and on the `forecast` array.
+current — an observation, not a forecast slot — and also costs no extra call. One Call reports no
+daily extremes in that block, so `max_temperature` and `min_temperature` are `null` here. The day's own
+extremes are on the `onecall.daily` entries and on the `forecast` array.
 
 #### POST /weather/forecast/7day
 Same as the GET endpoint, with a JSON body. `days` is not accepted: this route always returns 7 days.
@@ -369,21 +370,34 @@ Every weather response carries two vocabularies side by side. Three rules govern
 the rules a consumer cannot infer from the JSON itself.
 
 1. **Faithful keys** mirror the documented schema of that route's own upstream endpoint, and nothing
-   else. A field absent from that endpoint's schema gets no faithful key on that route.
-2. **Legacy keys** are the original public vocabulary. Every one of them is always present. A legacy
-   key the route cannot supply serialises as `null`.
+   else. A field absent from that endpoint's schema gets no faithful key on that route. The one
+   exception is `wind.gust` on `/current` and `forecast[].hourly[].wind.gust` on `/forecast`: both are
+   emitted, because OpenWeatherMap does send a gust in practice on the two `/data/2.5` endpoints even
+   though only the daily endpoints document it, and dropping a reading the upstream actually sent
+   would be the same defect as inventing one.
+2. **Legacy keys** are the original public vocabulary. Every one of them is always present, with three
+   exceptions that carry `omitempty` and are therefore *absent* rather than `null` when the route
+   cannot supply them: `current.wind_gust`; `location.region`, which only the 7-day route populates
+   and only when the geocoder returned a state or province; and `location.timezone`, which no route
+   populates at all — the faithful `timezone` on `/current` and `onecall.timezone` on `/forecast/7day`
+   are the upstream's own value and are the keys to read. A legacy key outside that list that the
+   route cannot supply serialises as `null`.
 3. **Omitted is not the same as null.** A field the route's endpoint documents but the upstream had
    no value for is `null`. An opt-in block the caller did not request is left out of the response
    entirely. A block the caller asked for is never omitted.
 
 Pointers are what make the third rule work: a measured `0` serialises as `0`, a gap serialises as
 `null`, and a nil block is a third state distinct from both — an absent block, rather than a block
-whose every member is missing.
+whose every member is missing. The `omitempty` keys in rule 2 are the one place a gap shows up as an
+absent key, so a reader looking for `null` on `current.wind_gust` will not find it and should look
+for the key instead.
 
 #### The `current` block and its faithful twin
 
 `current` is the legacy block on all three routes, and each legacy key carries the same reading as the
-faithful key in the same column. `null` means the route measures no such value.
+faithful key in the same column. `null` means the route measures no such value — except `wind_gust`,
+which is the one key here that is absent rather than `null` when there is no gust, and which only
+appears at all when the upstream reported one.
 
 | Legacy key | `/current` | `/forecast` | `/forecast/7day` |
 |---|---|---|---|
@@ -394,7 +408,7 @@ faithful key in the same column. `null` means the route measures no such value.
 | `visibility` | `visibility` | `forecast[0].hourly[0].visibility` | `onecall.current.visibility` |
 | `wind_speed` | `wind.speed` | `forecast[0].hourly[0].wind.speed` | `onecall.current.wind_speed` |
 | `wind_direction` | `wind.deg` | `forecast[0].hourly[0].wind.deg` | `onecall.current.wind_deg` |
-| `wind_gust` | `wind.gust` | `forecast[0].hourly[0].wind.gust` | `onecall.current.wind_gust` |
+| `wind_gust` † | `wind.gust` | `forecast[0].hourly[0].wind.gust` | `onecall.current.wind_gust` |
 | `cloud_cover` | `clouds.all` | `forecast[0].hourly[0].clouds.all` | `onecall.current.clouds` |
 | `condition` | `weather[0].main` | `forecast[0].hourly[0].weather[0].main` | `onecall.current.weather[0].main` |
 | `description` | `weather[0].description` | `forecast[0].hourly[0].weather[0].description` | `onecall.current.weather[0].description` |
@@ -403,7 +417,11 @@ faithful key in the same column. `null` means the route measures no such value.
 | `max_temperature` | `null` | `forecast[0].hourly[0].main.temp_max` | `null` |
 | `min_temperature` | `null` | `forecast[0].hourly[0].main.temp_min` | `null` |
 
-Three of those rows are one reading in two renderings rather than the same number twice.
+† `wind_gust` is the one row that is absent rather than `null` when there is no gust, on all three
+routes: the legacy key carries `omitempty`, and a measured `0` is a non-nil pointer to zero so it is
+reported rather than dropped.
+
+Four of those rows are one reading in two renderings rather than the same number twice.
 `description` is the upstream's lowercase string title-cased on the legacy side, as it always has.
 `pressure` and `visibility` are integers on the faithful side and floats on the legacy one, widened
 rather than reinterpreted. `last_updated` is the faithful epoch timestamp rendered as RFC3339 in UTC —
@@ -481,7 +499,11 @@ The value is checked against an allowlist, so a typo is a `400` rather than a si
 
 The allowlist is a set, so `blocks=hourly` and `blocks=hourly,minutely,alerts` are two different
 requests. A block the caller asked for and the upstream reported as an empty array comes back as an
-empty array, not as a missing key.
+empty array, not as a missing key. The parameter is read only on `/weather/forecast/7day`: on
+`/current` and `/forecast`, on both the GET and the POST route, it is silently ignored rather than
+rejected.
+
+#### The `onecall` block
 
 The faithful One Call data lives under a single `onecall` key rather than at the top level, because the
 legacy `current` block and the faithful One Call `current` object both want the JSON key `current`.
@@ -503,10 +525,8 @@ onecall.alerts[]{sender_name, event, start, end, description, tags[]}   # opt-in
 `dew_point`, `wind_speed`, `wind_deg`, `wind_gust`, `weather[]`, `clouds`, `pop`, `rain`, `snow` and
 `uvi`. `onecall.daily[]` is uncapped: it holds every day the upstream sent, which may be more than the
 seven in the legacy `forecast[]` beside it. `rain` and `snow` there are plain millimetre totals for the
-day, not the windowed `{1h}`/`{3h}` blocks the `/data/2.5` endpoints use.
-
-`?blocks=` is accepted only on `/weather/forecast/7day`. On `/current` and `/forecast` it is silently
-ignored rather than rejected, on both the GET and the POST route.
+day, not the windowed `{1h}`/`{3h}` blocks the `/data/2.5` endpoints use, and `daily` has no
+`omitempty`, so an upstream that sent no day at all renders it as `null`.
 
 #### No `chance_of_rain` on /weather/current
 
@@ -515,12 +535,18 @@ no `pop` field to mirror. This is not a gap in the response: a key that could on
 carries no information. `/forecast` and `/forecast/7day` both have a real upstream source and both
 report an accurate probability.
 
-#### The forecast routes' `current` block is derived, not observed
+#### The 5-day route's `current` block is derived, not observed
 
-On `/forecast` the block comes from the first three-hour slot of the same upstream response; on
-`/forecast/7day` it comes from the One Call `current` object. Neither route makes a second upstream
-call to fill it, and neither is an observation of conditions at the moment you asked: on `/forecast`
-it can be up to three hours old, which is what `last_updated` is there to tell you.
+`/forecast/7day` is not in this category. Its `current` block is the One Call `current` object, which
+is an observation of conditions at the moment the upstream calculated it, and the route is genuinely
+current.
+
+`/forecast` is. Its block comes from the first three-hour slot of the forecast payload, not from a
+second upstream call, which is why the route cannot also be reporting live conditions. `last_updated`
+is that slot's timestamp, and it can sit on either side of `request_time`: OpenWeatherMap's `list`
+starts at the *next* three-hour boundary, so shortly after an hour boundary `list[0]` is in the future
+by up to three hours, and shortly before one it can be an hour or more old. Read it as "this is the
+slot this reading came from", not as an age.
 
 ### Breaking changes
 
@@ -535,6 +561,7 @@ and quietly wrong is worse than a missing one. Consumers that read any of them n
 | `/forecast` day `uv_index` | Always `0` | Always `null`: this endpoint reports no ultraviolet index |
 | `/forecast` day `precipitation` | Always a number, `0` when nothing fell or nothing was measured | `null` when no slot reported a precipitation window, and the sum when one did |
 | `/forecast/7day` day `precipitation` | Same as above | Same as above |
+| `/forecast` day `condition`, `description`, `icon` | `""` when the middle slot carried no weather entry | `null`, matching what the other three blocks have always reported for that case |
 | `/forecast/7day` day `chance_of_rain` | Truncated percentage | Rounded percentage, and `null` when the day carried no `pop` |
 | `current.max_temperature`, `min_temperature` on `/current` and `/forecast/7day` | Always `0` | Always `null`: neither route measures daily extremes in its current block |
 | `current.visibility` on `/forecast` | Always `0` | The first slot's `visibility`, or `null` when that slot reports none |
@@ -542,9 +569,10 @@ and quietly wrong is worse than a missing one. Consumers that read any of them n
 | `forecast` key on both forecast routes | Absent when the upstream sent no days | Always present, as `[]` |
 | `date` on `/forecast/7day`, and `last_updated` and `request_time` on all three routes | Rendered in the server's local zone | Rendered in UTC, so the same body serialises identically on every host |
 
-On the forecast routes, a legacy `condition`, `description` or `icon` is now `null` where a block the
-upstream sent carried no weather entry, rather than an empty string. `last_updated` is `null` there if
-the upstream sent no current block at all, where it was previously `1970-01-01T00:00:00Z`.
+A legacy `condition`, `description` or `icon` is `null` on every block of every route where the
+upstream carried no weather entry — both forecast `current` blocks, the 7-day day block and the
+5-day day block alike. `last_updated` is `null` on the forecast routes if the upstream sent no current
+block at all, where it was previously `1970-01-01T00:00:00Z`.
 
 ### API key per request
 
@@ -590,8 +618,11 @@ All errors follow a consistent format:
 }
 ```
 
-The error object has three keys and no `details` key, so any diagnostic detail an error carries is
-appended to `message` rather than exposed separately.
+The error object has three keys and nothing else, and no error carries a fourth. Internally some
+errors carry a `details` string, but the response writer copies only the message across, so **the
+detail is dropped rather than surfaced**: a `days=6` request gets `"Invalid days parameter"` and never
+learns that the limit is 5. The `?blocks=` `400` is the one case that carries a diagnostic, because
+that handler writes the text into the message itself rather than into the detail slot.
 
 ## ⚙️ Configuration
 
