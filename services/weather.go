@@ -627,15 +627,24 @@ func (w *WeatherService) resolveAPIKey(apikey string) string {
 }
 
 // mapCurrentWeather builds the current route's response: a faithful mirror of
-// the /data/2.5/weather schema plus the legacy vocabulary. Both are assigned in
-// one struct literal from the same locals, so a legacy key cannot drift away from
-// the faithful value it aliases. Values come from owm; presence, and therefore
-// the difference between a measured zero and an absent member, comes from
-// payload.
+// the /data/2.5/weather schema plus the legacy vocabulary. Both vocabularies are
+// assigned from the same locals, so a legacy key cannot drift away from the
+// faithful value it aliases. Values come from owm; presence, and therefore the
+// difference between a measured zero and an absent member, comes from payload.
 //
 // A block the upstream did not send is left nil, so an absent block and a block
 // whose members are all null stay two different things, and the window this
 // endpoint does not document is omitted from a precipitation block.
+//
+// The legacy block is gated on the same three blocks as the faithful one, for the
+// same reason. It used to be assigned in one literal from locals read straight off
+// the decode struct, so a body with no wind reported "wind": null beside
+// current.wind_speed: 0 and current.wind_direction: 0, a body with no main
+// reported "main": null beside four fabricated zeroes, and a body with no clouds
+// reported "clouds": null beside current.cloud_cover: 0. The two vocabularies
+// contradicting each other about whether a reading exists is the one thing the
+// pointer work was for, and this half of the block had been left out of it.
+// currentFromOneCall and forecastDay both read the block this way.
 //
 // The gust is read from the payload rather than from the decode struct, because
 // wind.gust is not documented for this endpoint and the decode field's zero means
@@ -648,16 +657,6 @@ func (w *WeatherService) resolveAPIKey(apikey string) string {
 // The legacy current block's max_temperature and min_temperature are null, since
 // this endpoint reports no extremes and the route has never measured any. They
 // were a fabricated 0 until models.Current became pointer shaped.
-// payloadWindGust reads the conditional wind member for the legacy current block. A
-// nil wind block and a wind block with no gust in it are the same answer, null, and
-// only a gust the upstream measured is a number.
-func payloadWindGust(payload models.CurrentWeatherPayload) *float64 {
-	if payload.Wind == nil {
-		return nil
-	}
-	return payload.Wind.Gust
-}
-
 func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, payload models.CurrentWeatherPayload) *models.CurrentWeatherResponse {
 	var condition, description, icon string
 	if len(owm.Weather) > 0 {
@@ -730,41 +729,41 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 		snow = &models.SnowBlock{OneHour: payload.Snow.OneHour}
 	}
 
-	// The legacy block is built in one literal from the same locals, so a legacy key
-	// cannot drift away from the faithful value it aliases, and the condition trio is
-	// added afterwards under the same gate the other two mappers use. It used to be
-	// assigned inside this literal, unconditionally, which meant the gate above
-	// computed the right answer and then threw it away: a body with no weather entry
-	// left condition, description and icon as "", and the address of "" is
-	// serialised, so the three keys reported a fabricated value beside a faithful
-	// weather[] that correctly said null. Computing the right answer and discarding it
-	// is worse than having no gate, because the code reads as if the case is handled.
+	// The legacy block is built from the same locals as the faithful one, so a legacy
+	// key cannot drift away from the faithful value it aliases, and every reading that
+	// lives inside a block is assigned under the same gate the faithful block uses.
+	// Taking the address of a local the faithful block decided to discard is how a
+	// fabricated zero gets in beside a null: the gate computes the right answer and
+	// then a second, ungated assignment throws it away, and the code reads as if the
+	// case were handled. Three separate gates, one per block, and the condition trio
+	// is a fourth under the same rule.
 	legacy := models.Current{
-		Temperature:   &temp,
-		FeelsLike:     &feelsLike,
-		Humidity:      &humidity,
-		Pressure:      &pressureFloat,
-		WindSpeed:     &speed,
-		WindDirection: &deg,
-		// The gust and the visibility are the two members this route reads from
-		// the payload rather than from the decode struct, and for the same reason
-		// each time: the decode field is a value where a member the upstream never
-		// sent and a member it measured as 0 are the same value, and taking its
-		// address fabricated the 0. Every other key here is the upstream's own
-		// value, taken from the same locals the faithful block is built from.
-		WindGust: payloadWindGust(payload),
-		// Visibility is an int on the faithful block and a float here, so it is
-		// widened rather than reinterpreted by the same helper the forecast route
-		// uses for its slot visibility. An absent reading stays absent through the
-		// conversion, so it is null on both sides rather than a 0 either of them
-		// measured.
-		Visibility:  floatPtr(payload.Visibility),
-		CloudCover:  &cloudCover,
+		// The two members read from the payload rather than from the decode struct, the
+		// gust through the wind gate below and the visibility here, are covered by the
+		// function comment above.
+		Visibility: floatPtr(payload.Visibility),
+		// dt is documented as always sent by this endpoint, which is what the payload
+		// allowlist claims for it, so the timestamp is not gated. UTC, like the
+		// faithful dt and the seven day route's last_updated: the same body must
+		// serialise the same way on two hosts.
 		LastUpdated: &dtTime,
 		// max_temperature and min_temperature stay null. This endpoint reports no
-		// extremes and the route has never measured any, so the 0 they used to
-		// carry was a reading nobody made; every other key above is the upstream's
-		// own value, taken from the same locals the faithful block is built from.
+		// extremes and the route has never measured any, so the 0 they used to carry
+		// was a reading nobody made.
+	}
+	if payload.Main != nil {
+		legacy.Temperature = &temp
+		legacy.FeelsLike = &feelsLike
+		legacy.Humidity = &humidity
+		legacy.Pressure = &pressureFloat
+	}
+	if payload.Wind != nil {
+		legacy.WindSpeed = &speed
+		legacy.WindDirection = &deg
+		legacy.WindGust = payload.Wind.Gust
+	}
+	if payload.Clouds != nil {
+		legacy.CloudCover = &cloudCover
 	}
 	// The condition, description and icon are the first weather entry's, and a body
 	// the upstream sent with no weather entry has none, so the trio stays null rather
@@ -1184,7 +1183,8 @@ func floatPtr(reading *int) *float64 {
 // reported as last_updated so callers can see how stale the reading is.
 //
 // presence is the payload view of the same slot, and every member whose zero in the
-// decode struct could be an absent member is read from it. Two are read that way here.
+// decode struct could be an absent member is read through it. Four are read that way
+// here: visibility, and the main, wind and clouds blocks as blocks.
 //
 // Visibility is one: the endpoint documents list.visibility, so the faithful hourly slot
 // and this legacy block were reporting the same datum two ways, the slot populated and
@@ -1192,13 +1192,21 @@ func floatPtr(reading *int) *float64 {
 // a visibility of 0 metres, which is what reading the non-pointer field would have
 // reported.
 //
-// WindGust is the other, and the opposite way round. The endpoint does not document
-// wind.gust for a three hour slot, so the decode field's zero means "no gust" rather
-// than "a measured 0 m/s", and taking its address fabricated the 0. Reading the payload
-// gives the three states their three answers: no gust leaves the member nil and omitempty
-// drops the key, a measured 0 is a non-nil pointer to zero and is reported as 0, and a
-// gust is that number. Every other member below is documented as sent on every slot, so
-// its zero in the decode struct is a real reading and the payload needs no view of it.
+// The main and wind blocks are the other two, and the rule is the same one the
+// faithful slot and currentFromOneCall follow: a reading that lives inside a block the
+// upstream did not send is not a reading. The faithful slot reports such a slot's main
+// block as null, so a legacy block carrying four zeroes beside it said the two
+// vocabularies disagree about whether the upstream measured anything. The gates are
+// written out per block rather than folded into one predicate, because each block gates
+// a different set of keys and a single shared guard is what made the block look
+// handled while three of its readings were assigned anyway.
+//
+// WindGust is the other member of the wind block, and the opposite way round. The
+// endpoint does not document wind.gust for a three hour slot, so the decode field's
+// zero means "no gust" rather than "a measured 0 m/s", and taking its address
+// fabricated the 0. Reading the payload gives the three states their three answers: no
+// gust leaves the member nil and omitempty drops the key, a measured 0 is a non-nil
+// pointer to zero and is reported as 0, and a gust is that number.
 func currentFromForecast(items []models.ForecastItem, presence models.ForecastPayloadItem) models.Current {
 	if len(items) == 0 {
 		return models.Current{}
@@ -1217,9 +1225,9 @@ func currentFromForecast(items []models.ForecastItem, presence models.ForecastPa
 	}
 
 	// The values are the ones this function has always read, taken by address because
-	// models.Current is pointer shaped. An empty list returns the all-null zero value
-	// above, which is what the block is now able to say. Every key set below is a
-	// reading on a real body, and its JSON is unchanged.
+	// models.Current is pointer shaped, and gated below on the same blocks the
+	// faithful slot is gated on. An empty list returns the all-null zero value above,
+	// which is what the block is now able to say.
 	temp, feelsLike := nearest.Main.Temp, nearest.Main.FeelsLike
 	humidity, pressure := nearest.Main.Humidity, float64(nearest.Main.Pressure)
 	speed, deg := nearest.Wind.Speed, nearest.Wind.Deg
@@ -1230,26 +1238,33 @@ func currentFromForecast(items []models.ForecastItem, presence models.ForecastPa
 	updated := time.Unix(nearest.Dt, 0).UTC()
 
 	legacy := models.Current{
-		Temperature:   &temp,
-		FeelsLike:     &feelsLike,
-		Humidity:      &humidity,
-		Pressure:      &pressure,
-		WindSpeed:     &speed,
-		WindDirection: &deg,
-		MaxTemp:       &maxTemp,
-		MinTemp:       &minTemp,
-		CloudCover:    &cloudCover,
-		LastUpdated:   &updated,
+		// dt is documented as always sent on a slot, which is what the payload
+		// allowlist claims for list.dt, so the timestamp is not gated on anything.
+		LastUpdated: &updated,
 		// The documented list.visibility of the slot, through the presence view rather
 		// than the decode struct's zero, so the same reading reaches the faithful
 		// hourly slot and this block, and an absent one is null in both.
 		Visibility: floatPtr(presence.Visibility),
 	}
-	// The gust is the other conditional member, and the pointer is the whole of it: a
-	// slot the upstream sent a wind block for with no gust leaves this nil, so the key
-	// is absent rather than 0, and a slot that measured one keeps the number.
+	if presence.Main != nil {
+		// The extremes are members of the same main block as the temperature, so they
+		// are gated with it rather than beside it. A slot the upstream sent with no
+		// main block has no temp_max to report, and reporting 0 is the same
+		// fabrication the other four keys were.
+		legacy.Temperature = &temp
+		legacy.FeelsLike = &feelsLike
+		legacy.Humidity = &humidity
+		legacy.Pressure = &pressure
+		legacy.MaxTemp = &maxTemp
+		legacy.MinTemp = &minTemp
+	}
 	if presence.Wind != nil {
+		legacy.WindSpeed = &speed
+		legacy.WindDirection = &deg
 		legacy.WindGust = presence.Wind.Gust
+	}
+	if presence.Clouds != nil {
+		legacy.CloudCover = &cloudCover
 	}
 	// The condition, description and icon are the first weather entry's, and they are
 	// only set when there is one: a slot with no weather entry reports them null rather

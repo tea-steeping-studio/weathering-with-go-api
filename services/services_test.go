@@ -3,6 +3,7 @@ package services
 import (
 	"encoding/json"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -10,6 +11,22 @@ import (
 
 	"weathering-with-go/models"
 )
+
+// decodeCurrentBody decodes a /data/2.5/weather body into both structs the mapper
+// takes, exactly as fetchCurrentWeather does. Going through the raw bytes is what lets
+// a fixture distinguish a member the upstream sent as 0 from one it never sent.
+func decodeCurrentBody(t *testing.T, raw string) (models.OpenWeatherMapResponse, models.CurrentWeatherPayload) {
+	t.Helper()
+	var owm models.OpenWeatherMapResponse
+	if err := json.Unmarshal([]byte(raw), &owm); err != nil {
+		t.Fatalf("failed to decode the fixture into the upstream struct: %v", err)
+	}
+	var payload models.CurrentWeatherPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("failed to decode the fixture into the payload: %v", err)
+	}
+	return owm, payload
+}
 
 func TestMapCurrentWeather(t *testing.T) {
 	svc := NewWeatherService("dummy")
@@ -46,15 +63,7 @@ func TestMapCurrentWeatherCarriesTheGustTheWayTheUpstreamMeant(t *testing.T) {
 		raw := `{"coord":{"lon":-0.13,"lat":51.51},"weather":[{"main":"Clear","description":"clear sky","icon":"01d"}],` +
 			`"main":{"temp":15.0,"feels_like":14.8,"pressure":1013,"humidity":72},"wind":` + wind + `,` +
 			`"clouds":{"all":40},"dt":1234567890,"sys":{"country":"GB"},"name":"London","cod":200}`
-		var owm models.OpenWeatherMapResponse
-		if err := json.Unmarshal([]byte(raw), &owm); err != nil {
-			t.Fatalf("failed to decode the fixture into the upstream struct: %v", err)
-		}
-		var payload models.CurrentWeatherPayload
-		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
-			t.Fatalf("failed to decode the fixture into the payload: %v", err)
-		}
-		return owm, payload
+		return decodeCurrentBody(t, raw)
 	}
 	renders := func(t *testing.T, current models.Current) string {
 		t.Helper()
@@ -138,18 +147,6 @@ const currentBodyWithWeather = `{"coord":{"lon":-0.13,"lat":51.51},"weather":[{"
 // rather than three empty strings beside it. The JSON is marshalled as well, because
 // "null rather than \"\"" is a claim about the response and not only about the pointer.
 func TestMapCurrentWeatherNullsTheConditionTrioWithoutWeather(t *testing.T) {
-	decode := func(t *testing.T, raw string) (models.OpenWeatherMapResponse, models.CurrentWeatherPayload) {
-		t.Helper()
-		var owm models.OpenWeatherMapResponse
-		if err := json.Unmarshal([]byte(raw), &owm); err != nil {
-			t.Fatalf("failed to decode the fixture into the upstream struct: %v", err)
-		}
-		var payload models.CurrentWeatherPayload
-		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
-			t.Fatalf("failed to decode the fixture into the payload: %v", err)
-		}
-		return owm, payload
-	}
 	renders := func(t *testing.T, current models.Current) string {
 		t.Helper()
 		out, err := json.Marshal(current)
@@ -159,7 +156,7 @@ func TestMapCurrentWeatherNullsTheConditionTrioWithoutWeather(t *testing.T) {
 		return string(out)
 	}
 
-	owm, payload := decode(t, currentBodyNoWeather)
+	owm, payload := decodeCurrentBody(t, currentBodyNoWeather)
 	data := NewWeatherService("dummy").mapCurrentWeather(owm, payload)
 
 	// The faithful mirror: an absent weather array is null, since the slice carries no
@@ -201,7 +198,7 @@ func TestMapCurrentWeatherNullsTheConditionTrioWithoutWeather(t *testing.T) {
 	// The same body with a weather[] entry reports the trio, and the description is the
 	// title-cased upstream string the legacy vocabulary has always carried. Without
 	// this the nulls above would pass on a mapper that dropped the trio entirely.
-	withOWM, withPayload := decode(t, currentBodyWithWeather)
+	withOWM, withPayload := decodeCurrentBody(t, currentBodyWithWeather)
 	reported := NewWeatherService("dummy").mapCurrentWeather(withOWM, withPayload)
 
 	if len(reported.Weather) != 1 {
@@ -210,6 +207,122 @@ func TestMapCurrentWeatherNullsTheConditionTrioWithoutWeather(t *testing.T) {
 	requireString(t, "the condition", reported.Current.Condition, "Clouds")
 	requireString(t, "the description", reported.Current.Description, "Scattered Clouds")
 	requireString(t, "the icon", reported.Current.Icon, "03d")
+}
+
+// currentBlockBody renders a /data/2.5/weather body with exactly one block left out,
+// so the three cases come from one place and differ by one key each. Every other block
+// is present with a real reading, so a null in the response is the block that was left
+// out and not a thin fixture. A block the upstream sent with a member missing from it
+// is a fourth state and a different one; the gust tests cover that.
+func currentBlockBody(omit string) string {
+	main := `"main":{"temp":15.0,"feels_like":14.8,"temp_min":14.0,"temp_max":17.0,"pressure":1013,"humidity":72},`
+	wind := `"wind":{"speed":3.6,"deg":230},`
+	clouds := `"clouds":{"all":40},`
+	switch omit {
+	case "main":
+		main = ""
+	case "wind":
+		wind = ""
+	case "clouds":
+		clouds = ""
+	}
+	return `{"coord":{"lon":-0.13,"lat":51.51},"weather":[{"id":802,"main":"Clouds","description":"scattered clouds","icon":"03d"}],` +
+		`"base":"stations",` + main + `"visibility":10000,` + wind + clouds +
+		`"dt":1772000000,"sys":{"type":2,"id":5081,"country":"GB","sunrise":1771960000,"sunset":1772010000},` +
+		`"id":2643743,"timezone":0,"name":"London","cod":200}`
+}
+
+// legacyNulls asserts that every named member of the legacy current block is present
+// and null, and hands back the whole rendered block so a caller can check that the
+// readings outside the absent block survived. It marshals rather than reading the
+// pointers, because "reports null" is a claim about the JSON and a nil pointer only
+// becomes a null key through the encoder. Present matters as much as null: an absent
+// key answers a different question.
+func legacyNulls(t *testing.T, current models.Current, keys ...string) map[string]any {
+	t.Helper()
+	rendered, err := json.Marshal(current)
+	if err != nil {
+		t.Fatalf("failed to render the legacy current block: %v", err)
+	}
+	var block map[string]any
+	if err := json.Unmarshal(rendered, &block); err != nil {
+		t.Fatalf("failed to decode the rendered legacy block: %v", err)
+	}
+	for _, key := range keys {
+		value, present := block[key]
+		if !present {
+			t.Fatalf("expected the legacy key %q to be present, got %v", key, block)
+		}
+		if value != nil {
+			t.Fatalf("expected the legacy key %q to be null, got %#v", key, value)
+		}
+	}
+	return block
+}
+
+// The legacy current block is gated on the same blocks as the faithful one, and the
+// two vocabularies have to answer one question the same way. They did not: the legacy
+// block was assigned in one literal from locals read straight off the decode struct,
+// so a body with no wind reported "wind": null beside current.wind_speed: 0 and
+// current.wind_direction: 0, a body with no main reported "main": null beside four
+// fabricated zeroes, and a body with no clouds reported "clouds": null beside
+// current.cloud_cover: 0. The two halves of one response contradicting each other about
+// whether the upstream measured anything is the defect the pointer-shaped blocks exist
+// to prevent, and this half of the block had been left out of it. The seven day route's
+// mapper has always read it this way.
+//
+// Every case asserts the faithful block too, because the legacy key is an alias of it
+// and a mapper that nulled both would pass a check on the legacy block alone.
+func TestMapCurrentWeatherNullsTheLegacyBlockBesideAnAbsentUpstreamBlock(t *testing.T) {
+	for _, tc := range []struct {
+		omit   string
+		legacy []string
+	}{
+		{"main", []string{"temperature", "feels_like", "humidity", "pressure"}},
+		{"wind", []string{"wind_speed", "wind_direction"}},
+		{"clouds", []string{"cloud_cover"}},
+	} {
+		t.Run(tc.omit, func(t *testing.T) {
+			owm, payload := decodeCurrentBody(t, currentBlockBody(tc.omit))
+			data := NewWeatherService("dummy").mapCurrentWeather(owm, payload)
+
+			// The faithful block is the anchor: it is the one half of the response that
+			// was already right, and the legacy keys are aliases of its members.
+			var reported any
+			switch tc.omit {
+			case "main":
+				reported = data.Main
+			case "wind":
+				reported = data.Wind
+			case "clouds":
+				reported = data.Clouds
+			}
+			if !isNil(reported) {
+				t.Fatalf("expected a null faithful %s block for a body that sent none, got %#v", tc.omit, reported)
+			}
+
+			// The rest of the block is unaffected, so this is a handful of gaps rather
+			// than an empty object: a mapper that nulled everything on an absent block
+			// fails here.
+			block := legacyNulls(t, data.Current, tc.legacy...)
+			if block["last_updated"] == nil {
+				t.Fatalf("expected a real last_updated beside the nulls, got %v", block["last_updated"])
+			}
+			if block["visibility"] != 10000.0 {
+				t.Fatalf("expected a visibility of 10000 beside the nulls, got %#v", block["visibility"])
+			}
+			requireString(t, "the condition beside the nulls", data.Current.Condition, "Clouds")
+		})
+	}
+}
+
+// isNil reports whether an interface holds a nil pointer, which is how a faithful
+// block that the upstream did not send reaches here. The blocks are three different
+// pointer types and the case is one assertion, so reflection is cheaper than a case
+// per type; a non-nil block is passed through, so the caller can print it.
+func isNil(block any) bool {
+	value := reflect.ValueOf(block)
+	return value.Kind() == reflect.Pointer && value.IsNil()
 }
 
 // Fixed slots for ordering tests, so results never depend on the wall clock.
@@ -1106,6 +1219,87 @@ func TestCurrentFromForecastReportsTheGustTheWayTheUpstreamMeant(t *testing.T) {
 	if slot := measured.Forecast[0].Hourly[0].Wind; slot == nil || slot.Gust == nil || *slot.Gust != 7.5 {
 		t.Fatalf("expected a faithful gust of 7.5, got %#v", slot)
 	}
+}
+
+// forecastSlotBody renders one three hour slot with exactly one block left out, so the
+// three cases come from one place and differ by one key each. Every other block is
+// present with a real reading, so a null in the response is the block that was left out
+// and not a thin fixture.
+func forecastSlotBody(t *testing.T, omit string) string {
+	t.Helper()
+	slot := map[string]any{
+		"dt":      1772000000,
+		"main":    map[string]any{"temp": 18.0, "feels_like": 17.2, "temp_min": 15.0, "temp_max": 21.0, "pressure": 1012, "humidity": 70},
+		"weather": []any{map[string]any{"main": "Rain", "description": "light rain", "icon": "10d"}},
+		"clouds":  map[string]any{"all": 80},
+		"wind":    map[string]any{"speed": 5.0, "deg": 90},
+		"sys":     map[string]any{"pod": "d"},
+	}
+	if omit != "" {
+		delete(slot, omit)
+	}
+	return mustSlotJSON(t, slot)
+}
+
+// The same rule the current route's legacy block now follows, on the second route that
+// derives one. The five day block is slot zero's readings, and it was assigned in one
+// literal from locals read straight off the decode struct, so a slot the upstream sent
+// with no wind reported "wind": null in the faithful slot beside current.wind_speed: 0
+// and current.wind_direction: 0, and a slot with no main reported "main": null beside
+// five fabricated zeroes. The seven day route has always read its block through the
+// presence view, so one case, one rule, all three routes.
+//
+// The extremes are in the main case for the same reason and not because the review
+// named them: they are members of the same block as the temperature, so a mapper that
+// gates four keys of a block and leaves the other two ungated has still reported a
+// reading from a block the upstream did not send.
+func TestCurrentFromForecastNullsTheLegacyBlockBesideAnAbsentUpstreamBlock(t *testing.T) {
+	for _, tc := range []struct {
+		omit   string
+		legacy []string
+	}{
+		{"main", []string{"temperature", "feels_like", "humidity", "pressure", "max_temperature", "min_temperature"}},
+		{"wind", []string{"wind_speed", "wind_direction"}},
+		{"clouds", []string{"cloud_cover"}},
+	} {
+		t.Run(tc.omit, func(t *testing.T) {
+			data := mapForecastBody(t, forecastBody(t, forecastSlotBody(t, tc.omit)), 5)
+
+			// The faithful slot is the anchor: it is the half of the response that was
+			// already right, and the legacy keys are aliases of its members.
+			slot := data.Forecast[0].Hourly[0]
+			var reported any
+			switch tc.omit {
+			case "main":
+				reported = slot.Main
+			case "wind":
+				reported = slot.Wind
+			case "clouds":
+				reported = slot.Clouds
+			}
+			if !isNil(reported) {
+				t.Fatalf("expected a null faithful %s block on the slot for a slot that carried none, got %#v", tc.omit, reported)
+			}
+
+			// The rest of the block is unaffected, so this is a handful of gaps rather
+			// than an empty object: a mapper that nulled everything on an absent block
+			// fails here.
+			block := legacyNulls(t, data.Current, tc.legacy...)
+			if block["last_updated"] == nil {
+				t.Fatalf("expected a real last_updated beside the nulls, got %v", block["last_updated"])
+			}
+			requireString(t, "the condition beside the nulls", data.Current.Condition, "Rain")
+		})
+	}
+
+	// A block the upstream did send is unaffected, so the nulls above are the absent
+	// block and not the mapper dropping readings. Without this a mapper that nulled
+	// the legacy block unconditionally would pass every case above.
+	reported := mapForecastBody(t, forecastBody(t, forecastSlotBody(t, "")), 5)
+	requireFloat(t, "the temperature on a complete slot", reported.Current.Temperature, 18.0)
+	requireInt(t, "the humidity on a complete slot", reported.Current.Humidity, 70)
+	requireFloat(t, "the wind speed on a complete slot", reported.Current.WindSpeed, 5.0)
+	requireInt(t, "the cloud cover on a complete slot", reported.Current.CloudCover, 80)
 }
 
 // The mapper is handed a payload shorter than the upstream list, which cannot
