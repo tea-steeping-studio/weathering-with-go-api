@@ -684,6 +684,61 @@ func TestCurrentFromForecastCarriesTheFirstSlotVisibility(t *testing.T) {
 	requireFloat(t, "a measured zero visibility", measuredZero.Current.Visibility, 0)
 }
 
+// wind.gust is not documented for a three hour slot, so its zero in the decode struct
+// means "no gust" rather than "a measured 0 m/s". Taking its address fabricated the 0,
+// and the legacy key has an omitempty that drops a nil, so the three states have to come
+// out as three answers: the key absent, a 0, and the number.
+func TestCurrentFromForecastReportsTheGustTheWayTheUpstreamMeant(t *testing.T) {
+	slotWith := func(wind map[string]any) string {
+		return mustSlotJSON(t, map[string]any{
+			"dt":      1772000000,
+			"main":    map[string]any{"temp": 18.0, "pressure": 1012, "humidity": 70},
+			"weather": []any{map[string]any{"main": "Rain", "description": "light rain", "icon": "10d"}},
+			"clouds":  map[string]any{"all": 80},
+			"wind":    wind,
+		})
+	}
+
+	// The upstream sent a wind block with no gust in it. The key is absent, which is the
+	// only honest answer: 0 m/s would be a measurement nobody made, and the decode
+	// field's zero is exactly that zero read as a reading.
+	noGust := mapForecastBody(t, forecastBody(t,
+		slotWith(map[string]any{"speed": 5.0, "deg": 90}),
+	), 5)
+	if noGust.Current.WindGust != nil {
+		t.Fatalf("expected no legacy gust for a slot that sent none, got %v", *noGust.Current.WindGust)
+	}
+	// The faithful slot agrees: the same absent member, null there and omitted here,
+	// which is the one place the two vocabularies differ in shape rather than in value.
+	if noGust.Forecast[0].Hourly[0].Wind == nil || noGust.Forecast[0].Hourly[0].Wind.Gust != nil {
+		t.Fatalf("expected a null faithful gust for a slot that sent none, got %#v", noGust.Forecast[0].Hourly[0].Wind)
+	}
+
+	// The upstream measured 0 m/s. That is a reading, and a non-nil pointer to zero is
+	// what distinguishes it from the case above: the key is present and says 0.
+	measuredZero := mapForecastBody(t, forecastBody(t,
+		slotWith(map[string]any{"speed": 5.0, "deg": 90, "gust": 0}),
+	), 5)
+	if measuredZero.Current.WindGust == nil {
+		t.Fatal("expected a legacy gust for a measured 0, got null")
+	}
+	if *measuredZero.Current.WindGust != 0 {
+		t.Fatalf("expected a measured 0 gust to serialise as 0, got %v", *measuredZero.Current.WindGust)
+	}
+	if slot := measuredZero.Forecast[0].Hourly[0].Wind; slot == nil || slot.Gust == nil || *slot.Gust != 0 {
+		t.Fatalf("expected a faithful gust of 0, got %#v", slot)
+	}
+
+	// The ordinary case: a gust is a gust.
+	measured := mapForecastBody(t, forecastBody(t,
+		slotWith(map[string]any{"speed": 5.0, "deg": 90, "gust": 7.5}),
+	), 5)
+	requireFloat(t, "a measured gust", measured.Current.WindGust, 7.5)
+	if slot := measured.Forecast[0].Hourly[0].Wind; slot == nil || slot.Gust == nil || *slot.Gust != 7.5 {
+		t.Fatalf("expected a faithful gust of 7.5, got %#v", slot)
+	}
+}
+
 // The mapper is handed a payload shorter than the upstream list, which cannot
 // happen from a real body but must not panic or index out of range if it ever does.
 // An empty payload leaves every slot reporting no presence, and the day then says

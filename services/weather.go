@@ -1133,11 +1133,21 @@ func floatPtr(reading *int) *float64 {
 // reported as last_updated so callers can see how stale the reading is.
 //
 // presence is the payload view of the same slot, and every member whose zero in the
-// decode struct could be an absent member is read from it. Visibility is one of those:
-// the endpoint documents list.visibility, so the faithful hourly slot and this legacy
-// block were reporting the same datum two ways, the slot populated and the block null.
-// A slot the upstream sent without one leaves it null here, rather than a visibility of
-// 0 metres, which is what reading the non-pointer field would have reported.
+// decode struct could be an absent member is read from it. Two are read that way here.
+//
+// Visibility is one: the endpoint documents list.visibility, so the faithful hourly slot
+// and this legacy block were reporting the same datum two ways, the slot populated and
+// the block null. A slot the upstream sent without one leaves it null here, rather than
+// a visibility of 0 metres, which is what reading the non-pointer field would have
+// reported.
+//
+// WindGust is the other, and the opposite way round. The endpoint does not document
+// wind.gust for a three hour slot, so the decode field's zero means "no gust" rather
+// than "a measured 0 m/s", and taking its address fabricated the 0. Reading the payload
+// gives the three states their three answers: no gust leaves the member nil and omitempty
+// drops the key, a measured 0 is a non-nil pointer to zero and is reported as 0, and a
+// gust is that number. Every other member below is documented as sent on every slot, so
+// its zero in the decode struct is a real reading and the payload needs no view of it.
 func currentFromForecast(items []models.ForecastItem, presence models.ForecastPayloadItem) models.Current {
 	if len(items) == 0 {
 		return models.Current{}
@@ -1161,7 +1171,7 @@ func currentFromForecast(items []models.ForecastItem, presence models.ForecastPa
 	// reading on a real body, and its JSON is unchanged.
 	temp, feelsLike := nearest.Main.Temp, nearest.Main.FeelsLike
 	humidity, pressure := nearest.Main.Humidity, float64(nearest.Main.Pressure)
-	speed, deg, gust := nearest.Wind.Speed, nearest.Wind.Deg, nearest.Wind.Gust
+	speed, deg := nearest.Wind.Speed, nearest.Wind.Deg
 	maxTemp, minTemp := nearest.Main.TempMax, nearest.Main.TempMin
 	cloudCover := nearest.Clouds.All
 	// UTC, as on the other two routes: the same body must serialise the same way on
@@ -1175,7 +1185,6 @@ func currentFromForecast(items []models.ForecastItem, presence models.ForecastPa
 		Pressure:      &pressure,
 		WindSpeed:     &speed,
 		WindDirection: &deg,
-		WindGust:      &gust,
 		MaxTemp:       &maxTemp,
 		MinTemp:       &minTemp,
 		CloudCover:    &cloudCover,
@@ -1184,6 +1193,12 @@ func currentFromForecast(items []models.ForecastItem, presence models.ForecastPa
 		// than the decode struct's zero, so the same reading reaches the faithful
 		// hourly slot and this block, and an absent one is null in both.
 		Visibility: floatPtr(presence.Visibility),
+	}
+	// The gust is the other conditional member, and the pointer is the whole of it: a
+	// slot the upstream sent a wind block for with no gust leaves this nil, so the key
+	// is absent rather than 0, and a slot that measured one keeps the number.
+	if presence.Wind != nil {
+		legacy.WindGust = presence.Wind.Gust
 	}
 	// The condition, description and icon are the first weather entry's, and they are
 	// only set when there is one: a slot with no weather entry reports them null rather
