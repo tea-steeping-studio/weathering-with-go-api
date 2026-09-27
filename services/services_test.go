@@ -632,6 +632,58 @@ func TestMapForecastPopulatesCurrent(t *testing.T) {
 	requireTime(t, "the current last_updated", got.LastUpdated, time.Unix(1772000000, 0))
 }
 
+// The legacy current block is slot zero's readings, and visibility is one of them:
+// the endpoint documents list.visibility, so the faithful hourly slot and the legacy
+// block were reporting the same datum two ways. A slot that carries one has to reach
+// both, and a slot the upstream sent without one has to be null in both rather than a
+// visibility of 0 metres, which is what reading the non-pointer field reports.
+func TestCurrentFromForecastCarriesTheFirstSlotVisibility(t *testing.T) {
+	slot := func(visibility any) string {
+		members := map[string]any{
+			"dt":      1772000000,
+			"main":    map[string]any{"temp": 18.0, "feels_like": 17.2, "temp_min": 15.0, "temp_max": 21.0, "pressure": 1012, "humidity": 70},
+			"weather": []any{map[string]any{"main": "Rain", "description": "light rain", "icon": "10d"}},
+			"clouds":  map[string]any{"all": 80},
+			"wind":    map[string]any{"speed": 5.0, "deg": 90},
+		}
+		if visibility != nil {
+			members["visibility"] = visibility
+		}
+		return mustSlotJSON(t, members)
+	}
+
+	// The first slot reports a visibility. The legacy block and the faithful slot have
+	// to agree, and the value is a reading rather than a derived one.
+	reported := mapForecastBody(t, forecastBody(t, slot(9000), slot(8000)), 5)
+	requireFloat(t, "the legacy current visibility", reported.Current.Visibility, 9000)
+	if slotVisibility := reported.Forecast[0].Hourly[0].Visibility; slotVisibility == nil {
+		t.Fatal("expected the faithful slot to report its visibility, got null")
+	} else if *slotVisibility != 9000 {
+		t.Fatalf("expected the faithful slot visibility 9000, got %d", *slotVisibility)
+	}
+	if legacy := reported.Current.Visibility; legacy == nil || *legacy != float64(*reported.Forecast[0].Hourly[0].Visibility) {
+		t.Fatalf("expected the legacy block and the faithful slot to report one visibility, got %v and %d", legacy, *reported.Forecast[0].Hourly[0].Visibility)
+	}
+
+	// The first slot carries no visibility at all. Both go null: 0 metres of
+	// visibility is a reading nobody made, and the legacy key has never had a way to
+	// say null other than by being absent.
+	absent := mapForecastBody(t, forecastBody(t, slot(nil), slot(8000)), 5)
+	if absent.Current.Visibility != nil {
+		t.Fatalf("expected a null legacy visibility for a slot that sent none, got %v", *absent.Current.Visibility)
+	}
+	if absent.Forecast[0].Hourly[0].Visibility != nil {
+		t.Fatalf("expected a null faithful slot visibility for a slot that sent none, got %d",
+			*absent.Forecast[0].Hourly[0].Visibility)
+	}
+
+	// A slot that reports a visibility the upstream measured as 0 is still a reading,
+	// and a non-nil pointer is what says so. The legacy key carries no omitempty, so
+	// 0 reaches the JSON rather than being dropped.
+	measuredZero := mapForecastBody(t, forecastBody(t, slot(0)), 5)
+	requireFloat(t, "a measured zero visibility", measuredZero.Current.Visibility, 0)
+}
+
 // The mapper is handed a payload shorter than the upstream list, which cannot
 // happen from a real body but must not panic or index out of range if it ever does.
 // An empty payload leaves every slot reporting no presence, and the day then says

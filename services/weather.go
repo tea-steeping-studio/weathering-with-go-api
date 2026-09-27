@@ -827,7 +827,7 @@ func (w *WeatherService) mapForecast(owm models.OpenWeatherMapForecastResponse, 
 			Latitude:  lat,
 			Longitude: lon,
 		},
-		Current:  currentFromForecast(owm.List),
+		Current:  currentFromForecast(owm.List, forecastPresence(payload, 0)),
 		Forecast: forecasts,
 		// UTC, like the seven day route's request_time: a cache entry that renders in
 		// the server's zone is host dependent output.
@@ -1105,11 +1105,40 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 	return day
 }
 
+// forecastPresence is the presence view of the i-th slot, mirroring oneCallPresence on
+// the seven day route. The two decodes read the same array in the same order, so index
+// i of payload.List is the presence view of index i of items[i].
+func forecastPresence(payload models.ForecastPayload, i int) models.ForecastPayloadItem {
+	if i < len(payload.List) {
+		return payload.List[i]
+	}
+	return models.ForecastPayloadItem{}
+}
+
+// floatPtr widens an int reading to the float the legacy block carries, keeping nil nil
+// so an absent reading stays absent through the conversion. models.Current.Pressure and
+// .Visibility are floats where the upstream reports ints, which is the only reason this
+// exists.
+func floatPtr(reading *int) *float64 {
+	if reading == nil {
+		return nil
+	}
+	widened := float64(*reading)
+	return &widened
+}
+
 // currentFromForecast maps the nearest forecast slot onto our model. The 5 day
-// endpoint returns 3 hour slots rather than true current conditions, and it carries
-// no visibility, so that member is null rather than a visibility of 0 metres. The slot
-// timestamp is reported as last_updated so callers can see how stale the reading is.
-func currentFromForecast(items []models.ForecastItem) models.Current {
+// endpoint returns 3 hour slots rather than true current conditions, so this block is
+// a slot's readings under a name that promises otherwise; the slot timestamp is
+// reported as last_updated so callers can see how stale the reading is.
+//
+// presence is the payload view of the same slot, and every member whose zero in the
+// decode struct could be an absent member is read from it. Visibility is one of those:
+// the endpoint documents list.visibility, so the faithful hourly slot and this legacy
+// block were reporting the same datum two ways, the slot populated and the block null.
+// A slot the upstream sent without one leaves it null here, rather than a visibility of
+// 0 metres, which is what reading the non-pointer field would have reported.
+func currentFromForecast(items []models.ForecastItem, presence models.ForecastPayloadItem) models.Current {
 	if len(items) == 0 {
 		return models.Current{}
 	}
@@ -1128,11 +1157,8 @@ func currentFromForecast(items []models.ForecastItem) models.Current {
 
 	// The values are the ones this function has always read, taken by address because
 	// models.Current is pointer shaped. An empty list returns the all-null zero value
-	// above, which is what the block is now able to say. On a real body every key set
-	// below is a reading and its JSON is unchanged, with one exception that has always
-	// been there: visibility is not assigned at all, because the three hour endpoint
-	// reports no visibility, so that member is null on every response this route
-	// produces.
+	// above, which is what the block is now able to say. Every key set below is a
+	// reading on a real body, and its JSON is unchanged.
 	temp, feelsLike := nearest.Main.Temp, nearest.Main.FeelsLike
 	humidity, pressure := nearest.Main.Humidity, float64(nearest.Main.Pressure)
 	speed, deg, gust := nearest.Wind.Speed, nearest.Wind.Deg, nearest.Wind.Gust
@@ -1154,6 +1180,10 @@ func currentFromForecast(items []models.ForecastItem) models.Current {
 		MinTemp:       &minTemp,
 		CloudCover:    &cloudCover,
 		LastUpdated:   &updated,
+		// The documented list.visibility of the slot, through the presence view rather
+		// than the decode struct's zero, so the same reading reaches the faithful
+		// hourly slot and this block, and an absent one is null in both.
+		Visibility: floatPtr(presence.Visibility),
 	}
 	// The condition, description and icon are the first weather entry's, and they are
 	// only set when there is one: a slot with no weather entry reports them null rather
