@@ -56,7 +56,10 @@ func mustSlotJSON(t *testing.T, slot map[string]any) string {
 // forecastBody wraps rendered slots in a /data/2.5/forecast envelope.
 func forecastBody(t *testing.T, slots ...string) string {
 	t.Helper()
-	return `{"cod":"200","message":0,"cnt":` + strconv.Itoa(len(slots)) +
+	// message is the upstream's calculation time and arrives as a float, such as
+	// 0.0117. Every fixture here carries that shape so a decode that reverted the
+	// field to an int would fail this whole package rather than one test.
+	return `{"cod":"200","message":0.0117,"cnt":` + strconv.Itoa(len(slots)) +
 		`,"list":[` + strings.Join(slots, ",") +
 		`],"city":{"id":2643743,"name":"London","coord":{"lon":-0.13,"lat":51.51},"country":"GB","population":7556900,"timezone":0,"sunrise":1771999200,"sunset":1772030400}}`
 }
@@ -92,11 +95,10 @@ func assertClose(t *testing.T, what string, got, want float64) {
 	}
 }
 
-// forecastLocalMidnight anchors the forecast fixtures. The route groups slots by the
-// date a timestamp formats to in this process's zone, so a fixed UTC instant would
-// land on two grouped days on some hosts. Anchoring on local midnight keeps every
-// fixture's slots on exactly one day wherever the tests run.
-var forecastLocalMidnight = time.Date(2026, 2, 1, 0, 0, 0, 0, time.Local)
+// forecastUTCMidnight anchors the forecast fixtures. The route groups slots by the
+// UTC date of a timestamp, so a UTC anchor is what makes a fixture land on exactly
+// one day on every host, whatever the test process's own zone happens to be.
+var forecastUTCMidnight = time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
 
 // popSlots renders a day of three hour slots, carrying only dt and the members a pop
 // test names. Index i of pops is the offset from the anchor in three hour steps, so
@@ -121,7 +123,7 @@ func popSlots(t *testing.T, at time.Time, pops map[int]float64) string {
 }
 
 func TestDailyPopIsMaxAcrossSlots(t *testing.T) {
-	body := popSlots(t, forecastLocalMidnight, map[int]float64{0: 0.1, 1: 0.8, 2: 0.3, 3: 0.2})
+	body := popSlots(t, forecastUTCMidnight, map[int]float64{0: 0.1, 1: 0.8, 2: 0.3, 3: 0.2})
 
 	day := mapForecastBody(t, body, 5).Forecast[0]
 
@@ -140,7 +142,7 @@ func TestDailyPopIsMaxAcrossSlots(t *testing.T) {
 }
 
 func TestDailyPopIgnoresSlotsWithoutPop(t *testing.T) {
-	body := popSlots(t, forecastLocalMidnight, map[int]float64{0: 0.5, 2: 0.9})
+	body := popSlots(t, forecastUTCMidnight, map[int]float64{0: 0.5, 2: 0.9})
 
 	day := mapForecastBody(t, body, 5).Forecast[0]
 
@@ -160,19 +162,35 @@ func TestDailyPopIgnoresSlotsWithoutPop(t *testing.T) {
 	assertClose(t, "the day pop_mean", *day.PopMean, 0.7)
 }
 
+// chance_of_rain is the day's pop as a whole percentage, and it has to be rounded.
+// 0.29 is 28.999999999999996 in binary floating point and 0.425 is exactly 42.5, so
+// a truncating conversion answers 28 and 42 for days the upstream called 29 and 43
+// percent. The number this key reports is the one the reported bug was about, so a
+// truncation bug in it is not a rounding detail.
 func TestLegacyChanceOfRainMatchesDailyPop(t *testing.T) {
-	body := popSlots(t, forecastLocalMidnight, map[int]float64{0: 0.42})
+	for _, tc := range []struct {
+		pop  float64
+		want int
+	}{
+		{pop: 0.42, want: 42},
+		{pop: 0.29, want: 29},
+		{pop: 0.425, want: 43},
+		{pop: 0.0, want: 0},
+	} {
+		body := popSlots(t, forecastUTCMidnight, map[int]float64{0: tc.pop})
 
-	day := mapForecastBody(t, body, 5).Forecast[0]
+		day := mapForecastBody(t, body, 5).Forecast[0]
 
-	if day.Pop == nil {
-		t.Fatal("expected a day pop, got none")
-	}
-	if day.ChanceOfRain == nil {
-		t.Fatal("expected a legacy chance_of_rain, got none")
-	}
-	if want := int(*day.Pop * 100); *day.ChanceOfRain != want {
-		t.Fatalf("expected chance_of_rain %d to match pop %v, got %d", want, *day.Pop, *day.ChanceOfRain)
+		if day.Pop == nil {
+			t.Fatalf("pop %v: expected a day pop, got none", tc.pop)
+		}
+		assertClose(t, "the day pop", *day.Pop, tc.pop)
+		if day.ChanceOfRain == nil {
+			t.Fatalf("pop %v: expected a legacy chance_of_rain, got none", tc.pop)
+		}
+		if *day.ChanceOfRain != tc.want {
+			t.Fatalf("pop %v: expected chance_of_rain %d, got %d", tc.pop, tc.want, *day.ChanceOfRain)
+		}
 	}
 }
 
@@ -180,7 +198,7 @@ func TestLegacyChanceOfRainMatchesDailyPop(t *testing.T) {
 // the day reports null for every member it has no source for. temp.min and
 // temp.max are the exception and they are derived, not measured.
 func TestForecastDayHasNoTimeOfDayBreakdown(t *testing.T) {
-	at := forecastLocalMidnight
+	at := forecastUTCMidnight
 	slots := []string{
 		mustSlotJSON(t, map[string]any{
 			"dt":   at.Unix(),
@@ -237,28 +255,24 @@ func TestForecastDayHasNoTimeOfDayBreakdown(t *testing.T) {
 	}
 }
 
-// Slots are grouped by the date their timestamp formats to, and time.Unix returns
-// local time, so the boundary is the process's local midnight rather than UTC. The
-// plan and the brief describe this grouping as UTC; on any host whose offset is not
-// zero the two differ, and the fixtures in the other tests here are only split in
-// two because the test process is on UTC. The two slots below therefore sit an hour
-// either side of local midnight, so the split is the same on every host.
-//
-// The grouping itself is not this task's to change: it is the existing
-// Format("2006-01-02") behaviour, kept deliberately.
+// Slots are grouped by the UTC date of their timestamp, so a slot at 23:00 UTC and
+// one at 01:00 UTC the next morning are two days. The two instants here are fixed,
+// and the expected day keys are the literal UTC dates they fall on rather than
+// anything this process's own zone would format them as, so the test fails if the
+// .UTC() in the grouping is removed and the suite is run anywhere but UTC.
 func TestForecastDayGroupsSlotsAcrossUtcMidnight(t *testing.T) {
-	boundary := time.Date(2026, 2, 1, 0, 0, 0, 0, time.Local)
+	late := time.Date(2026, 2, 1, 23, 0, 0, 0, time.UTC)
 	slots := []string{
-		mustSlotJSON(t, map[string]any{"dt": boundary.Add(-time.Hour).Unix(), "main": map[string]any{"temp": 4.0}}),
-		mustSlotJSON(t, map[string]any{"dt": boundary.Add(time.Hour).Unix(), "main": map[string]any{"temp": 2.0}}),
+		mustSlotJSON(t, map[string]any{"dt": late.Unix(), "main": map[string]any{"temp": 4.0}}),
+		mustSlotJSON(t, map[string]any{"dt": late.Add(2 * time.Hour).Unix(), "main": map[string]any{"temp": 2.0}}),
 	}
 
 	days := mapForecastBody(t, forecastBody(t, slots...), 5).Forecast
 
 	if len(days) != 2 {
-		t.Fatalf("expected the midnight to split the slots into 2 days, got %d: %+v", len(days), days)
+		t.Fatalf("expected the UTC midnight to split the slots into 2 days, got %d: %+v", len(days), days)
 	}
-	want := []string{boundary.Add(-time.Hour).Format("2006-01-02"), boundary.Add(time.Hour).Format("2006-01-02")}
+	want := []string{"2026-02-01", "2026-02-02"}
 	for i, day := range days {
 		if got := day.Date.Format("2006-01-02"); got != want[i] {
 			t.Fatalf("expected day %d to be %s got %s", i, want[i], got)
@@ -291,6 +305,73 @@ func forecastResponseFixture() models.OpenWeatherMapForecastResponse {
 			},
 		},
 		City: models.City{Name: "London", Country: "GB", Coord: models.Coordinates{Lat: 51.51, Lon: -0.13}},
+	}
+}
+
+// Every day value that is not a date is a rollup over the day's slots, and a mean
+// is taken over the slots that actually carry the member. Two cases: a full day, and
+// a day whose second slot reported no main and no clouds block, so the means are
+// taken over the one slot that has them rather than being diluted by a zero.
+func TestForecastDayRollsUpSlotMeans(t *testing.T) {
+	full := mapForecastBody(t, forecastBody(t,
+		mustSlotJSON(t, map[string]any{
+			"dt":         forecastUTCMidnight.Unix(),
+			"main":       map[string]any{"temp": 18.0, "pressure": 1012, "humidity": 70},
+			"clouds":     map[string]any{"all": 80},
+			"wind":       map[string]any{"speed": 5.0, "deg": 90, "gust": 7.5},
+			"visibility": 10000,
+		}),
+		mustSlotJSON(t, map[string]any{
+			"dt":         forecastUTCMidnight.Add(3 * time.Hour).Unix(),
+			"main":       map[string]any{"temp": 19.0, "pressure": 1011, "humidity": 65},
+			"clouds":     map[string]any{"all": 0},
+			"wind":       map[string]any{"speed": 3.0, "deg": 100},
+			"visibility": 9000,
+		}),
+	), 5).Forecast[0]
+
+	if full.Humidity == nil || full.Pressure == nil || full.Clouds == nil || full.Visibility == nil || full.WindSpeed == nil {
+		t.Fatalf("expected every mean to be reported when both slots carry it, got %+v", full)
+	}
+	// Integer means truncate: (1012+1011)/2 is 1011.5 and (70+65)/2 is 67.5, which
+	// is the value the legacy humidity key has always reported.
+	if *full.Pressure != 1011 {
+		t.Fatalf("expected the day pressure mean 1011, got %d", *full.Pressure)
+	}
+	if *full.Humidity != 67 {
+		t.Fatalf("expected the day humidity mean 67, got %d", *full.Humidity)
+	}
+	if *full.Clouds != 40 || *full.Visibility != 9500 {
+		t.Fatalf("expected the day cloud and visibility means 40 and 9500, got %d and %d", *full.Clouds, *full.Visibility)
+	}
+	assertClose(t, "the day wind speed mean", *full.WindSpeed, 4.0)
+	// wind_gust is the max, and wind_deg is the direction of the day's strongest
+	// wind, not a mean of headings: the fastest slot here is the first, at deg 90.
+	if full.WindGust == nil || *full.WindGust != 7.5 {
+		t.Fatalf("expected the day wind_gust max 7.5, got %v", full.WindGust)
+	}
+	if full.WindDeg == nil || *full.WindDeg != 90 {
+		t.Fatalf("expected the day wind_deg 90 from the fastest slot, got %v", full.WindDeg)
+	}
+
+	partial := mapForecastBody(t, forecastBody(t,
+		mustSlotJSON(t, map[string]any{
+			"dt":     forecastUTCMidnight.Unix(),
+			"main":   map[string]any{"temp": 18.0, "pressure": 1012, "humidity": 70},
+			"clouds": map[string]any{"all": 80},
+		}),
+		mustSlotJSON(t, map[string]any{"dt": forecastUTCMidnight.Add(3 * time.Hour).Unix()}),
+	), 5).Forecast[0]
+
+	if partial.Pressure == nil || *partial.Pressure != 1012 {
+		t.Fatalf("expected the mean over the one slot that reported pressure, got %v", partial.Pressure)
+	}
+	if partial.Humidity == nil || *partial.Humidity != 70 {
+		t.Fatalf("expected the mean over the one slot that reported humidity, got %v", partial.Humidity)
+	}
+	// Nothing reported a wind, so there is no wind to average and none is invented.
+	if partial.WindSpeed != nil || partial.WindDeg != nil || partial.WindGust != nil {
+		t.Fatalf("expected no wind rollup when no slot reported wind, got %+v", partial)
 	}
 }
 
@@ -346,8 +427,8 @@ func TestMapForecastPopulatesCurrent(t *testing.T) {
 func TestMapForecastWithoutAPayloadStillRollsUpDays(t *testing.T) {
 	owm := models.OpenWeatherMapForecastResponse{
 		List: []models.ForecastItem{
-			{Dt: forecastLocalMidnight.Unix(), Main: models.Main{Temp: 11}, Clouds: models.Clouds{All: 20}},
-			{Dt: forecastLocalMidnight.Add(12 * time.Hour).Unix(), Main: models.Main{Temp: 12}, Clouds: models.Clouds{All: 40}},
+			{Dt: forecastUTCMidnight.Unix(), Main: models.Main{Temp: 11}, Clouds: models.Clouds{All: 20}},
+			{Dt: forecastUTCMidnight.Add(12 * time.Hour).Unix(), Main: models.Main{Temp: 12}, Clouds: models.Clouds{All: 40}},
 		},
 		City: models.City{Name: "London", Country: "GB", Coord: models.Coordinates{Lat: 51.51, Lon: -0.13}},
 	}
@@ -417,13 +498,8 @@ func TestMapForecastReturnsEarliestDaysInOrder(t *testing.T) {
 		t.Fatalf("expected 2 forecast days, got %d", len(data.Forecast))
 	}
 	// The three slots are noon UTC on three consecutive UTC dates, and the route
-	// groups by the date a timestamp formats to in this process's zone, so the
-	// expected keys are derived the same way. On a UTC host they read 2026-02-01 and
-	// 2026-02-02.
-	want := []string{
-		time.Unix(firstFeb, 0).Format("2006-01-02"),
-		time.Unix(secondFeb, 0).Format("2006-01-02"),
-	}
+	// groups by UTC date, so these are exact on every host.
+	want := []string{"2026-02-01", "2026-02-02"}
 	for i, day := range data.Forecast {
 		if got := day.Date.Format("2006-01-02"); got != want[i] {
 			t.Fatalf("expected day %d to be %s got %s", i, want[i], got)

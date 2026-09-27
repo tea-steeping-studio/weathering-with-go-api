@@ -161,6 +161,11 @@ var currentPayloadNarrowed = map[string]string{
 // it: a slot whose rain window measures 0 must not collapse into the same report as
 // a slot that never sent a rain block. OpenWeatherMapForecastResponse and
 // ForecastPayload are the pair to keep in step.
+//
+// The scope is those two decode-side types. A response-side field that neither
+// declares, such as the day's rolled up pressure, is out of this walk by
+// construction: it appears in no decode struct, so nothing can drift relative to
+// here. It is covered where it is produced, in TestForecastDayRollsUpSlotMeans.
 func TestForecastPayloadCoversDecodedFields(t *testing.T) {
 	upstream := jsonMemberPaths(reflect.TypeOf(OpenWeatherMapForecastResponse{}))
 	// jsonMemberPaths reports a slice as a leaf, and list is a slice, so the slot

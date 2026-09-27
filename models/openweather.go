@@ -78,10 +78,15 @@ type Sys struct {
 	Sunset  int64  `json:"sunset"`
 }
 
-// OpenWeatherMapForecastResponse represents the 5-day forecast response
+// OpenWeatherMapForecastResponse represents the 5-day forecast response.
+// Message is a float because that is what the endpoint sends: it carries the
+// calculation time, such as 0.0117, and a JSON float cannot decode into an int,
+// so an int here fails the whole body and the route answers 500 on a real
+// response. It is not a status code, and it is not the cod member, which is the
+// string above.
 type OpenWeatherMapForecastResponse struct {
 	Cod     string         `json:"cod"`
-	Message int            `json:"message"`
+	Message float64        `json:"message"`
 	Cnt     int            `json:"cnt"`
 	List    []ForecastItem `json:"list"`
 	City    City           `json:"city"`

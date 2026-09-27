@@ -90,7 +90,7 @@ func TestUpstreamModelsBindAllDocumentedFields(t *testing.T) {
 		t.Fatalf("expected rain 1h 0.4, got %v", resp.Rain.OneHour)
 	}
 
-	forecastBody := `{"cod":"200","message":0,"cnt":1,
+	forecastBody := `{"cod":"200","message":0.0117,"cnt":1,
 	"list":[{"dt":1485789600,"main":{"temp":280.32,"temp_kf":0.3},"weather":[{"id":500,"main":"Rain","description":"light rain","icon":"10d"}],
 	"clouds":{"all":90},"wind":{"speed":4.1,"deg":80,"gust":6.1},"visibility":10000,"pop":0.32,
 	"rain":{"3h":0.5},"snow":{"3h":0.1},"sys":{"pod":"d"},"dt_txt":"2017-01-30 18:00:00"}],
@@ -115,6 +115,11 @@ func TestUpstreamModelsBindAllDocumentedFields(t *testing.T) {
 	}
 	if forecast.City.Population != 1000000 {
 		t.Fatalf("expected city population 1000000, got %v", forecast.City.Population)
+	}
+	// The endpoint sends message as a float carrying the calculation time. Binding
+	// it as an int would fail this whole decode and turn a real response into a 500.
+	if forecast.Message != 0.0117 {
+		t.Fatalf("expected message 0.0117, got %v", forecast.Message)
 	}
 }
 

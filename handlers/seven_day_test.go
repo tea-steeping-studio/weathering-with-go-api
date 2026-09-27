@@ -20,16 +20,16 @@ const currentWeatherJSON = `{"coord":{"lon":-0.13,"lat":51.51},"weather":[{"main
 
 const forecastJSON = `{"cod":"200","message":0,"cnt":2,"list":[{"dt":1772000000,"main":{"temp":18.0,"temp_min":15.0,"temp_max":21.0,"feels_like":18.0,"pressure":1012,"humidity":70},"weather":[{"main":"Rain","description":"light rain","icon":"10d"}],"clouds":{"all":80},"wind":{"speed":5.0,"deg":90},"rain":{"3h":1.2},"sys":{"pod":"d"},"dt_txt":"2026-02-25 12:00:00"},{"dt":1772010800,"main":{"temp":19.0,"temp_min":16.0,"temp_max":22.0,"feels_like":19.0,"pressure":1011,"humidity":65},"weather":[{"main":"Clear","description":"clear sky","icon":"01d"}],"clouds":{"all":0},"wind":{"speed":3.0,"deg":100},"sys":{"pod":"d"},"dt_txt":"2026-02-25 15:00:00"}],"city":{"id":2643743,"name":"London","coord":{"lon":-0.13,"lat":51.51},"country":"GB","timezone":0}}`
 
-// forecastLocalMidnight anchors the forecast route fixtures. The route groups slots
-// by the date a timestamp formats to in this process's zone, so a fixed UTC instant
-// would land on two grouped days on some hosts. Anchoring on local midnight keeps
-// every fixture on exactly one day wherever the tests run.
-var forecastLocalMidnight = time.Date(2026, 2, 25, 0, 0, 0, 0, time.Local)
+// forecastUTCMidnight anchors the forecast route fixtures. The route groups slots by
+// the UTC date of a timestamp, so a UTC anchor is what makes a fixture land on
+// exactly one day on every host, whatever the test process's own zone is.
+var forecastUTCMidnight = time.Date(2026, 2, 25, 0, 0, 0, 0, time.UTC)
 
 // forecastSlot renders one raw three hour slot. A member left out of members is
 // left out of the body, which is how a fixture says the upstream never sent it.
+// dt_txt is the UTC rendering of the slot's own dt, as the upstream sends it.
 func forecastSlot(offsetHours int, members map[string]any) map[string]any {
-	dt := forecastLocalMidnight.Add(time.Duration(offsetHours) * time.Hour).Unix()
+	dt := forecastUTCMidnight.Add(time.Duration(offsetHours) * time.Hour).Unix()
 	members["dt"] = dt
 	members["dt_txt"] = time.Unix(dt, 0).UTC().Format("2006-01-02 15:04:05")
 	members["sys"] = map[string]any{"pod": "d"}
@@ -46,7 +46,9 @@ func forecastRouteBody(t *testing.T, slots ...map[string]any) string {
 		}
 		rendered = append(rendered, string(body))
 	}
-	return fmt.Sprintf(`{"cod":"200","message":0,"cnt":%d,"list":[%s],"city":{"id":2643743,"name":"London","coord":{"lon":-0.13,"lat":51.51},"country":"GB","population":7556900,"timezone":0,"sunrise":1771999200,"sunset":1772030400}}`,
+	// message is the upstream's calculation time and arrives as a float, such as
+	// 0.0117, so every forecast fixture carries that shape.
+	return fmt.Sprintf(`{"cod":"200","message":0.0117,"cnt":%d,"list":[%s],"city":{"id":2643743,"name":"London","coord":{"lon":-0.13,"lat":51.51},"country":"GB","population":7556900,"timezone":0,"sunrise":1771999200,"sunset":1772030400}}`,
 		len(slots), strings.Join(rendered, ","))
 }
 
@@ -291,6 +293,12 @@ func TestForecastRouteExposesRawSlotsWithPop(t *testing.T) {
 	if envelope["cnt"] != 2.0 {
 		t.Fatalf("expected the faithful envelope to mirror cnt 2, got %#v", envelope["cnt"])
 	}
+	// The upstream sends message as a float carrying the calculation time. Binding it
+	// as an int fails the whole decode, so this assertion is the guard against that
+	// coming back: the fixture's value is fractional on purpose.
+	if envelope["message"] != 0.0117 {
+		t.Fatalf("expected the faithful envelope to mirror message 0.0117, got %#v", envelope["message"])
+	}
 	city := block(t, envelope, "city")
 	if city["population"] != 7556900.0 {
 		t.Fatalf("expected faithful city.population 7556900, got %#v", city["population"])
@@ -357,13 +365,12 @@ func TestForecastRouteReportsMeasuredZeroRain(t *testing.T) {
 	if threeHour != 0.0 {
 		t.Fatalf("expected a measured rain.3h of 0, got %#v", threeHour)
 	}
-	// The 1h window is not documented for /data/2.5/forecast, so it can never carry
-	// a reading here. The shared RainBlock tags it as a required key, so it reports
-	// null instead of being absent, and this assertion records that as a pending
-	// ruling on whether the forecast route needs its own precipitation block types.
-	// It is not an endorsement of the key.
-	if value, ok := rain["1h"]; !ok || value != nil {
-		t.Fatalf("expected rain.1h to be present and carry no reading, got %#v (present %t)", value, ok)
+	// The 1h window is not documented for /data/2.5/forecast, so the key must be
+	// absent. It was briefly present and null, which is a key the endpoint never
+	// documented carrying no information; the forecast block types fix that by not
+	// declaring the member at all.
+	if value, ok := rain["1h"]; ok {
+		t.Fatalf("expected no 1h key on a forecast rain block, got %#v", value)
 	}
 	nullKey(t, slots[1], "rain")
 }

@@ -56,7 +56,8 @@ type CloudsBlock struct {
 // and a block upstream reported with no window in it does not look like a block
 // that was never sent. ThreeHour is the window /data/2.5/weather does not
 // document, so it is tagged omitempty, which on a pointer field drops only nil and
-// can never discard a measured zero.
+// can never discard a measured zero. /data/2.5/forecast does not document OneHour
+// at all, so it uses ForecastRainBlock instead of this type.
 type RainBlock struct {
 	OneHour   *float64 `json:"1h"`
 	ThreeHour *float64 `json:"3h,omitempty"`
@@ -65,10 +66,38 @@ type RainBlock struct {
 // SnowBlock represents the snow block of the /data/2.5 endpoints. It tags its
 // members for the same reasons as RainBlock: OneHour has no omitempty because the
 // window is documented, and ThreeHour has it because this endpoint does not
-// document that window.
+// document that window. /data/2.5/forecast uses ForecastSnowBlock.
 type SnowBlock struct {
 	OneHour   *float64 `json:"1h"`
 	ThreeHour *float64 `json:"3h,omitempty"`
+}
+
+// ForecastRainBlock is the rain block of the /data/2.5/forecast slots and of the
+// day rolled up from them.
+//
+// It exists because the two forecast endpoints need opposite treatment of the
+// same two windows and one shared type cannot express both. /data/2.5/weather
+// documents 1h and not 3h, so RainBlock makes 1h a required key that reports null
+// when the upstream measured nothing: a body of "rain":{} has to read as
+// {"1h":null} rather than as {}. /data/2.5/forecast documents 3h and not 1h, so
+// the 1h key must be absent entirely rather than permanently null, and a key the
+// endpoint does not document carries no information. Omitting the member is the
+// only way to say that with a struct tag.
+//
+// ThreeHour is a pointer with no omitempty, because the window is documented here:
+// a measured 0 serialises as 0, a block upstream sent with no window in it reports
+// null, and a block upstream never sent is a nil block, which is three different
+// readings.
+type ForecastRainBlock struct {
+	ThreeHour *float64 `json:"3h"`
+}
+
+// ForecastSnowBlock is the snow block of the /data/2.5/forecast route, and exists
+// for exactly the reason ForecastRainBlock does: the 1h window is not documented
+// here, so the member is absent rather than null, while 3h is documented and
+// reports null, 0 or an absent block as three separate states.
+type ForecastSnowBlock struct {
+	ThreeHour *float64 `json:"3h"`
 }
 
 // SysBlock represents the sys block of the /data/2.5 endpoints.
@@ -219,23 +248,22 @@ type FeelsLikePoint struct {
 // signal, and a second pointer for a string the endpoint does document would add
 // nothing.
 //
-// Rain and Snow carry the shared block types, so their 1h key is present and null:
-// the shared tags make the documented window required, and this endpoint documents
-// only 3h. The two routes need opposite tags on the same member, which one shared
-// type cannot express. The null is a statement about what this endpoint documents,
-// never a reading the upstream sent.
+// Rain and Snow use the forecast precipitation types rather than the shared ones,
+// so the 1h window is absent here rather than null: this endpoint documents the
+// 3h window only, and a key it does not document carries no information. See
+// ForecastRainBlock for why the two routes cannot share one type.
 type ForecastSlot struct {
-	Dt         int64        `json:"dt"`
-	Main       *MainBlock   `json:"main"`
-	Weather    []Weather    `json:"weather"`
-	Clouds     *CloudsBlock `json:"clouds"`
-	Wind       *WindBlock   `json:"wind"`
-	Visibility *int         `json:"visibility"`
-	Pop        *float64     `json:"pop"`
-	Rain       *RainBlock   `json:"rain"`
-	Snow       *SnowBlock   `json:"snow"`
-	Sys        *ForecastSys `json:"sys"`
-	DtTxt      string       `json:"dt_txt"`
+	Dt         int64              `json:"dt"`
+	Main       *MainBlock         `json:"main"`
+	Weather    []Weather          `json:"weather"`
+	Clouds     *CloudsBlock       `json:"clouds"`
+	Wind       *WindBlock         `json:"wind"`
+	Visibility *int               `json:"visibility"`
+	Pop        *float64           `json:"pop"`
+	Rain       *ForecastRainBlock `json:"rain"`
+	Snow       *ForecastSnowBlock `json:"snow"`
+	Sys        *ForecastSys       `json:"sys"`
+	DtTxt      string             `json:"dt_txt"`
 }
 
 // ForecastDay is one entry of the forecast route's forecast[] array, in the
@@ -249,9 +277,10 @@ type ForecastSlot struct {
 // always been. Their JSON is byte identical to the response this type replaces.
 //
 // MaxTemp, MinTemp and AvgTemp are value fields because the route always produces
-// them. ChanceOfRain and UVIndex are pointers because it does not: no slot
-// carrying pop leaves chance_of_rain null rather than reporting a fabricated zero,
-// and the three hour endpoint reports no uvi at all.
+// them. ChanceOfRain, UVIndex and Pressure are pointers because it does not: no
+// slot carrying pop leaves chance_of_rain null rather than reporting a fabricated
+// zero, the three hour endpoint reports no uvi at all, and a day whose slots
+// reported no main block has no pressure to average.
 type ForecastDay struct {
 	Date          time.Time `json:"date"`
 	MaxTemp       float64   `json:"max_temperature"`
@@ -275,45 +304,47 @@ type ForecastDay struct {
 	// temperatures. They are not the same quantity as a slot's main.temp_min and
 	// main.temp_max, which the upstream measures over its own three hour window.
 	//
-	// Clouds, Visibility, WindDeg, WindGust, Rain and Snow are the day's rollup as
-	// well. WindDeg is the direction of the slot with the day's strongest wind,
-	// matching the documented meaning of deg on the daily endpoints. Rain and Snow
-	// are sums of the slots' 3h windows and are null when no slot reported one.
+	// Clouds, Visibility, Pressure, WindDeg, WindGust, Rain and Snow are the day's
+	// rollup as well. WindDeg is the direction of the slot with the day's strongest
+	// wind, matching the documented meaning of deg on the daily endpoints. Rain and
+	// Snow are sums of the slots' 3h windows and are null when no slot reported one.
 	//
 	// FeelsLike and Uvi are always null here: the three hour endpoint reports
 	// neither.
-	Pop        *float64        `json:"pop"`
-	PopMin     *float64        `json:"pop_min"`
-	PopMean    *float64        `json:"pop_mean"`
-	Temp       *TempPoint      `json:"temp"`
-	FeelsLike  *FeelsLikePoint `json:"feels_like"`
-	WindDeg    *int            `json:"wind_deg"`
-	WindGust   *float64        `json:"wind_gust"`
-	Clouds     *int            `json:"clouds"`
-	Visibility *int            `json:"visibility"`
-	Rain       *RainBlock      `json:"rain"`
-	Snow       *SnowBlock      `json:"snow"`
-	Uvi        *float64        `json:"uvi"`
-	Weather    []Weather       `json:"weather"`
-	Hourly     []ForecastSlot  `json:"hourly"`
+	Pop        *float64           `json:"pop"`
+	PopMin     *float64           `json:"pop_min"`
+	PopMean    *float64           `json:"pop_mean"`
+	Temp       *TempPoint         `json:"temp"`
+	FeelsLike  *FeelsLikePoint    `json:"feels_like"`
+	WindDeg    *int               `json:"wind_deg"`
+	WindGust   *float64           `json:"wind_gust"`
+	Clouds     *int               `json:"clouds"`
+	Visibility *int               `json:"visibility"`
+	Pressure   *int               `json:"pressure"`
+	Rain       *ForecastRainBlock `json:"rain"`
+	Snow       *ForecastSnowBlock `json:"snow"`
+	Uvi        *float64           `json:"uvi"`
+	Weather    []Weather          `json:"weather"`
+	Hourly     []ForecastSlot     `json:"hourly"`
 }
 
 // ForecastResponse is the body of GET|POST /api/v1/weather/forecast, served inside
 // the {"success":true,"data":{...}} envelope.
 //
 // The first group mirrors the /data/2.5/forecast envelope, in upstream field order.
-// cod is a string on this endpoint and cnt and message are the integers the decode
-// struct binds, so they are value fields: none of their zeroes is a reading a real
-// response makes. City is a pointer because the block can be absent.
+// cod is a string on this endpoint and message is the float the upstream sends, the
+// calculation time, so neither is an int. cnt is the integer the decode struct
+// binds. None of their zeroes is a reading a real response makes, so all three are
+// value fields. City is a pointer because the block can be absent.
 //
 // The second group is the legacy vocabulary, unchanged, so existing consumers keep
 // working. Forecast is a slice with no omitempty, so the key is always present even
 // when the upstream sent no slots.
 type ForecastResponse struct {
-	Cod     string `json:"cod"`
-	Message int    `json:"message"`
-	Cnt     int    `json:"cnt"`
-	City    *City  `json:"city"`
+	Cod     string  `json:"cod"`
+	Message float64 `json:"message"`
+	Cnt     int     `json:"cnt"`
+	City    *City   `json:"city"`
 
 	Location    Location      `json:"location"`
 	Current     Current       `json:"current"`

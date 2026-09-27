@@ -492,20 +492,23 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 // currentFromForecast. Filling it costs no upstream call, and the route must not
 // start making one.
 func (w *WeatherService) mapForecast(owm models.OpenWeatherMapForecastResponse, payload models.ForecastPayload, days int) *models.ForecastResponse {
-	// Group by the date a slot's timestamp formats to, as the route always has.
-	// time.Unix returns local time, so the boundary is this process's midnight, not
-	// UTC and not the city's: a slot at 23:00 UTC and one at 01:00 UTC the next
-	// morning are two days only when the offset is zero. The grouping is not this
-	// change's to make and is kept as it is. The two decodes read the same array in
-	// the same order, so index i of payload.List is the presence view of
+	// Group by the UTC date of a slot's timestamp. The two decodes read the same
+	// array in the same order, so index i of payload.List is the presence view of
 	// owm.List[i].
+	//
+	// The .UTC() is load bearing. time.Unix returns local time, so without it the
+	// same upstream body yields a different number of days depending on where the
+	// process runs: a slot at 23:00 UTC and one at 01:00 UTC the next morning are
+	// two days in one zone and one in another. The city's own offset is not applied
+	// either, so a London day is a UTC day; that is a separate question from this
+	// one and is not settled here.
 	slotsByDate := make(map[string][]models.ForecastSlot)
 	for i, item := range owm.List {
 		var presence models.ForecastPayloadItem
 		if i < len(payload.List) {
 			presence = payload.List[i]
 		}
-		date := time.Unix(item.Dt, 0).Format("2006-01-02")
+		date := time.Unix(item.Dt, 0).UTC().Format("2006-01-02")
 		slotsByDate[date] = append(slotsByDate[date], mapForecastSlot(item, presence))
 	}
 
@@ -593,14 +596,15 @@ func mapForecastSlot(item models.ForecastItem, presence models.ForecastPayloadIt
 		slot.Clouds = &models.CloudsBlock{All: &cloudCover}
 	}
 
-	// Only the 3h window is documented on this endpoint, so OneHour stays nil. The
-	// shared RainBlock tags 1h as a required key, so it is present and null here
-	// rather than absent; see models.ForecastSlot.
+	// The forecast block types carry only the 3h window, so there is no 1h key to
+	// report: this endpoint does not document it. The window has no omitempty
+	// because here it is documented, so a block upstream sent empty reports null
+	// and a measured zero reports 0.
 	if presence.Rain != nil {
-		slot.Rain = &models.RainBlock{ThreeHour: presence.Rain.ThreeHour}
+		slot.Rain = &models.ForecastRainBlock{ThreeHour: presence.Rain.ThreeHour}
 	}
 	if presence.Snow != nil {
-		slot.Snow = &models.SnowBlock{ThreeHour: presence.Snow.ThreeHour}
+		slot.Snow = &models.ForecastSnowBlock{ThreeHour: presence.Snow.ThreeHour}
 	}
 	if presence.Sys != nil {
 		sys := item.Sys
@@ -633,12 +637,13 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 
 	var (
 		tempSum, tempMin, tempMax float64
-		humiditySum               float64
+		humiditySum, pressureSum  float64
 		windSum, fastest, gustMax float64
 		cloudSum, visibilitySum   float64
 		popSum, popMin, popMax    float64
 		rainSum, snowSum          float64
 		tempCount, humidityCount  int
+		pressureCount             int
 		windCount, cloudCount     int
 		visibilityCount, popCount int
 		windDeg                   int
@@ -662,6 +667,9 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 
 			humiditySum += float64(*main.Humidity)
 			humidityCount++
+
+			pressureSum += float64(*main.Pressure)
+			pressureCount++
 		}
 
 		if wind := slot.Wind; wind != nil {
@@ -745,9 +753,9 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 	if gustSeen {
 		day.WindGust = &gustMax
 	}
-	// clouds and visibility are integer keys, so their means are truncated the same
-	// way humidity is. wind_speed stays a float mean, unrounded, which is the
-	// legacy value unchanged.
+	// clouds, visibility and pressure are integer keys, so their means are truncated
+	// the same way humidity is. wind_speed stays a float mean, unrounded, which is
+	// the legacy value unchanged.
 	if cloudCount > 0 {
 		clouds := int(cloudSum / float64(cloudCount))
 		day.Clouds = &clouds
@@ -755,6 +763,10 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 	if visibilityCount > 0 {
 		visibility := int(visibilitySum / float64(visibilityCount))
 		day.Visibility = &visibility
+	}
+	if pressureCount > 0 {
+		pressure := int(pressureSum / float64(pressureCount))
+		day.Pressure = &pressure
 	}
 
 	if popSeen {
@@ -766,16 +778,19 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 		day.Pop = &popMax
 		day.PopMin = &popMin
 		day.PopMean = &popMean
-		// The legacy alias of the same maximum, so the two cannot disagree.
-		chanceOfRain := int(popMax * 100)
+		// The legacy alias of the same maximum, so the two cannot disagree. Rounded,
+		// because a truncation reports a probability the upstream never gave: 0.29 is
+		// 28.999999999999996 in binary floating point, so a plain int() call would
+		// answer 28 for a day the upstream called 29 percent.
+		chanceOfRain := int(math.Round(popMax * 100))
 		day.ChanceOfRain = &chanceOfRain
 	}
 
 	if rainSeen {
-		day.Rain = &models.RainBlock{ThreeHour: &rainSum}
+		day.Rain = &models.ForecastRainBlock{ThreeHour: &rainSum}
 	}
 	if snowSeen {
-		day.Snow = &models.SnowBlock{ThreeHour: &snowSum}
+		day.Snow = &models.ForecastSnowBlock{ThreeHour: &snowSum}
 	}
 	// The legacy precipitation is the same two sums as one number, so it is 0 for a
 	// day no slot reported precipitation for: a total of zero is a reading, and the
