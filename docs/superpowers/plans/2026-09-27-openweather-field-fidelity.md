@@ -19,7 +19,7 @@
 - Every upstream call still routes through `cachedFetch`/`cachedFetchTracked`. No new direct HTTP call is permitted.
 - The `/forecast` route must keep costing exactly one upstream call. `TestForecastHandlerDoesNotCallCurrentEndpoint` continues to guard this.
 - Response bodies are wrapped by `utils.SendCachedSuccess` as `{"success":true,"data":{...}}`. The new response types are what goes in `data`.
-- A field the upstream genuinely measures as `0` serialises as `0`. Only a field with no value serialises as `null`. `omitempty` is forbidden on any faithful block field.
+- A field the upstream genuinely measures as `0` serialises as `0`. Only a field with no value serialises as `null`. `omitempty` is permitted on pointer fields, where it drops only `nil` and therefore cannot discard a measured zero, and forbidden on value fields, where it would drop one. On a pointer field the tag means "this endpoint does not document this key".
 - Pointer fields represent "may be absent". Non-pointer fields are reserved for values the route always produces.
 - Toolchain: if `go` fails with "No version is set for shim", prefix commands with `mise exec go@1.25.7 --`.
 
@@ -110,7 +110,7 @@ Introduces the first per-route response type and migrates the current route onto
 
 **Interfaces:**
 - Consumes: upstream fields from Task 1
-- Produces: `models.CurrentWeatherResponse`; the block types `models.MainBlock`, `models.WindBlock`, `models.CloudsBlock`, `models.RainBlock`, `models.SnowBlock`, `models.SysBlock`; service method `func (w *WeatherService) GetCurrentWeather(location, units, apikey string) (*models.CurrentWeatherResponse, bool, error)`; mapper `func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse) *models.CurrentWeatherResponse`.
+- Produces: `models.CurrentWeatherResponse`; the block types `models.MainBlock`, `models.WindBlock`, `models.CloudsBlock`, `models.RainBlock`, `models.SnowBlock`, `models.SysBlock`; the pointer-shaped faithful payload `models.CurrentWeatherPayload`; service method `func (w *WeatherService) GetCurrentWeather(location, units, apikey string) (*models.CurrentWeatherResponse, bool, error)`; mapper `func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, payload models.CurrentWeatherPayload) *models.CurrentWeatherResponse`.
 
 **Design note that governs this task:** the response block types are new, not the existing `models.Main`/`Wind`/`Rain`/`Snow`. The existing ones carry `omitempty`, which would drop a genuine measured `0` and break the "measured zero is not absence" rule. The new block types have no `omitempty` and use pointer fields.
 
