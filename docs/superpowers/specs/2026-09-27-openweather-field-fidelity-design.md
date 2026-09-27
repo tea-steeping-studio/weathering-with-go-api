@@ -136,10 +136,26 @@ Daily rollup is retained. Per day:
 
 Faithful envelope: `cod`, `message`, `cnt`, `city{...}` with `population` added.
 
-Legacy block, unchanged: `location`, `current` (still derived from `list[0]`), and
-per day `date`, `max_temperature`, `min_temperature`, `avg_temperature`,
-`condition`, `description`, `icon`, `humidity`, `wind_speed`, `precipitation`,
-`chance_of_rain`, `uv_index`.
+Legacy block: `location`, `current` (still derived from `list[0]`), and per day `date`,
+`max_temperature`, `min_temperature`, `avg_temperature`, `condition`, `description`,
+`icon`, `humidity`, `wind_speed`, `precipitation`, `chance_of_rain`, `uv_index`.
+
+**Four legacy keys change value, not shape.** This is a breaking change for existing
+consumers and is deliberate:
+
+- `max_temperature` and `min_temperature` previously carried the upstream `temp_max` and
+  `temp_min`, which on the `/data/2.5` endpoints are documented as the extremes *in the
+  city at the moment of calculation*, not the day's extremes. Labelling them
+  `max_temperature`/`min_temperature` was a mislabel. They now carry the same derived
+  day-level extremes as `temp.max` and `temp.min`, which is what the names claim.
+- `chance_of_rain` was a permanent `0`; it is now the rounded daily probability.
+- `uv_index` was a fabricated `0`; the three-hour endpoint has no `uvi`, so it is now
+  `null`.
+
+`humidity` deliberately keeps its truncating mean, because the legacy field is an `int`
+and truncating is what it has always done. `pressure`, `clouds` and `visibility` have no
+legacy counterpart and are rounded. `chance_of_rain` is rounded. This mixed policy is
+stated on the `ForecastDay` type and in the README so it does not read as an oversight.
 
 Within `hourly[]`, each slot's `main.temp_min` and `main.temp_max` stay faithful to
 the upstream city-moment measurement. At the day level, `temp.min` and `temp.max`

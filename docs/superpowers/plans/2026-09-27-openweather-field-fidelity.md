@@ -200,17 +200,20 @@ Expected: FAIL, `chance_of_rain` is `0` and no `hourly` key exists.
 
 Add to `models/responses.go`: `TempPoint` and `FeelsLikePoint` with pointer fields; `ForecastSlot` mirroring a raw three-hour slot with `Dt int64`, `Main *MainBlock`, `Weather []Weather`, `Clouds *CloudsBlock`, `Wind *WindBlock`, `Visibility *int`, `Pop *float64`, `Rain *RainBlock`, `Snow *SnowBlock`, `Sys *ForecastSys`, `DtTxt string`; `ForecastDay`; and `ForecastResponse`.
 
-`ForecastDay` holds the legacy flat keys `date`, `max_temperature`, `min_temperature`, `avg_temperature`, `condition`, `description`, `icon`, `uv_index`, `precipitation`, `chance_of_rain`, plus faithful `pop`, `pop_min`, `pop_mean`, `temp`, `feels_like`, `wind_deg`, `wind_gust`, `clouds`, `visibility`, `rain`, `snow`, `uvi`, `weather`, `hourly`, plus the three shared keys `humidity` and `wind_speed` described above.
+`ForecastDay` holds the legacy flat keys `date`, `max_temperature`, `min_temperature`, `avg_temperature`, `condition`, `description`, `icon`, `uv_index`, `precipitation`, `chance_of_rain`, plus faithful `pop`, `pop_min`, `pop_mean`, `temp`, `feels_like`, `pressure`, `wind_deg`, `wind_gust`, `clouds`, `visibility`, `rain`, `snow`, `uvi`, `weather`, `hourly`, plus the three shared keys `humidity` and `wind_speed` described above.
 
-`ForecastResponse` holds faithful `cod`, `message`, `cnt`, `city` and legacy `location`, `current`, `request_time`.
+`ForecastResponse` holds faithful `cod`, `message`, `cnt`, `city` and legacy `location`, `current`, `forecast`, `request_time`. The legacy `forecast` array is the route's primary existing payload and must not be dropped.
+
+Rain and snow for the three-hour slots use block types distinct from the `/current` route's: the forecast-side types omit the `1h` window entirely, because `/data/2.5/forecast` does not document it and the key must be absent rather than null.
 
 - [ ] **Step 4: Write the mapper**
 
-Replace `convertForecastResponse` and `calculateDailyForecast` with a single per-route mapper. Keep the existing date grouping and the `sort.Strings` on the date keys. Inside each day:
+Replace `convertForecastResponse` and `calculateDailyForecast` with a single per-route mapper. Group by **UTC** date: `time.Unix(item.Dt, 0).UTC().Format("2006-01-02")`. The `.UTC()` is required — `time.Unix` returns local time, so without it the grouping silently changes with the server's timezone. Keep the `sort.Strings` on the date keys. Inside each day:
 
 - `Pop` is the max over slots that have a `Pop`; `PopMin` the min over those; `PopMean` the arithmetic mean of those fractional values, not of their percentages. Slots with no `Pop` are excluded from all three.
 - `temp.min` and `temp.max` are the extremes of `item.Main.Temp` across the day's slots. This is a derivation, not an upstream value; comment it as such. Leave `temp.day`, `temp.night`, `temp.morn`, `temp.eve` nil.
-- `humidity` is the rounded mean of `item.Main.Humidity`; `wind_speed` the mean of `item.Wind.Speed`; `clouds` and `visibility` means; `wind_gust` the max.
+- `humidity` is the rounded mean of `item.Main.Humidity`; `pressure`, `wind_speed`, `clouds` and `visibility` are means; `wind_gust` the max.
+- `chance_of_rain` is `int(math.Round(pop*100))`, not `int(pop*100)`. Truncation turns `0.29` into `28`.
 - `wind_deg` is the `item.Wind.Deg` of the slot with the day's highest `item.Wind.Speed`, matching the daily endpoints' documented meaning of `deg`.
 - `rain` and `snow` are the sums of the slots' `3h` values, `nil` when no slot reports any.
 - `weather` comes from the middle slot, as today.
