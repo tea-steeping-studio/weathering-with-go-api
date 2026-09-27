@@ -9,7 +9,8 @@ A modern, high-performance weather API built with Go and the Gin web framework. 
 - **Response Caching**: 15-minute in-memory cache to protect your OpenWeatherMap quota
 - **Multiple Units**: Support for metric, imperial, and Kelvin units
 - **RESTful API**: Clean, well-documented REST endpoints
-- **Error Handling**: Comprehensive error handling with detailed responses
+- **Error Handling**: One consistent error envelope on every failure, where the message is the only
+  detail a response carries — see [Error Responses](#error-responses)
 - **CORS Support**: Cross-origin resource sharing enabled
 - **Health Checks**: Monitor API health and status
 - **Middleware**: Security headers, logging, and request tracking
@@ -101,7 +102,7 @@ curl "http://localhost:8080/api/v1/weather/current?location=London,UK&units=metr
       "temperature": 15.5,
       "feels_like": 14.8,
       "humidity": 72,
-      "pressure": 1013.2,
+      "pressure": 1013,
       "visibility": 10000,
       "wind_speed": 3.6,
       "wind_direction": 230,
@@ -181,7 +182,7 @@ curl "http://localhost:8080/api/v1/weather/forecast?location=Tokyo,JP&units=metr
       "temperature": 19.4,
       "feels_like": 18.9,
       "humidity": 68,
-      "pressure": 1011.0,
+      "pressure": 1011,
       "visibility": 10000,
       "wind_speed": 4.2,
       "wind_direction": 180,
@@ -309,7 +310,7 @@ curl -i "http://localhost:8080/api/v1/weather/forecast/7day?location=Tokyo,JP&un
       "temperature": 16.2,
       "feels_like": 15.8,
       "humidity": 61,
-      "pressure": 1014.0,
+      "pressure": 1014,
       "visibility": 10000,
       "wind_speed": 3.1,
       "wind_direction": 190,
@@ -562,6 +563,9 @@ and quietly wrong is worse than a missing one. Consumers that read any of them n
 | `/forecast` day `precipitation` | Always a number, `0` when nothing fell or nothing was measured | `null` when no slot reported a precipitation window, and the sum when one did |
 | `/forecast/7day` day `precipitation` | Same as above | Same as above |
 | `/forecast` day `condition`, `description`, `icon` | `""` when the middle slot carried no weather entry | `null`, matching what the other three blocks have always reported for that case |
+| Any legacy `current` reading taken from a block the upstream did not send, on `/current` and `/forecast` | The decode struct's zero, so a body with no `main`, `wind` or `clouds` reported a row of fabricated zeroes beside a `null` block | `null` in both vocabularies, so the two never disagree about whether the upstream measured anything |
+| `/forecast` slot `main.temp_kf` | Always `null`: the field was suppressed on a false claim that this endpoint does not document it | The slot's `temp_kf`, or `null` when the upstream sent no member |
+| `/forecast` slot `sys.pod` | `""` when the upstream sent a `sys` block with no `pod` in it | `null` |
 | `/forecast/7day` day `chance_of_rain` | Truncated percentage | Rounded percentage, and `null` when the day carried no `pop` |
 | `current.max_temperature`, `min_temperature` on `/current` and `/forecast/7day` | Always `0` | Always `null`: neither route measures daily extremes in its current block |
 | `current.visibility` on `/forecast` | Always `0` | The first slot's `visibility`, or `null` when that slot reports none |

@@ -14,8 +14,8 @@ import (
 // does not send, which are exactly the two whose rows cannot exist without them.
 //
 //   - wind.gust, for the legacy current.wind_gust and its faithful twin wind.gust.
-//     Both are read from the same datum, payload.Wind.Gust, at services/weather.go
-//     :766 and :708, so the pair is expressible the moment the upstream sends a gust.
+//     Both are read from the same datum, payload.Wind.Gust, in the mapper's one gate on
+//     the wind block, so the pair is expressible the moment the upstream sends a gust.
 //     Without one the legacy key carries omitempty and is absent while the faithful
 //     one is null, and there is no pair to compare.
 //   - visibility, for the legacy current.visibility and the faithful top-level
@@ -157,6 +157,13 @@ type aliasRow struct {
 //     route the legacy and faithful vocabularies share one JSON key, because there is
 //     no upstream daily block to name the measurement differently. A row would
 //     compare a value with itself and assert nothing.
+//   - avg_temperature on the /forecast day. Unlike humidity and wind_speed, this one
+//     has no shared key and no faithful twin either: ForecastDay.Temp is a TempPoint,
+//     whose members are day, min, max, night, morn and eve, and the three hour endpoint
+//     documents no average of the day's temperature. The legacy key is this API's own
+//     mean of the day's slot main.temp values, so the only thing to compare it against
+//     is the same derivation twice. The seven day route does have a row for it, against
+//     daily[0].temp.day, because that endpoint measures a day temperature.
 //   - uv_index on the /forecast day. The three hour endpoint documents no uvi, so the
 //     route has no ultraviolet reading to alias and both keys are null by design.
 var aliasRows = []aliasRow{
