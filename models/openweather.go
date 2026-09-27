@@ -133,17 +133,21 @@ type GeocodingResult struct {
 	State   string  `json:"state"`
 }
 
-// OneCallResponse represents the One Call 3.0 response
+// OneCallResponse represents the One Call 3.0 response.
+//
+// It carries the envelope scalars, the current block and the daily array, and
+// nothing else. The minutely, hourly and alerts arrays are decoded by
+// SevenDayPayload alone, from the response point types, because no mapper reads
+// them from here: a parallel set of value-typed decode structs would decode 48
+// hourly and up to 120 minutely entries a second time on every fetch and
+// discard one of the two copies. See SevenDayPayload.
 type OneCallResponse struct {
 	Lat            float64         `json:"lat"`
 	Lon            float64         `json:"lon"`
 	Timezone       string          `json:"timezone"`
 	TimezoneOffset int             `json:"timezone_offset"`
 	Current        *OneCallCurrent `json:"current"`
-	Minutely       []Minutely      `json:"minutely"`
-	Hourly         []Hourly        `json:"hourly"`
 	Daily          []DailyForecast `json:"daily"`
-	Alerts         []Alert         `json:"alerts"`
 }
 
 // OneCallCurrent represents the current conditions block of the One Call 3.0 response.
@@ -163,34 +167,6 @@ type OneCallCurrent struct {
 	WindSpeed  float64   `json:"wind_speed"`
 	WindDeg    int       `json:"wind_deg"`
 	WindGust   float64   `json:"wind_gust"`
-	Weather    []Weather `json:"weather"`
-}
-
-// Minutely represents one entry from the One Call 3.0 minutely forecast
-type Minutely struct {
-	Dt            int64   `json:"dt"`
-	Precipitation float64 `json:"precipitation"`
-}
-
-// Hourly represents one entry from the One Call 3.0 hourly forecast
-type Hourly struct {
-	Dt         int64     `json:"dt"`
-	Sunrise    int64     `json:"sunrise"`
-	Sunset     int64     `json:"sunset"`
-	Temp       float64   `json:"temp"`
-	FeelsLike  float64   `json:"feels_like"`
-	Pressure   int       `json:"pressure"`
-	Humidity   int       `json:"humidity"`
-	DewPoint   float64   `json:"dew_point"`
-	Uvi        float64   `json:"uvi"`
-	Clouds     int       `json:"clouds"`
-	Visibility int       `json:"visibility"`
-	WindSpeed  float64   `json:"wind_speed"`
-	WindDeg    int       `json:"wind_deg"`
-	WindGust   float64   `json:"wind_gust"`
-	Pop        float64   `json:"pop"`
-	Rain       float64   `json:"rain"`
-	Snow       float64   `json:"snow"`
 	Weather    []Weather `json:"weather"`
 }
 
@@ -234,14 +210,4 @@ type DailyFeelsLike struct {
 	Night float64 `json:"night"`
 	Eve   float64 `json:"eve"`
 	Morn  float64 `json:"morn"`
-}
-
-// Alert represents one government weather alert from the One Call 3.0 response
-type Alert struct {
-	SenderName  string   `json:"sender_name"`
-	Event       string   `json:"event"`
-	Start       int64    `json:"start"`
-	End         int64    `json:"end"`
-	Description string   `json:"description"`
-	Tags        []string `json:"tags"`
 }

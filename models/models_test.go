@@ -123,18 +123,44 @@ func TestUpstreamModelsBindAllDocumentedFields(t *testing.T) {
 	}
 }
 
+// assertJSONNames is assertJSONTags without the value-type guard, for the response
+// point types. Those are deliberately pointer shaped: a member the upstream measured
+// as 0 and a member it never sent have to be different readings, and a plain number
+// cannot say so. The guard in assertJSONTags exists to catch a pointer smuggled into
+// a decode struct, where it would be read as a reading, so it does not apply here.
+func assertJSONNames(t *testing.T, v any, want map[string]string) {
+	t.Helper()
+	rt := reflect.TypeOf(v)
+	for field, tag := range want {
+		f, ok := rt.FieldByName(field)
+		if !ok {
+			t.Errorf("%s.%s: field missing", rt.Name(), field)
+			continue
+		}
+		if got := f.Tag.Get("json"); got != tag {
+			t.Errorf("%s.%s: json tag = %q, want %q", rt.Name(), field, got, tag)
+		}
+	}
+}
+
+// The three opt-in arrays are decoded by SevenDayPayload, from the response point
+// types, so this test binds them there rather than on OneCallResponse. It used to
+// assert against a parallel set of value-typed decode structs that no mapper read,
+// which is the duplication the payload-only decode removed.
 func TestOneCallModelsBindDocumentedFields(t *testing.T) {
 	assertJSONTags(t, OneCallResponse{}, map[string]string{
 		"TimezoneOffset": "timezone_offset",
-		"Minutely":       "minutely",
-		"Hourly":         "hourly",
-		"Alerts":         "alerts",
 	})
-	assertJSONTags(t, Minutely{}, map[string]string{
+	assertJSONTags(t, SevenDayPayload{}, map[string]string{
+		"Minutely": "minutely",
+		"Hourly":   "hourly",
+		"Alerts":   "alerts",
+	})
+	assertJSONNames(t, OneCallMinutelyPoint{}, map[string]string{
 		"Dt":            "dt",
 		"Precipitation": "precipitation",
 	})
-	assertJSONTags(t, Hourly{}, map[string]string{
+	assertJSONNames(t, OneCallHourlyPoint{}, map[string]string{
 		"Dt": "dt", "Sunrise": "sunrise", "Sunset": "sunset", "Temp": "temp", "FeelsLike": "feels_like",
 		"Pressure": "pressure", "Humidity": "humidity", "DewPoint": "dew_point", "Uvi": "uvi",
 		"Clouds": "clouds", "Visibility": "visibility", "WindSpeed": "wind_speed", "WindDeg": "wind_deg",
@@ -144,7 +170,7 @@ func TestOneCallModelsBindDocumentedFields(t *testing.T) {
 		"DewPoint": "dew_point", "WindGust": "wind_gust", "Sunrise": "sunrise", "Sunset": "sunset",
 		"Moonrise": "moonrise", "Moonset": "moonset", "MoonPhase": "moon_phase",
 	})
-	assertJSONTags(t, Alert{}, map[string]string{
+	assertJSONNames(t, OneCallAlertPoint{}, map[string]string{
 		"SenderName": "sender_name", "Event": "event", "Start": "start", "End": "end",
 		"Description": "description", "Tags": "tags",
 	})
@@ -171,38 +197,50 @@ func TestOneCallModelsBindDocumentedFields(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &resp); err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
+	var payload SevenDayPayload
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("payload decode failed: %v", err)
+	}
 
 	if resp.TimezoneOffset != -18000 {
 		t.Fatalf("expected timezone_offset -18000, got %v", resp.TimezoneOffset)
 	}
 
-	if len(resp.Minutely) != 1 {
-		t.Fatalf("expected 1 minutely entry, got %d", len(resp.Minutely))
+	if len(payload.Minutely) != 1 {
+		t.Fatalf("expected 1 minutely entry, got %d", len(payload.Minutely))
 	}
-	if resp.Minutely[0].Dt != 1595243460 {
-		t.Fatalf("expected minutely dt 1595243460, got %v", resp.Minutely[0].Dt)
+	if payload.Minutely[0].Dt == nil || *payload.Minutely[0].Dt != 1595243460 {
+		t.Fatalf("expected minutely dt 1595243460, got %v", payload.Minutely[0].Dt)
 	}
-	if resp.Minutely[0].Precipitation != 0.02 {
-		t.Fatalf("expected minutely precipitation 0.02, got %v", resp.Minutely[0].Precipitation)
+	if payload.Minutely[0].Precipitation == nil || *payload.Minutely[0].Precipitation != 0.02 {
+		t.Fatalf("expected minutely precipitation 0.02, got %v", payload.Minutely[0].Precipitation)
 	}
 
-	if len(resp.Hourly) != 1 {
-		t.Fatalf("expected 1 hourly entry, got %d", len(resp.Hourly))
+	if len(payload.Hourly) != 1 {
+		t.Fatalf("expected 1 hourly entry, got %d", len(payload.Hourly))
 	}
-	h := resp.Hourly[0]
-	if h.Dt != 1595242800 || h.Sunrise != 1595243663 || h.Sunset != 1595294958 {
-		t.Fatalf("unexpected hourly timestamps: dt=%v sunrise=%v sunset=%v", h.Dt, h.Sunrise, h.Sunset)
+	h := payload.Hourly[0]
+	if want := int64(1595242800); h.Dt == nil || *h.Dt != want {
+		t.Fatalf("expected hourly dt 1595242800, got %v", h.Dt)
 	}
-	if h.Temp != 299.41 || h.FeelsLike != 300.32 || h.DewPoint != 297.15 {
+	if want := int64(1595243663); h.Sunrise == nil || *h.Sunrise != want {
+		t.Fatalf("expected hourly sunrise 1595243663, got %v", h.Sunrise)
+	}
+	if want := int64(1595294958); h.Sunset == nil || *h.Sunset != want {
+		t.Fatalf("expected hourly sunset 1595294958, got %v", h.Sunset)
+	}
+	if h.Temp == nil || *h.Temp != 299.41 || h.FeelsLike == nil || *h.FeelsLike != 300.32 || h.DewPoint == nil || *h.DewPoint != 297.15 {
 		t.Fatalf("unexpected hourly temps: temp=%v feels_like=%v dew_point=%v", h.Temp, h.FeelsLike, h.DewPoint)
 	}
-	if h.Uvi != 5.53 || h.Pop != 0.32 || h.Rain != 0.12 || h.Snow != 0.2 {
+	if h.Uvi == nil || *h.Uvi != 5.53 || h.Pop == nil || *h.Pop != 0.32 || h.Rain == nil || *h.Rain != 0.12 || h.Snow == nil || *h.Snow != 0.2 {
 		t.Fatalf("unexpected hourly float fields: uvi=%v pop=%v rain=%v snow=%v", h.Uvi, h.Pop, h.Rain, h.Snow)
 	}
-	if h.WindSpeed != 3.12 || h.WindGust != 6.2 {
+	if h.WindSpeed == nil || *h.WindSpeed != 3.12 || h.WindGust == nil || *h.WindGust != 6.2 {
 		t.Fatalf("unexpected hourly wind: speed=%v gust=%v", h.WindSpeed, h.WindGust)
 	}
-	if h.Pressure != 1014 || h.Humidity != 89 || h.Clouds != 75 || h.WindDeg != 210 || h.Visibility != 10000 {
+	if h.Pressure == nil || *h.Pressure != 1014 || h.Humidity == nil || *h.Humidity != 89 ||
+		h.Clouds == nil || *h.Clouds != 75 || h.WindDeg == nil || *h.WindDeg != 210 ||
+		h.Visibility == nil || *h.Visibility != 10000 {
 		t.Fatalf("unexpected hourly int fields: pressure=%v humidity=%v clouds=%v wind_deg=%v visibility=%v",
 			h.Pressure, h.Humidity, h.Clouds, h.WindDeg, h.Visibility)
 	}
@@ -236,20 +274,20 @@ func TestOneCallModelsBindDocumentedFields(t *testing.T) {
 		t.Fatalf("expected daily snow 0.35, got %v", d.Snow)
 	}
 
-	if len(resp.Alerts) != 1 {
-		t.Fatalf("expected 1 alert, got %d", len(resp.Alerts))
+	if len(payload.Alerts) != 1 {
+		t.Fatalf("expected 1 alert, got %d", len(payload.Alerts))
 	}
-	a := resp.Alerts[0]
-	if a.SenderName != "NWS Tulsa" {
+	a := payload.Alerts[0]
+	if a.SenderName == nil || *a.SenderName != "NWS Tulsa" {
 		t.Fatalf("expected alert sender_name NWS Tulsa, got %v", a.SenderName)
 	}
-	if a.Event != "Heat Advisory" {
+	if a.Event == nil || *a.Event != "Heat Advisory" {
 		t.Fatalf("expected alert event Heat Advisory, got %v", a.Event)
 	}
-	if a.Start != 1595246400 || a.End != 1595293200 {
+	if a.Start == nil || *a.Start != 1595246400 || a.End == nil || *a.End != 1595293200 {
 		t.Fatalf("unexpected alert times: start=%v end=%v", a.Start, a.End)
 	}
-	if a.Description != "HEAT ADVISORY REMAINS IN EFFECT UNTIL 9 PM CDT." {
+	if a.Description == nil || *a.Description != "HEAT ADVISORY REMAINS IN EFFECT UNTIL 9 PM CDT." {
 		t.Fatalf("unexpected alert description: %v", a.Description)
 	}
 	if len(a.Tags) != 2 || a.Tags[0] != "Extreme temperature value" || a.Tags[1] != "Heat" {
