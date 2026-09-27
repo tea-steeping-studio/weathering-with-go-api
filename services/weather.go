@@ -635,12 +635,29 @@ func (w *WeatherService) resolveAPIKey(apikey string) string {
 //
 // A block the upstream did not send is left nil, so an absent block and a block
 // whose members are all null stay two different things, and the window this
-// endpoint does not document is omitted from a precipitation block. The legacy
-// blocks keep their own omitempty, so an absent gust stays absent in
-// current.wind_gust while the faithful wind.gust reports it null. The legacy
-// current block's max_temperature and min_temperature stay at 0, as they have
-// always been on this route: changing them is a change to the legacy vocabulary,
-// not a faithfulness fix.
+// endpoint does not document is omitted from a precipitation block.
+//
+// The gust is read from the payload rather than from the decode struct, because
+// wind.gust is not documented for this endpoint and the decode field's zero means
+// "no gust" rather than "a measured 0 m/s". Its legacy key carries an omitempty
+// that drops only nil, so the member is left nil for an absent gust and the key
+// goes with it, while a measured 0 is a non-nil pointer to zero and is reported.
+// Taking the decode field's address made the pointer never nil and fabricated the
+// 0; that was the same defect the forecast route carried.
+//
+// The legacy current block's max_temperature and min_temperature are null, since
+// this endpoint reports no extremes and the route has never measured any. They
+// were a fabricated 0 until models.Current became pointer shaped.
+// payloadWindGust reads the conditional wind member for the legacy current block. A
+// nil wind block and a wind block with no gust in it are the same answer, null, and
+// only a gust the upstream measured is a number.
+func payloadWindGust(payload models.CurrentWeatherPayload) *float64 {
+	if payload.Wind == nil {
+		return nil
+	}
+	return payload.Wind.Gust
+}
+
 func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, payload models.CurrentWeatherPayload) *models.CurrentWeatherResponse {
 	var condition, description, icon string
 	if len(owm.Weather) > 0 {
@@ -656,7 +673,7 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 	tempMin, tempMax := owm.Main.TempMin, owm.Main.TempMax
 	pressure, humidity := owm.Main.Pressure, owm.Main.Humidity
 	visibility := owm.Visibility
-	speed, deg, gust := owm.Wind.Speed, owm.Wind.Deg, owm.Wind.Gust
+	speed, deg := owm.Wind.Speed, owm.Wind.Deg
 	cloudCover := owm.Clouds.All
 	dt := owm.Dt
 	sysType, sysID := owm.Sys.Type, owm.Sys.ID
@@ -743,13 +760,15 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 			Pressure:      &pressureFloat,
 			WindSpeed:     &speed,
 			WindDirection: &deg,
-			WindGust:      &gust,
 			Visibility:    &visibilityFloat,
-			Condition:     &condition,
-			Description:   &description,
-			Icon:          &icon,
-			CloudCover:    &cloudCover,
-			LastUpdated:   &dtTime,
+			// The gust is the one legacy member this route reads from the payload rather
+			// than from the decode struct, and the reason is in the doc comment above.
+			WindGust:    payloadWindGust(payload),
+			Condition:   &condition,
+			Description: &description,
+			Icon:        &icon,
+			CloudCover:  &cloudCover,
+			LastUpdated: &dtTime,
 			// max_temperature and min_temperature stay null. This endpoint reports no
 			// extremes and the route has never measured any, so the 0 they used to
 			// carry was a reading nobody made; every other key above is the upstream's

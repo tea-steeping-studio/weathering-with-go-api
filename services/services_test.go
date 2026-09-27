@@ -35,6 +35,80 @@ func TestMapCurrentWeather(t *testing.T) {
 	}
 }
 
+// wind.gust is not documented for /data/2.5/weather either, so its zero in the decode
+// struct means "no gust" rather than "a measured 0 m/s". The legacy key has an
+// omitempty that drops only nil, so the three states have to come out as three answers:
+// the key absent, a 0, and the number. The test marshals the block as well as reading
+// it, because "absent" is a claim about the JSON and not only about the pointer.
+func TestMapCurrentWeatherCarriesTheGustTheWayTheUpstreamMeant(t *testing.T) {
+	body := func(wind string) (models.OpenWeatherMapResponse, models.CurrentWeatherPayload) {
+		t.Helper()
+		raw := `{"coord":{"lon":-0.13,"lat":51.51},"weather":[{"main":"Clear","description":"clear sky","icon":"01d"}],` +
+			`"main":{"temp":15.0,"feels_like":14.8,"pressure":1013,"humidity":72},"wind":` + wind + `,` +
+			`"clouds":{"all":40},"dt":1234567890,"sys":{"country":"GB"},"name":"London","cod":200}`
+		var owm models.OpenWeatherMapResponse
+		if err := json.Unmarshal([]byte(raw), &owm); err != nil {
+			t.Fatalf("failed to decode the fixture into the upstream struct: %v", err)
+		}
+		var payload models.CurrentWeatherPayload
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			t.Fatalf("failed to decode the fixture into the payload: %v", err)
+		}
+		return owm, payload
+	}
+	renders := func(t *testing.T, current models.Current) string {
+		t.Helper()
+		out, err := json.Marshal(current)
+		if err != nil {
+			t.Fatalf("failed to render the legacy current block: %v", err)
+		}
+		return string(out)
+	}
+
+	// The upstream sent a wind block with no gust in it. The member is nil, so the key
+	// is absent: 0 m/s would be a measurement nobody made, and the decode field's zero is
+	// exactly that zero read as a reading. The faithful twin already reported null.
+	noGustOWM, noGustPayload := body(`{"speed":3.6,"deg":230}`)
+	noGust := NewWeatherService("dummy").mapCurrentWeather(noGustOWM, noGustPayload)
+	if noGust.Current.WindGust != nil {
+		t.Fatalf("expected no legacy gust for a body that sent none, got %v", *noGust.Current.WindGust)
+	}
+	if noGust.Wind == nil || noGust.Wind.Gust != nil {
+		t.Fatalf("expected a null faithful gust for a body that sent none, got %#v", noGust.Wind)
+	}
+	if rendered := renders(t, noGust.Current); strings.Contains(rendered, "wind_gust") {
+		t.Fatalf("expected no wind_gust key in %s", rendered)
+	}
+
+	// The upstream measured 0 m/s. That is a reading, and a non-nil pointer to zero is
+	// what distinguishes it from the case above: the key is present and says 0.
+	zeroOWM, zeroPayload := body(`{"speed":3.6,"deg":230,"gust":0}`)
+	zero := NewWeatherService("dummy").mapCurrentWeather(zeroOWM, zeroPayload)
+	if zero.Current.WindGust == nil {
+		t.Fatal("expected a legacy gust for a measured 0, got null")
+	}
+	if *zero.Current.WindGust != 0 {
+		t.Fatalf("expected a measured 0 gust to serialise as 0, got %v", *zero.Current.WindGust)
+	}
+	if rendered := renders(t, zero.Current); !strings.Contains(rendered, `"wind_gust":0`) {
+		t.Fatalf("expected a wind_gust key of 0 in %s", rendered)
+	}
+	if zero.Wind == nil || zero.Wind.Gust == nil || *zero.Wind.Gust != 0 {
+		t.Fatalf("expected a faithful gust of 0, got %#v", zero.Wind)
+	}
+
+	// The ordinary case: a gust is a gust.
+	gustOWM, gustPayload := body(`{"speed":3.6,"deg":230,"gust":7.5}`)
+	gust := NewWeatherService("dummy").mapCurrentWeather(gustOWM, gustPayload)
+	requireFloat(t, "a measured gust", gust.Current.WindGust, 7.5)
+	if rendered := renders(t, gust.Current); !strings.Contains(rendered, `"wind_gust":7.5`) {
+		t.Fatalf("expected a wind_gust key of 7.5 in %s", rendered)
+	}
+	if gust.Wind == nil || gust.Wind.Gust == nil || *gust.Wind.Gust != 7.5 {
+		t.Fatalf("expected a faithful gust of 7.5, got %#v", gust.Wind)
+	}
+}
+
 // Fixed slots for ordering tests, so results never depend on the wall clock.
 var (
 	firstFeb  = time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC).Unix()
@@ -575,6 +649,100 @@ func TestForecastDayPrecipitationSeparatesAMeasuredZeroFromNoReading(t *testing.
 	if days[2].Condition != "Clear" {
 		t.Fatalf("expected the condition from the middle slot, got %q", days[2].Condition)
 	}
+}
+
+// A block the upstream sent in part has no way to report the part it left out. The
+// allowlist claims every member of a slot's main block is unconditionally sent, which is
+// the assumption this test exists to pin: the members are read from a non-pointer decode
+// struct, so a member that was not in the body is a zero there. OpenWeatherMap does not
+// send a partial main block, which is what makes the claim safe; if it ever did, these
+// assertions are the ones that would have been wrong silently.
+//
+// This is the forecast route's counterpart to the seven day route's partial-breakdown
+// test, and the same three places report the consequence: the slot, the day's rollups,
+// and the legacy current block the route derives from the first slot.
+func TestForecastDayPartialMainBlockReportsZeroForTheMembersItLacks(t *testing.T) {
+	day := mapForecastBody(t, forecastBody(t,
+		mustSlotJSON(t, map[string]any{
+			"dt":      forecastUTCMidnight.Unix(),
+			"main":    map[string]any{"temp": 15.0},
+			"weather": []any{map[string]any{"main": "Clear", "description": "clear sky", "icon": "01d"}},
+			"clouds":  map[string]any{"all": 40},
+			"wind":    map[string]any{"speed": 3.6, "deg": 230},
+		}),
+	), 5).Forecast[0]
+
+	// The slot reports the block it was sent, with the five members it was not sent
+	// reported as zeroes. The block's own presence is real, so the slot is not null.
+	slot := day.Hourly[0]
+	if slot.Main == nil {
+		t.Fatal("expected the main block the upstream did send to be reported on the slot")
+	}
+	if slot.Main.Temp == nil || *slot.Main.Temp != 15 {
+		t.Fatalf("expected the slot temp the upstream sent to be 15, got %#v", slot.Main.Temp)
+	}
+	for name, got := range map[string]*float64{
+		"feels_like": slot.Main.FeelsLike, "temp_min": slot.Main.TempMin,
+		"temp_max": slot.Main.TempMax,
+	} {
+		if got == nil {
+			t.Fatalf("expected a fabricated 0 for the missing slot main.%s, got null", name)
+		}
+		if *got != 0 {
+			t.Fatalf("expected a fabricated 0 for the missing slot main.%s, got %v", name, *got)
+		}
+	}
+	for name, got := range map[string]*int{"pressure": slot.Main.Pressure, "humidity": slot.Main.Humidity} {
+		if got == nil {
+			t.Fatalf("expected a fabricated 0 for the missing slot main.%s, got null", name)
+		}
+		if *got != 0 {
+			t.Fatalf("expected a fabricated 0 for the missing slot main.%s, got %v", name, *got)
+		}
+	}
+	// The members this endpoint does not document are a different case and stay null:
+	// temp_kf is not documented for a three hour slot, and sea_level and grnd_level come
+	// only from points near sea level or the ground. Their null is a statement about the
+	// schema rather than about this body, which is the opposite of the five zeroes above
+	// and the reason the two are not treated alike.
+	if slot.Main.TempKF != nil {
+		t.Fatalf("expected a null temp_kf, which this endpoint does not document for a slot, got %v", *slot.Main.TempKF)
+	}
+	if slot.Main.SeaLevel != nil || slot.Main.GrndLevel != nil {
+		t.Fatalf("expected null sea_level and grnd_level for a body that sent none, got %v and %v",
+			slot.Main.SeaLevel, slot.Main.GrndLevel)
+	}
+	if slot.Visibility != nil || slot.Pop != nil {
+		t.Fatalf("expected null visibility and pop for a body that sent none, got %v and %v", slot.Visibility, slot.Pop)
+	}
+
+	// The day rolls the same readings up, so its pressure and humidity are zeros as
+	// well: the mean of one slot's fabricated zero.
+	requireInt(t, "the day pressure from a partial main block", day.Pressure, 0)
+	requireInt(t, "the day humidity from a partial main block", day.Humidity, 0)
+	requireFloat(t, "the day min_temperature from a partial main block", day.MinTemp, 15)
+	requireFloat(t, "the day max_temperature from a partial main block", day.MaxTemp, 15)
+	requireFloat(t, "the day avg_temperature from a partial main block", day.AvgTemp, 15)
+	// Visibility has no fabricated counterpart, because the payload says no slot
+	// reported one.
+	if day.Visibility != nil {
+		t.Fatalf("expected a null day visibility, got %v", *day.Visibility)
+	}
+	// The legacy current block is slot zero's readings, so it carries the same two
+	// zeroes: a pressure of 0 hPa and a humidity of 0 percent are readings nobody made.
+	current := mapForecastBody(t, forecastBody(t,
+		mustSlotJSON(t, map[string]any{
+			"dt":      forecastUTCMidnight.Unix(),
+			"main":    map[string]any{"temp": 15.0},
+			"weather": []any{map[string]any{"main": "Clear", "description": "clear sky", "icon": "01d"}},
+			"clouds":  map[string]any{"all": 40},
+			"wind":    map[string]any{"speed": 3.6, "deg": 230},
+		}),
+	), 5).Current
+	requireFloat(t, "the legacy current pressure from a partial main block", current.Pressure, 0)
+	requireInt(t, "the legacy current humidity from a partial main block", current.Humidity, 0)
+	// The temperature is a real reading, from the one member the block did carry.
+	requireFloat(t, "the legacy current temperature from a partial main block", current.Temperature, 15)
 }
 
 // pop_mean is the raw arithmetic mean, not a value quantised to a fixed number of
