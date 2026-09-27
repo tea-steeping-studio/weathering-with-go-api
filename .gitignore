@@ -36,3 +36,9 @@ go.work.sum
 
 
 cmd/ui
+
+# Isolated git worktrees for feature work
+.worktrees/
+
+# Superpowers scratch: ledgers, briefs, review packages
+.superpowers/
