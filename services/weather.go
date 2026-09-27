@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -361,7 +362,7 @@ func (w *WeatherService) convertCurrentWeatherResponse(owm models.OpenWeatherMap
 			CloudCover:    owm.Clouds.All,
 			LastUpdated:   time.Unix(owm.Dt, 0),
 		},
-		RequestTime: time.Now(),
+		RequestTime: w.now(),
 	}
 }
 
@@ -375,19 +376,20 @@ func (w *WeatherService) convertForecastResponse(owm models.OpenWeatherMapForeca
 		forecastMap[date] = append(forecastMap[date], item)
 	}
 
-	// Convert to daily forecasts
-	var forecasts []models.Forecast
-	count := 0
+	// Walk the dates in chronological order so the returned days are deterministic.
+	dates := make([]string, 0, len(forecastMap))
+	for date := range forecastMap {
+		dates = append(dates, date)
+	}
+	sort.Strings(dates)
 
-	for date, items := range forecastMap {
-		if count >= days {
+	// Convert to daily forecasts
+	forecasts := make([]models.Forecast, 0, min(len(dates), days))
+	for _, date := range dates {
+		if len(forecasts) >= days {
 			break
 		}
-
-		// Calculate daily averages/extremes
-		forecast := w.calculateDailyForecast(date, items)
-		forecasts = append(forecasts, forecast)
-		count++
+		forecasts = append(forecasts, w.calculateDailyForecast(date, forecastMap[date]))
 	}
 
 	return &models.WeatherData{
@@ -399,7 +401,7 @@ func (w *WeatherService) convertForecastResponse(owm models.OpenWeatherMapForeca
 		},
 		Current:     currentFromForecast(owm.List),
 		Forecast:    forecasts,
-		RequestTime: time.Now(),
+		RequestTime: w.now(),
 	}
 }
 

@@ -37,6 +37,13 @@ func TestCalculateDailyForecastEmpty(t *testing.T) {
 	}
 }
 
+// Fixed slots for ordering tests, so results never depend on the wall clock.
+var (
+	firstFeb  = time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC).Unix()
+	secondFeb = time.Date(2026, 2, 2, 12, 0, 0, 0, time.UTC).Unix()
+	thirdFeb  = time.Date(2026, 2, 3, 12, 0, 0, 0, time.UTC).Unix()
+)
+
 func forecastResponseFixture() models.OpenWeatherMapForecastResponse {
 	return models.OpenWeatherMapForecastResponse{
 		List: []models.ForecastItem{
@@ -98,6 +105,29 @@ func TestConvertForecastResponseWithNoItemsLeavesCurrentZero(t *testing.T) {
 	}
 	if !data.Current.LastUpdated.IsZero() {
 		t.Fatalf("expected zero last_updated, got %s", data.Current.LastUpdated)
+	}
+}
+
+func TestConvertForecastResponseReturnsEarliestDaysInOrder(t *testing.T) {
+	svc := NewWeatherService("dummy")
+	owm := models.OpenWeatherMapForecastResponse{
+		List: []models.ForecastItem{
+			{Dt: thirdFeb, Main: models.Main{Temp: 13}},
+			{Dt: firstFeb, Main: models.Main{Temp: 11}},
+			{Dt: secondFeb, Main: models.Main{Temp: 12}},
+		},
+	}
+
+	data := svc.convertForecastResponse(owm, 2)
+
+	if len(data.Forecast) != 2 {
+		t.Fatalf("expected 2 forecast days, got %d", len(data.Forecast))
+	}
+	want := []string{"2026-02-01", "2026-02-02"}
+	for i, day := range data.Forecast {
+		if got := day.Date.Format("2006-01-02"); got != want[i] {
+			t.Fatalf("expected day %d to be %s got %s", i, want[i], got)
+		}
 	}
 }
 

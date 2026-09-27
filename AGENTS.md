@@ -34,7 +34,7 @@ Go 1.25 + Gin REST API wrapping OpenWeatherMap. Single module with the bare path
 
 - Tests never hit the network. `handlers/weather_test.go` stubs OpenWeatherMap by replacing `WeatherService.HTTPClient` with a custom `RoundTripper` that redirects to an `httptest` server, because `services.OpenWeatherMapBaseURL` is a `const`. Changing that URL requires updating the test's prefix check.
 - The 7-day route uses two more `const` base URLs (`GeocodingBaseURL`, `OneCallBaseURL`) and its tests route on `r.URL.Path` in the stub server.
-- `services.convertForecastResponse` groups 3-hour items into a Go map and iterates it, so forecast day order is nondeterministic. Sort before asserting order. The 7-day path (`convertOneCallResponse`) is unaffected: it iterates the ordered `daily` slice.
+- `services.convertForecastResponse` groups 3-hour items into a Go map, then sorts the date keys so the returned days are chronological and `days=<n>` returns the *earliest* n days. It still needs sorting defensively in tests that assert order across a date boundary. The 7-day path (`convertOneCallResponse`) needs no sorting: it iterates the ordered `daily` slice.
 
 ## Repo gotchas
 
