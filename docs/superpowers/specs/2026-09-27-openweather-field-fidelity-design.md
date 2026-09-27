@@ -151,16 +151,24 @@ different things; the README states which is which.
 The `exclude` parameter is dropped, so `minutely`, `hourly` and `alerts` are all
 fetched. This adds no upstream calls, only cached payload.
 
-Faithful block: `lat`, `lon`, `timezone`, `timezone_offset`,
-`current{dt, sunrise, sunset, temp, feels_like, pressure, humidity, dew_point,
-uvi, clouds, visibility, wind_speed, wind_deg, wind_gust, weather[]}`,
-`daily[]{dt, sunrise, sunset, moonrise, moonset, moon_phase, temp{day, min, max,
+Faithful block, namespaced under a single `onecall` key so it cannot collide with
+the legacy `current` key: `onecall{lat, lon, timezone, timezone_offset,
+current{dt, sunrise, sunset, temp, feels_like, pressure, humidity, dew_point,
+uvi, clouds, visibility, wind_speed, wind_deg, wind_gust, weather[]},
+daily[]{dt, sunrise, sunset, moonrise, moonset, moon_phase, temp{day, min, max,
 night, morn, eve}, feels_like{day, night, morn, eve}, pressure, humidity,
 dew_point, wind_speed, wind_deg, wind_gust, clouds, pop, rain, snow, uvi,
-weather[]}`.
+weather[]}}`.
 
-The three opt-in blocks live under a single `extra` key, present only when the
-caller requests at least one of them: `extra{minutely[], hourly[], alerts[]}`.
+The namespace is an amendment to the original design, which placed these keys at the
+top level. The legacy `current` block and the faithful One Call `current` object
+both want the JSON key `current`, and two Go fields cannot share one tag. Grouping
+the faithful data under `onecall` removes the collision and leaves every legacy key
+byte-identical to its current form.
+
+`onecall` is always present, so a caller who requests no blocks still receives
+`lat`, `lon`, `timezone`, `current` and `daily`. The three opt-in members
+`onecall{minutely[], hourly[], alerts[]}` appear only when requested.
 
 Legacy block, unchanged: `location`, `current`, `forecast[]` capped at 7 days,
 `request_time`. Faithful `daily[]` returns whatever upstream sends, which may
@@ -193,21 +201,20 @@ Projection therefore copies the value and clears one pointer:
 // must never mutate the receiver.
 func (r *SevenDayResponse) Project(blocks Blocks) SevenDayResponse {
     out := *r
-    if !blocks.Any() {
-        out.Extra = nil
+    if out.OneCall == nil {
         return out
     }
-    extra := *r.Extra
+    onecall := *out.OneCall
     if !blocks.Hourly {
-        extra.Hourly = nil
+        onecall.Hourly = nil
     }
     if !blocks.Minutely {
-        extra.Minutely = nil
+        onecall.Minutely = nil
     }
     if !blocks.Alerts {
-        extra.Alerts = nil
+        onecall.Alerts = nil
     }
-    out.Extra = &extra
+    out.OneCall = &onecall
     return out
 }
 ```
@@ -242,8 +249,11 @@ the loss is not in parsing.
 - `OneCallCurrent` and `DailyForecast` gain the opt-in block fields
 
 **models/responses.go** — new file. `CurrentWeatherResponse`, `ForecastResponse`,
-`SevenDayResponse`, `ExtraBlocks`, `Blocks`. Reuses `Main`, `Wind`, `Clouds`,
-`Rain`, `Snow`, `Sys`, `Coordinates` rather than duplicating them.
+`SevenDayResponse`, `OneCallEnvelope`, `Blocks`, and the pointer-field block types
+`MainBlock`, `WindBlock`, `CloudsBlock`, `RainBlock`, `SnowBlock`, `SysBlock`,
+`TempPoint`, `FeelsLikePoint`. Reuses `Coordinates` and `Weather` from the upstream
+models; the block types are new rather than the existing `Main`, `Wind`, `Rain` and
+`Snow`, because those carry `omitempty` and would drop a genuine measured zero.
 
 **models/weather.go** — `WeatherData` is removed. `Current` and `Forecast` survive
 unchanged as the legacy alias blocks. Removing an exported type is a breaking change
