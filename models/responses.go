@@ -312,9 +312,16 @@ type ForecastDay struct {
 	MaxTemp     *float64  `json:"max_temperature"`
 	MinTemp     *float64  `json:"min_temperature"`
 	AvgTemp     *float64  `json:"avg_temperature"`
-	Condition   string    `json:"condition"`
-	Description string    `json:"description"`
-	Icon        string    `json:"icon"`
+	// Condition, Description and Icon are the middle slot's weather entry, and they
+	// are null when that slot carried no weather array at all. As plain strings they
+	// reported "" there, which is a fabricated value sitting in a block whose every
+	// other reading the route admits it may be unable to measure, and which is the
+	// case rule 2 says should be null. This is the same rule models.Forecast follows
+	// for the same upstream condition on the seven day route, and the two blocks now
+	// answer it the same way.
+	Condition   *string `json:"condition"`
+	Description *string `json:"description"`
+	Icon        *string `json:"icon"`
 	// Humidity truncates its daily mean while Pressure, Clouds and Visibility round
 	// theirs, and the split is deliberate. Humidity's legacy counterpart is an int
 	// field that has always truncated, so rounding it would change a number existing

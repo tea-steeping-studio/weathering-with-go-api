@@ -337,6 +337,106 @@ func TestForecastDayHasNoTimeOfDayBreakdown(t *testing.T) {
 	}
 }
 
+// One route, one case, one rule: a day whose middle slot carries no weather entry has
+// no condition, no description and no icon, and the legacy keys report null rather
+// than the three empty strings they used to. The seven day route's day block and this
+// route's current block both already answered the same upstream condition that way;
+// the day block was the one place still answering with a value.
+//
+// The fixture puts a weather entry on the first and last slots and none on the middle
+// one, which is the slot the day reads. That is what makes the three nulls meaningful
+// rather than vacuous: a mapper that fell back to another slot would report "Rain" or
+// "Snow" here instead, and a mapper that read the middle slot correctly but left the
+// fields as plain strings would report three empty strings.
+func TestForecastDayNullsTheConditionTrioWithoutWeather(t *testing.T) {
+	at := forecastUTCMidnight
+	entry := func(main, description, icon string) []any {
+		return []any{map[string]any{"id": 500, "main": main, "description": description, "icon": icon}}
+	}
+	slot := func(offset time.Duration, weather []any) string {
+		members := map[string]any{
+			"dt":   at.Add(offset).Unix(),
+			"main": map[string]any{"temp": 18.0, "feels_like": 17.2, "temp_min": 15.0, "temp_max": 21.0, "pressure": 1012, "humidity": 70},
+		}
+		if weather != nil {
+			members["weather"] = weather
+		}
+		return mustSlotJSON(t, members)
+	}
+
+	// The middle of a three slot day is index 1, and it is the one without weather.
+	slots := []string{
+		slot(0, entry("Rain", "light rain", "10d")),
+		slot(3*time.Hour, nil),
+		slot(6*time.Hour, entry("Snow", "light snow", "13d")),
+	}
+
+	day := mapForecastBody(t, forecastBody(t, slots...), 5).Forecast[0]
+
+	// The faithful mirror of that same middle slot reports a null weather array, so
+	// the two vocabularies say the same thing about the missing entry.
+	if day.Weather != nil {
+		t.Fatalf("expected a null weather array on the day, got %#v", day.Weather)
+	}
+	if day.Condition != nil || day.Description != nil || day.Icon != nil {
+		// The values go through a helper rather than being dereferenced inline: one nil
+		// among the three would panic inside the failure message and destroy the
+		// diagnostic this assertion exists to give.
+		t.Fatalf("expected a null condition trio, got condition %s, description %s, icon %s",
+			quoted(day.Condition), quoted(day.Description), quoted(day.Icon))
+	}
+	// The rest of the day is unaffected, so this is a day with one gap rather than an
+	// empty object. Every other rollup is still a reading beside the three nulls, and
+	// the raw slots are still carried, so the neighbour's weather is still readable.
+	if icon := day.Hourly[0].Weather[0].Icon; icon != "10d" {
+		t.Fatalf("expected the first raw slot to still report its icon, got %q", icon)
+	}
+	requireFloat(t, "the max_temperature on a day with no weather", day.MaxTemp, 18)
+	requireInt(t, "the humidity on a day with no weather", day.Humidity, 70)
+
+	// The same day with a weather entry on the middle slot reports the trio from it.
+	// Without this the null above would pass on a mapper that dropped the trio entirely.
+	withWeather := slot(3*time.Hour, entry("Clouds", "scattered clouds", "03d"))
+	reported := mapForecastBody(t, forecastBody(t, slots[0], withWeather, slots[2]), 5).Forecast[0]
+
+	requireString(t, "the day condition", reported.Condition, "Clouds")
+	requireString(t, "the day description", reported.Description, "Scattered Clouds")
+	requireString(t, "the day icon", reported.Icon, "03d")
+}
+
+// The rule the day block had to be given is a claim about the JSON, not about the Go
+// types, so it is asserted on the serialised day rather than on the struct. Before the
+// trio became pointers this rendered as "condition":"" beside a null temp block and a
+// null precipitation total, which is the defect in prose: a value where the response
+// has already admitted three nulls beside it, and no way for a reader to tell the
+// difference between a day with no condition and a day whose condition was "".
+func TestForecastDaySerialisesTheConditionTrioAsNull(t *testing.T) {
+	at := forecastUTCMidnight
+	day := mapForecastBody(t, forecastBody(t, mustSlotJSON(t, map[string]any{
+		"dt":   at.Unix(),
+		"main": map[string]any{"temp": 18.0, "feels_like": 17.2, "temp_min": 15.0, "temp_max": 21.0, "pressure": 1012, "humidity": 70},
+	})), 5).Forecast[0]
+
+	encoded, err := json.Marshal(day)
+	if err != nil {
+		t.Fatalf("failed to render the day: %v", err)
+	}
+
+	var rendered map[string]any
+	if err := json.Unmarshal(encoded, &rendered); err != nil {
+		t.Fatalf("failed to decode the rendered day: %v", err)
+	}
+	for _, key := range []string{"condition", "description", "icon"} {
+		value, present := rendered[key]
+		if !present {
+			t.Fatalf("expected the key %q to be present, got %s", key, encoded)
+		}
+		if value != nil {
+			t.Fatalf("expected the key %q to be null, got %#v in %s", key, value, encoded)
+		}
+	}
+}
+
 // Slots are grouped by the UTC date of their timestamp, so a slot at 23:00 UTC and
 // one at 01:00 UTC the next morning are two days. The two instants here are fixed,
 // and the expected day keys are the literal UTC dates they fall on rather than
@@ -646,9 +746,7 @@ func TestForecastDayPrecipitationSeparatesAMeasuredZeroFromNoReading(t *testing.
 	// MaxTemp is the day's derived extreme of the slot temperatures, 18 to 25.
 	requireFloat(t, "the max_temperature on an unreported day", days[2].MaxTemp, 25)
 	requireFloat(t, "the min_temperature on an unreported day", days[2].MinTemp, 18)
-	if days[2].Condition != "Clear" {
-		t.Fatalf("expected the condition from the middle slot, got %q", days[2].Condition)
-	}
+	requireString(t, "the condition on an unreported day", days[2].Condition, "Clear")
 }
 
 // A block the upstream sent in part has no way to report the part it left out. The

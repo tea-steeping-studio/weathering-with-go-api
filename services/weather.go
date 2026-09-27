@@ -1119,12 +1119,19 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 
 	// weather comes from the middle slot, as the route always has, and the legacy
 	// condition, description and icon are that same entry rather than a second read
-	// of it.
+	// of it. A slot the upstream sent with no weather entry has no condition, so the
+	// trio is null rather than three empty strings, which is the rule the legacy
+	// current block on this route and the seven day route's day block both follow for
+	// the same upstream condition.
 	day.Weather = slots[len(slots)/2].Weather
 	if len(day.Weather) > 0 {
-		day.Condition = day.Weather[0].Main
-		day.Description = strings.Title(day.Weather[0].Description)
-		day.Icon = day.Weather[0].Icon
+		condition, description, icon := day.Weather[0].Main, day.Weather[0].Description, day.Weather[0].Icon
+		// Title cased, as the legacy value has always been on this route. The trio
+		// becoming pointers is about nullability, not about the text.
+		title := strings.Title(description)
+		day.Condition = &condition
+		day.Description = &title
+		day.Icon = &icon
 	}
 
 	// uv_index and uvi stay null: the three hour endpoint reports no uvi, and the
