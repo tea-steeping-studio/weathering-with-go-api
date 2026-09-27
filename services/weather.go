@@ -69,38 +69,6 @@ func (w *WeatherService) GetCurrentWeather(location, units, apikey string) (*mod
 	})
 }
 
-// currentOptional is a second, pointer-shaped view of the /data/2.5/weather body.
-// The upstream structs in models are non-pointer decode targets, so a member the
-// upstream measured as 0 is indistinguishable there from one it never sent, and
-// the response has to tell the two apart. Decoding the same bytes twice is the
-// cheapest way to recover which members were actually present.
-type currentOptional struct {
-	Main currentOptionalMain    `json:"main"`
-	Wind currentOptionalWind    `json:"wind"`
-	Rain *currentOptionalPrecip `json:"rain"`
-	Snow *currentOptionalPrecip `json:"snow"`
-	// timezone is documented for this endpoint but has no field on
-	// models.OpenWeatherMapResponse, so it is bound here.
-	Timezone *int `json:"timezone"`
-}
-
-type currentOptionalMain struct {
-	SeaLevel  *int     `json:"sea_level"`
-	GrndLevel *int     `json:"grnd_level"`
-	TempKF    *float64 `json:"temp_kf"`
-}
-
-type currentOptionalWind struct {
-	Gust *float64 `json:"gust"`
-}
-
-// currentOptionalPrecip covers the 1h window both rain and snow report on this
-// endpoint. A nil block means upstream sent no block at all, which is not the
-// same as a block whose window measures 0.
-type currentOptionalPrecip struct {
-	OneHour *float64 `json:"1h"`
-}
-
 func (w *WeatherService) fetchCurrentWeather(location, units, apikey string) (*models.CurrentWeatherResponse, error) {
 	// Build URL
 	endpoint := fmt.Sprintf("%s%s", OpenWeatherMapBaseURL, CurrentWeatherEndpoint)
@@ -125,7 +93,8 @@ func (w *WeatherService) fetchCurrentWeather(location, units, apikey string) (*m
 	}
 
 	// Read the body once and decode it twice: once into the upstream structs and
-	// once into the pointer view of the members they cannot express. This is one
+	// once into the pointer view of the members they cannot express, which is
+	// where a measured zero and an absent member are told apart. This is one
 	// upstream request, not two.
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -138,13 +107,13 @@ func (w *WeatherService) fetchCurrentWeather(location, units, apikey string) (*m
 		return nil, fmt.Errorf("failed to parse API response: %w", err)
 	}
 
-	var optional currentOptional
-	if err := json.Unmarshal(body, &optional); err != nil {
+	var payload models.CurrentWeatherPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("failed to parse API response: %w", err)
 	}
 
 	// Convert to our internal model
-	weatherData := w.mapCurrentWeather(owmResp, optional)
+	weatherData := w.mapCurrentWeather(owmResp, payload)
 	return weatherData, nil
 }
 
@@ -379,15 +348,18 @@ func (w *WeatherService) resolveAPIKey(apikey string) string {
 // mapCurrentWeather builds the current route's response: a faithful mirror of
 // the /data/2.5/weather schema plus the legacy vocabulary. Both are assigned in
 // one struct literal from the same locals, so a legacy key cannot drift away from
-// the faithful value it aliases.
+// the faithful value it aliases. Values come from owm; presence, and therefore
+// the difference between a measured zero and an absent member, comes from
+// payload.
 //
-// A rain or snow block the upstream omitted is nil; a block whose window measures
-// 0 keeps that 0. The legacy blocks keep their own omitempty, so an absent gust
-// stays absent in current.wind_gust while the faithful wind.gust reports it null.
-// The legacy current block's max_temperature and min_temperature stay at 0, as
-// they have always been on this route: changing them is a change to the legacy
-// vocabulary, not a faithfulness fix.
-func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, optional currentOptional) *models.CurrentWeatherResponse {
+// A rain or snow block the upstream omitted is nil, and the window this endpoint
+// does not document is omitted from the block. The legacy blocks keep their own
+// omitempty, so an absent gust stays absent in current.wind_gust while the
+// faithful wind.gust reports it null. The legacy current block's
+// max_temperature and min_temperature stay at 0, as they have always been on
+// this route: changing them is a change to the legacy vocabulary, not a
+// faithfulness fix.
+func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, payload models.CurrentWeatherPayload) *models.CurrentWeatherResponse {
 	var condition, description, icon string
 	if len(owm.Weather) > 0 {
 		condition = owm.Weather[0].Main
@@ -409,12 +381,12 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, op
 	sunrise, sunset := owm.Sys.Sunrise, owm.Sys.Sunset
 
 	var rain *models.RainBlock
-	if optional.Rain != nil {
-		rain = &models.RainBlock{OneHour: optional.Rain.OneHour}
+	if payload.Rain != nil {
+		rain = &models.RainBlock{OneHour: payload.Rain.OneHour}
 	}
 	var snow *models.SnowBlock
-	if optional.Snow != nil {
-		snow = &models.SnowBlock{OneHour: optional.Snow.OneHour}
+	if payload.Snow != nil {
+		snow = &models.SnowBlock{OneHour: payload.Snow.OneHour}
 	}
 
 	return &models.CurrentWeatherResponse{
@@ -428,15 +400,15 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, op
 			TempMax:   &tempMax,
 			Pressure:  &pressure,
 			Humidity:  &humidity,
-			SeaLevel:  optional.Main.SeaLevel,
-			GrndLevel: optional.Main.GrndLevel,
-			TempKF:    optional.Main.TempKF,
+			SeaLevel:  payload.Main.SeaLevel,
+			GrndLevel: payload.Main.GrndLevel,
+			TempKF:    payload.Main.TempKF,
 		},
 		Visibility: visibility,
 		Wind: &models.WindBlock{
 			Speed: &speed,
 			Deg:   &deg,
-			Gust:  optional.Wind.Gust,
+			Gust:  payload.Wind.Gust,
 		},
 		Clouds: &models.CloudsBlock{All: &cloudCover},
 		Rain:   rain,
@@ -450,7 +422,7 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, op
 			Sunset:  &sunset,
 		},
 		ID:       owm.ID,
-		Timezone: optional.Timezone,
+		Timezone: payload.Timezone,
 		Name:     name,
 		Cod:      owm.Cod,
 		Location: models.Location{

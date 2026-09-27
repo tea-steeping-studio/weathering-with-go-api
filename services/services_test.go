@@ -20,7 +20,7 @@ func TestConvertCurrentWeatherResponse(t *testing.T) {
 		Name:    "Testville",
 	}
 
-	data := svc.mapCurrentWeather(owm, currentOptional{})
+	data := svc.mapCurrentWeather(owm, models.CurrentWeatherPayload{})
 	if data.Location.Name != "Testville" {
 		t.Fatalf("expected location name Testville got %s", data.Location.Name)
 	}
