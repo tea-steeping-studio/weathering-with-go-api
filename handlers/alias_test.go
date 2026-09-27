@@ -8,9 +8,31 @@ import (
 	"time"
 )
 
+// currentAliasJSON is the /data/2.5/weather body the alias table reads the current
+// route from, a private variant on the same pattern as forecastAliasJSON. It carries
+// the readings of the shared currentWeatherJSON and adds the two the shared fixture
+// does not send, which are exactly the two whose rows cannot exist without them.
+//
+//   - wind.gust, for the legacy current.wind_gust and its faithful twin wind.gust.
+//     Both are read from the same datum, payload.Wind.Gust, at services/weather.go
+//     :766 and :708, so the pair is expressible the moment the upstream sends a gust.
+//     Without one the legacy key carries omitempty and is absent while the faithful
+//     one is null, and there is no pair to compare.
+//   - visibility, for the legacy current.visibility and the faithful top-level
+//     visibility. This is not a missing row but a vacuous one, and it is worth
+//     naming: OpenWeatherMapResponse.Visibility is a plain int, so a body that sends
+//     no visibility decodes to 0 and both vocabularies faithfully report that 0. The
+//     row then compares a fabricated zero with its twin and passes, which is the
+//     exact defect this table exists to catch, committed inside the table. A fixture
+//     that reports a real reading is the only way the row can mean anything.
+//
+// The readings are pairwise distinct, so a mapper that swaps any two of them fails
+// the row rather than passing it.
+const currentAliasJSON = `{"coord":{"lon":-0.13,"lat":51.51},"weather":[{"id":802,"main":"Clouds","description":"scattered clouds","icon":"03d"}],"base":"stations","main":{"temp":15.5,"feels_like":14.8,"temp_min":14.0,"temp_max":17.0,"pressure":1013,"humidity":72,"temp_kf":0.6},"visibility":10000,"wind":{"speed":3.6,"deg":230,"gust":6.1},"clouds":{"all":40},"dt":1234567890,"sys":{"type":2,"id":5081,"country":"GB","sunrise":1771960000,"sunset":1772010000},"id":2643743,"timezone":0,"name":"London","cod":200}`
+
 // forecastAliasJSON is the /data/2.5/forecast body the alias table reads the
 // forecast route from. It is a variant rather than the shared forecastJSON because
-// that fixture cannot make two of the four forecast day rows observable: it carries
+// that fixture cannot make two of the six forecast day rows observable: it carries
 // no pop on either slot, so the day reports chance_of_rain and pop as null together
 // and the pair has no number to compare, and it carries rain on one slot and no snow
 // at all, so the day's snow is null and rain plus snow is not a sum of two numbers.
@@ -120,8 +142,8 @@ type aliasRow struct {
 // from the clock rather than from the upstream, so it has no faithful twin on any
 // route.
 //
-// Four kinds of pair are deliberately absent, and each is absent for a reason rather
-// than by oversight. They are listed in full in the task 6 report.
+// The kinds of pair deliberately absent, each absent for a reason rather than by
+// oversight. They are listed in full in the task 6 report.
 //
 //   - description, on all three routes. The legacy vocabulary title cases it, as it
 //     has always done, and the faithful mirror reports the upstream string verbatim.
@@ -137,8 +159,6 @@ type aliasRow struct {
 //     compare a value with itself and assert nothing.
 //   - uv_index on the /forecast day. The three hour endpoint documents no uvi, so the
 //     route has no ultraviolet reading to alias and both keys are null by design.
-//   - wind_gust on /current. The fixture the shared stub serves sends no gust, so the
-//     legacy key is absent and the faithful one is null: no pair to compare.
 var aliasRows = []aliasRow{
 	// ---- /current. The faithful block is the /data/2.5/weather mirror at the top
 	// level of the same data object.
@@ -149,6 +169,7 @@ var aliasRows = []aliasRow{
 	{aliasCurrentRoute, "data.current.visibility", []string{"data.visibility"}, aliasSame},
 	{aliasCurrentRoute, "data.current.wind_speed", []string{"data.wind.speed"}, aliasSame},
 	{aliasCurrentRoute, "data.current.wind_direction", []string{"data.wind.deg"}, aliasSame},
+	{aliasCurrentRoute, "data.current.wind_gust", []string{"data.wind.gust"}, aliasSame},
 	{aliasCurrentRoute, "data.current.cloud_cover", []string{"data.clouds.all"}, aliasSame},
 	{aliasCurrentRoute, "data.current.condition", []string{"data.weather[0].main"}, aliasText},
 	{aliasCurrentRoute, "data.current.icon", []string{"data.weather[0].icon"}, aliasText},
@@ -428,9 +449,10 @@ func aliasLabel(spec aliasRow) string {
 func TestLegacyAliasesMatchFaithfulFields(t *testing.T) {
 	bodies := map[string]map[string]any{}
 
-	// /current needs no variant of its own: the shared currentWeatherJSON carries
-	// every reading the eleven rows below read.
-	bodies[aliasCurrentRoute] = requestCurrentRoute(t, newCurrentRouteRouter(t, currentWeatherJSON))
+	// /current uses the variant above rather than the shared currentWeatherJSON, for
+	// the same reason /forecast does: the shared fixture sends no gust and no
+	// visibility, and the rows reading those two cannot exist on it.
+	bodies[aliasCurrentRoute] = requestCurrentRoute(t, newCurrentRouteRouter(t, currentAliasJSON))
 
 	// /forecast needs the variant built above, because the shared forecastJSON
 	// carries no pop, no snow, no gust and no visibility.
