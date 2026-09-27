@@ -430,6 +430,23 @@ func decodeForecast(t *testing.T, body *bytes.Buffer) []map[string]any {
 	return resp.Data.Forecast
 }
 
+// decodeData returns the whole data object, for a test that reads a member the
+// per-block decoders do not reach.
+func decodeData(t *testing.T, body *bytes.Buffer) map[string]any {
+	t.Helper()
+	var resp struct {
+		Success bool           `json:"success"`
+		Data    map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response %q: %v", body.String(), err)
+	}
+	if !resp.Success {
+		t.Fatalf("expected success response, got %q", body.String())
+	}
+	return resp.Data
+}
+
 func decodeCurrent(t *testing.T, body *bytes.Buffer) map[string]any {
 	t.Helper()
 	var resp struct {
@@ -1148,19 +1165,25 @@ func TestSevenDayLegacyCurrentAliasesFaithfulCurrent(t *testing.T) {
 	}
 }
 
-// last_updated is an instant rather than a calendar day, so this is not a correctness
-// question the way the legacy date is. It is a cache question: the response is cached
-// per process, and a member that renders in the server's zone means the same upstream
-// body serialises differently on two hosts, which is wrong for anything a caller
-// compares or stores.
+// last_updated and request_time are both instants rather than calendar days, so
+// neither is a correctness question the way the legacy date is. They are a cache
+// question: the response is cached per process, and a member that renders in the
+// server's zone means the same upstream body, and the same cache entry, serialise
+// differently on two hosts. That is wrong for anything a caller compares or stores.
 //
-// The three expected strings are literals derived from the three fixture timestamps
-// (1234567890 on the current fixture, 1772000000 on the other two), not from the
-// mapper's own expression. The process zone is pinned, so this fails with a .UTC()
-// removed in every zone rather than only in one that has an offset.
-func TestLastUpdatedRendersInUTCOnEveryRoute(t *testing.T) {
+// request_time comes from the clock rather than from the upstream, so there is no
+// literal to assert for it: what is pinned is the zone it renders in, which is the
+// whole of the rule. A local rendering ends in "+05:00" under the pinned zone, so the
+// suffix check is what fails when a .UTC() comes out, and the zero-time check keeps it
+// from passing on a rendering of nothing.
+//
+// The three last_updated expectations are literals derived from the three fixture
+// timestamps (1234567890 on the current fixture, 1772000000 on the other two), not from
+// the mapper's own expression. The process zone is pinned, so every one of these fails
+// in every zone rather than only in one that has an offset.
+func TestTimestampsRenderInUTCOnEveryRoute(t *testing.T) {
 	original := time.Local
-	time.Local = time.FixedZone("last-updated-test", 5*60*60)
+	time.Local = time.FixedZone("timestamp-test", 5*60*60)
 	t.Cleanup(func() { time.Local = original })
 
 	router := newStubbedRouter(t, &upstreamStub{})
@@ -1175,8 +1198,17 @@ func TestLastUpdatedRendersInUTCOnEveryRoute(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("%s: expected 200 got %d body=%s", target, w.Code, w.Body.String())
 		}
+
 		if got := decodeCurrent(t, w.Body)["last_updated"]; got != want {
 			t.Fatalf("%s: expected last_updated %q, got %#v", target, want, got)
+		}
+
+		requested, _ := decodeData(t, w.Body)["request_time"].(string)
+		if !strings.HasSuffix(requested, "Z") {
+			t.Fatalf("%s: expected request_time to render in UTC, got %q", target, requested)
+		}
+		if requested == "" || strings.HasPrefix(requested, "0001-01-01") {
+			t.Fatalf("%s: expected a real request_time, got %q", target, requested)
 		}
 	}
 }

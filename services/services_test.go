@@ -417,8 +417,11 @@ func TestForecastDaySumsSlotPrecipitation(t *testing.T) {
 	}
 	assertClose(t, "the day snow sum", *summed.Snow.ThreeHour, 0.2)
 	// The legacy total is the same two sums as one number, so it can never disagree
-	// with the faithful pair.
-	assertClose(t, "the legacy precipitation", summed.Precipitation, 1.8)
+	// with the faithful pair. It is a pointer, so it is reached through one.
+	if summed.Precipitation == nil {
+		t.Fatal("expected a legacy precipitation total, got null")
+	}
+	assertClose(t, "the legacy precipitation", *summed.Precipitation, 1.8)
 
 	// A window the upstream measured as 0 is a reading: the block is present and the
 	// day is 0, not null.
@@ -432,7 +435,11 @@ func TestForecastDaySumsSlotPrecipitation(t *testing.T) {
 	if measuredZero.Snow != nil {
 		t.Fatalf("expected no snow block when no slot reported snow, got %#v", measuredZero.Snow)
 	}
-	assertClose(t, "the legacy precipitation for a measured zero", measuredZero.Precipitation, 0.0)
+	// The measured zero is a real total, so the legacy key is 0 rather than null.
+	if measuredZero.Precipitation == nil {
+		t.Fatal("expected a legacy precipitation total for a measured zero, got null")
+	}
+	assertClose(t, "the legacy precipitation for a measured zero", *measuredZero.Precipitation, 0.0)
 
 	// A block the upstream sent with no window in it stays three states apart on the
 	// slot: the block is present and its window is null. The day is null, because a
@@ -453,8 +460,9 @@ func TestForecastDaySumsSlotPrecipitation(t *testing.T) {
 		t.Fatalf("expected no day rain sum when no slot reported a window, got %#v", emptyWindow.Rain)
 	}
 
-	// No slot reported precipitation at all: both faithful blocks are null, and the
-	// legacy total is a real zero rather than a null.
+	// No slot reported precipitation at all: both faithful blocks are null, and so is
+	// the legacy total, because a sum of nothing measured is not a measurement of
+	// nothing. This is the change from a real 0, which claimed the day was dry.
 	unreported := mapForecastBody(t, forecastBody(t,
 		slotAt(0, map[string]any{}),
 		slotAt(1, map[string]any{}),
@@ -462,7 +470,111 @@ func TestForecastDaySumsSlotPrecipitation(t *testing.T) {
 	if unreported.Rain != nil || unreported.Snow != nil {
 		t.Fatalf("expected no day precipitation blocks, got %#v and %#v", unreported.Rain, unreported.Snow)
 	}
-	assertClose(t, "the legacy precipitation for an unreported day", unreported.Precipitation, 0.0)
+	if unreported.Precipitation != nil {
+		t.Fatalf("expected no legacy precipitation total for an unreported day, got %v", *unreported.Precipitation)
+	}
+}
+
+// A summed precipitation is an answer only when there was something to sum, and this
+// is the same rule the seven day route follows for its own day. Three days from one
+// fixture each: a day whose slots report two volumes, a day whose single slot reports
+// a volume the upstream measured as 0, and a day whose slots report no volume at all.
+// The three are three readings and the middle one is the only zero among them.
+func TestForecastDayPrecipitationSeparatesAMeasuredZeroFromNoReading(t *testing.T) {
+	slotAt := func(i int, members map[string]any) string {
+		members["dt"] = forecastUTCMidnight.Add(time.Duration(3*i) * time.Hour).Unix()
+		return mustSlotJSON(t, members)
+	}
+	plainSlot := func(temp float64, humidity int) map[string]any {
+		return map[string]any{
+			"main":    map[string]any{"temp": temp, "pressure": 1012, "humidity": humidity},
+			"weather": []any{map[string]any{"main": "Clear", "description": "clear sky", "icon": "01d"}},
+			"clouds":  map[string]any{"all": 0},
+		}
+	}
+
+	days := mapForecastBody(t, forecastBody(t,
+		slotAt(0, map[string]any{"rain": map[string]any{"3h": 1.2}}),
+		slotAt(1, map[string]any{"rain": map[string]any{"3h": 0.4}, "snow": map[string]any{"3h": 0.2}}),
+		slotAt(2, map[string]any{}),
+		slotAt(3, map[string]any{}),
+		slotAt(4, map[string]any{}),
+		// 24:00 falls on the next UTC date, so this is a second day: one slot, with a
+		// volume the upstream measured as 0, and nothing else on it.
+		slotAt(8, map[string]any{"rain": map[string]any{"3h": 0}}),
+		slotAt(9, map[string]any{}),
+		slotAt(10, map[string]any{}),
+		slotAt(11, map[string]any{}),
+		slotAt(12, map[string]any{}),
+		slotAt(13, map[string]any{}),
+		slotAt(14, map[string]any{}),
+		slotAt(15, map[string]any{}),
+		// 48:00 falls on the third UTC date. Its slots carry everything else a day
+		// carries, so the day is a real day and the precipitation gap is one gap in it
+		// rather than a day of nothing.
+		slotAt(16, plainSlot(18.0, 70)),
+		slotAt(17, plainSlot(19.0, 72)),
+		slotAt(18, plainSlot(20.0, 74)),
+		slotAt(19, plainSlot(21.0, 76)),
+		slotAt(20, plainSlot(22.0, 78)),
+		slotAt(21, plainSlot(23.0, 80)),
+		slotAt(22, plainSlot(24.0, 82)),
+		slotAt(23, plainSlot(25.0, 84)),
+	), 5).Forecast
+
+	// The fixture's own shape, so a test that cannot express the three states cannot
+	// pass by rendering one day instead of three.
+	if len(days) != 3 {
+		t.Fatalf("expected 3 days from the fixture, got %d", len(days))
+	}
+
+	// Day 0: two volumes reported, so the total is their sum and it is a reading.
+	if days[0].Precipitation == nil {
+		t.Fatal("expected a legacy precipitation total for a day with volumes, got null")
+	}
+	assertClose(t, "the day total for reported volumes", *days[0].Precipitation, 1.8)
+	if days[0].Rain == nil || days[0].Snow == nil {
+		t.Fatalf("expected both faithful blocks beside the total, got rain %#v snow %#v", days[0].Rain, days[0].Snow)
+	}
+
+	// Day 1: one slot reported a volume the upstream measured as 0. That is a reading
+	// of nothing falling, so the total is a real 0 rather than a null, and it is the
+	// only 0 among the three days.
+	if days[1].Precipitation == nil {
+		t.Fatal("expected a legacy precipitation total for a measured zero, got null")
+	}
+	assertClose(t, "the day total for a measured zero", *days[1].Precipitation, 0)
+	if days[1].Rain == nil || days[1].Rain.ThreeHour == nil {
+		t.Fatalf("expected a faithful rain block for a measured zero, got %#v", days[1].Rain)
+	}
+	assertClose(t, "the faithful day rain for a measured zero", *days[1].Rain.ThreeHour, 0)
+	// No slot reported snow on that day, so there is no snow sum beside the rain one.
+	if days[1].Snow != nil {
+		t.Fatalf("expected no snow block when no slot reported snow, got %#v", days[1].Snow)
+	}
+
+	// Day 2: no slot reported a volume, so the faithful blocks are null and the legacy
+	// total is null too. As a value this was 0, which said the day was dry and
+	// measured at the same time.
+	if days[2].Rain != nil || days[2].Snow != nil {
+		t.Fatalf("expected no faithful blocks on an unreported day, got rain %#v snow %#v", days[2].Rain, days[2].Snow)
+	}
+	if days[2].Precipitation != nil {
+		t.Fatalf("expected no legacy precipitation total for an unreported day, got %v", *days[2].Precipitation)
+	}
+	// The rest of the day is unaffected, so this is a day with one gap rather than an
+	// empty object: eight slots carried a main block and a weather array, and every
+	// other rollup is a reading.
+	if days[2].Humidity == nil {
+		t.Fatal("expected a humidity on an unreported day, got null")
+	}
+	assertClose(t, "the humidity on an unreported day", float64(*days[2].Humidity), 77)
+	// MaxTemp is the day's derived extreme of the slot temperatures, 18 to 25.
+	requireFloat(t, "the max_temperature on an unreported day", days[2].MaxTemp, 25)
+	requireFloat(t, "the min_temperature on an unreported day", days[2].MinTemp, 18)
+	if days[2].Condition != "Clear" {
+		t.Fatalf("expected the condition from the middle slot, got %q", days[2].Condition)
+	}
 }
 
 // pop_mean is the raw arithmetic mean, not a value quantised to a fixed number of

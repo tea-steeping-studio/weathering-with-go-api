@@ -355,10 +355,13 @@ func (w *WeatherService) mapOneCall(owm models.OneCallResponse, payload models.S
 		// been, while onecall.lat and onecall.lon are the upstream's echo of the same
 		// coordinates. Two sources for one pair of numbers, so they are read from
 		// where each has always come from rather than being made to agree here.
-		Location:    *loc,
-		Current:     currentFromOneCall(owm.Current, payload.Current),
-		Forecast:    forecasts,
-		RequestTime: w.now(),
+		Location: *loc,
+		Current:  currentFromOneCall(owm.Current, payload.Current),
+		Forecast: forecasts,
+		// UTC, like last_updated and the legacy date: the response is cached per process,
+		// so a member that renders in the server's zone means the same cache entry
+		// serialises differently on two hosts.
+		RequestTime: w.now().UTC(),
 	}
 }
 
@@ -747,7 +750,9 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 			// carry was a reading nobody made; every other key above is the upstream's
 			// own value, taken from the same locals the faithful block is built from.
 		},
-		RequestTime: w.now(),
+		// UTC, like the seven day route's request_time: a cache entry that renders in
+		// the server's zone is host dependent output.
+		RequestTime: w.now().UTC(),
 	}
 }
 
@@ -817,9 +822,11 @@ func (w *WeatherService) mapForecast(owm models.OpenWeatherMapForecastResponse, 
 			Latitude:  lat,
 			Longitude: lon,
 		},
-		Current:     currentFromForecast(owm.List),
-		Forecast:    forecasts,
-		RequestTime: w.now(),
+		Current:  currentFromForecast(owm.List),
+		Forecast: forecasts,
+		// UTC, like the seven day route's request_time: a cache entry that renders in
+		// the server's zone is host dependent output.
+		RequestTime: w.now().UTC(),
 	}
 }
 
@@ -1068,12 +1075,15 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 	if snowSeen {
 		day.Snow = &models.ForecastSnowBlock{ThreeHour: &snowSum}
 	}
-	// The legacy precipitation is the same two sums as one number, so it is 0 for a day
-	// no slot reported a window for. That is the pre-existing behaviour and the seven
-	// day route no longer does it: there, a day whose upstream reported no volume gets
-	// null rather than a fabricated 0. Left as it is until the two are reconciled; see
-	// the note on ForecastDay.Precipitation.
-	day.Precipitation = rainSum + snowSum
+	// The legacy precipitation is the same two sums as one number, and it is reported
+	// only when at least one slot carried a window. A slot reporting a measured 0 gives
+	// a total of 0, which is an answer; no slot reporting a window gives no total, which
+	// is a gap. This is the same rule the seven day route's Forecast.Precipitation
+	// follows, and the two keys now answer one question the same way.
+	if rainSeen || snowSeen {
+		total := rainSum + snowSum
+		day.Precipitation = &total
+	}
 
 	// weather comes from the middle slot, as the route always has, and the legacy
 	// condition, description and icon are that same entry rather than a second read

@@ -300,16 +300,16 @@ type ForecastDay struct {
 	// way as far as a legacy int key is concerned. The other three have no legacy
 	// counterpart, so nothing constrains them and they carry the nearest integer.
 	//
-	// Precipitation is the one numeric key that stays a value here, and that is now
-	// inconsistent with the seven day route's Forecast.Precipitation, which reports
-	// null for a day whose slots reported no window at all. The reasoning for this one
-	// is that the legacy key has always been a number; the reasoning on the other is
-	// that a total of nothing measured is not a total. The seven day reading is the
-	// better one and this is the one left behind, so treat it as pending rather than
-	// as a considered difference.
+	// Precipitation is a pointer, and the rule is the seven day route's rule rather
+	// than a near miss at it. A total is an answer only when there was something to
+	// total: a day with one slot reporting a 3h rain window the upstream measured as 0
+	// has a total of 0, and a day with no slot reporting any window has no total at all.
+	// As a value both reported 0, and the second one sat beside a rain and a snow that
+	// were both null, so the response said nothing fell and measured nothing at the same
+	// time.
 	Humidity      *int     `json:"humidity"`
 	WindSpeed     *float64 `json:"wind_speed"`
-	Precipitation float64  `json:"precipitation"`
+	Precipitation *float64 `json:"precipitation"`
 	ChanceOfRain  *int     `json:"chance_of_rain"`
 	UVIndex       *float64 `json:"uv_index"`
 
