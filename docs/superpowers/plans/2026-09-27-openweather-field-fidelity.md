@@ -300,7 +300,7 @@ Delete the `OneCallExcludes` constant and stop adding the `exclude` parameter in
 
 - [ ] **Step 5: Remove `WeatherData`**
 
-Delete the `WeatherData` type from `models/weather.go`. Leave `Current`, `Forecast` and `WeatherRequest` in place.
+Delete the `WeatherData` type from `models/weather.go`. `Current` and `Forecast` survive as the legacy alias blocks, but their fields become pointers wherever a route could reasonably fail to measure them, so an unmeasurable legacy key serialises as `null` rather than a fabricated `0`. For a real upstream body the JSON is byte-identical. `WeatherRequest` is untouched. Removing an exported type is a breaking change for any importer; nothing in this repository imports it, and the alternative, keeping it as a deprecated alias, would leave two competing envelope types with only one of them maintained.
 
 - [ ] **Step 6: Switch the route over and verify the build**
 

@@ -151,6 +151,15 @@ consumers and is deliberate:
 - `chance_of_rain` was a permanent `0`; it is now the rounded daily probability.
 - `uv_index` was a fabricated `0`; the three-hour endpoint has no `uvi`, so it is now
   `null`.
+- On `/weather/current` and `/weather/forecast/7day`, `current.max_temperature` and
+  `current.min_temperature` move from `0` to `null`. Neither was ever a real reading:
+  the upstream `temp_min`/`temp_max` on the `/data/2.5` endpoints are documented as
+  extremes in the city at the moment of calculation, not daily extremes, so labelling
+  them `min_temperature`/`max_temperature` was a mislabel. `null` says the route does not
+  report a daily extreme there. `/weather/forecast` is unaffected, because that route
+  derives real day-level extremes.
+- The legacy `date` field renders in UTC rather than the server's local zone, so the day
+  component of the rendered string no longer shifts with the server's `TZ`.
 
 `humidity` deliberately keeps its truncating mean, because the legacy field is an `int`
 and truncating is what it has always done. `pressure`, `clouds` and `visibility` have no
