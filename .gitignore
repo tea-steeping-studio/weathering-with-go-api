@@ -8,6 +8,9 @@
 *.so
 *.dylib
 
+# Extensionless binary that `go build` drops in the repo root
+/weathering-with-go
+
 # Test binary, built with `go test -c`
 *.test
 
