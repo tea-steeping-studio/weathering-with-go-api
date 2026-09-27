@@ -181,13 +181,26 @@ func (h *WeatherHandler) GetSevenDayForecast(c *gin.Context) {
 		return
 	}
 
+	// Resolved before the fetch, so an unrecognised block costs no upstream call. The
+	// parse error is the message rather than the details slot, because SendError
+	// renders only the message: a 400 that did not say which token was wrong would
+	// leave the caller bisecting their own list to find the typo.
+	blocks, err := models.ParseBlocks(c.Query("blocks"))
+	if err != nil {
+		utils.SendError(c, utils.NewAPIError(http.StatusBadRequest, err.Error()))
+		return
+	}
+
 	weatherData, cacheHit, err := h.weatherService.GetSevenDayForecast(location, units, requestAPIKey(c))
 	if err != nil {
 		utils.SendError(c, utils.HandleWeatherAPIError(err))
 		return
 	}
 
-	utils.SendCachedSuccess(c, weatherData, cacheHit)
+	// The blocks parameter decides what is exposed, not what is fetched: the cache key
+	// does not carry it and the cached value is always complete, so this costs a struct
+	// copy and no quota. Project does the copy without writing to the shared entry.
+	utils.SendCachedSuccess(c, weatherData.Project(blocks), cacheHit)
 }
 
 // PostSevenDayForecast handles POST /weather/forecast/7day requests with JSON body
@@ -213,6 +226,14 @@ func (h *WeatherHandler) PostSevenDayForecast(c *gin.Context) {
 		return
 	}
 
+	// The same allowlist and the same pre-fetch resolution as the GET route, read from
+	// the body rather than the query string.
+	blocks, err := models.ParseBlocks(req.Blocks)
+	if err != nil {
+		utils.SendError(c, utils.NewAPIError(http.StatusBadRequest, err.Error()))
+		return
+	}
+
 	if req.Keys == "" {
 		req.Keys = c.GetHeader("X-API-Key")
 	}
@@ -223,7 +244,7 @@ func (h *WeatherHandler) PostSevenDayForecast(c *gin.Context) {
 		return
 	}
 
-	utils.SendCachedSuccess(c, weatherData, cacheHit)
+	utils.SendCachedSuccess(c, weatherData.Project(blocks), cacheHit)
 }
 
 // requestAPIKey resolves the caller supplied api key, if any.

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -318,10 +319,14 @@ func requestSevenDayRouteBody(t *testing.T, body string) map[string]any {
 // faithful onecall namespace and the legacy keys from the same body.
 func requestSevenDayRoute(t *testing.T, router *gin.Engine) map[string]any {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/weather/forecast/7day?location=London,UK&units=metric", nil)
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
+	return requestSevenDayRouteTarget(t, router, sevenDayTarget)
+}
 
+// requestSevenDayRouteTarget is requestSevenDayRoute against a target the test
+// writes itself, so a test can add a query parameter to the base one.
+func requestSevenDayRouteTarget(t *testing.T, router *gin.Engine, target string) map[string]any {
+	t.Helper()
+	w := sevenDayGet(router, target)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d body=%s", w.Code, w.Body.String())
 	}
@@ -337,6 +342,60 @@ func requestSevenDayRoute(t *testing.T, router *gin.Engine) map[string]any {
 		t.Fatalf("expected a success response, got %q", w.Body.String())
 	}
 	return resp.Data
+}
+
+// sevenDayTarget is the base 7-day request: no opt-in block, and the parameters
+// every test on this route shares. Opt-in targets are this string plus a blocks
+// parameter, which is why it is a constant rather than written out per test.
+const sevenDayTarget = "/api/v1/weather/forecast/7day?location=London,UK&units=metric"
+
+// sevenDayGet issues one 7-day GET at the target verbatim and returns the
+// recorder, so a test can read the status and the X-Cache header as well as the body.
+func sevenDayGet(router *gin.Engine, target string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
+// newSevenDayBlocksRouter serves the full fixture, which carries all three opt-in
+// blocks, to both 7-day routes and counts the One Call upstream calls. It exists
+// because the shared stub's body has no opt-in block to expose at all, and because
+// the call count is the only evidence that asking for a block costs no second
+// fetch. It registers the POST route too, so the two opt-in tests can share it.
+//
+// The fixture body is rendered before the server starts rather than inside the
+// handler, because it calls t.Fatalf on a marshal error and a handler runs on a
+// goroutine this test does not own.
+func newSevenDayBlocksRouter(t *testing.T, oneCallCalls *int32) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+
+	upstream := sevenDayRouteFullJSON(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/geo/1.0/direct"):
+			fmt.Fprintln(w, `[{"name":"London","lat":51.5074,"lon":-0.1278,"country":"GB","state":"England"}]`)
+		case strings.HasPrefix(r.URL.Path, "/data/3.0/onecall"):
+			atomic.AddInt32(oneCallCalls, 1)
+			fmt.Fprintln(w, upstream)
+		default:
+			// t.Errorf is safe from a handler goroutine; t.Fatalf is not.
+			t.Errorf("unexpected upstream path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := services.NewWeatherService("server-key")
+	svc.HTTPClient = &http.Client{Transport: &transportRedirect{target: srv.URL}}
+
+	router := gin.New()
+	handler := NewWeatherHandler(svc)
+	router.GET("/api/v1/weather/forecast/7day", handler.GetSevenDayForecast)
+	router.POST("/api/v1/weather/forecast/7day", handler.PostSevenDayForecast)
+	return router
 }
 
 // array returns an array member as a slice of objects.
@@ -988,9 +1047,12 @@ func TestSevenDayRouteAlwaysFetchesEveryBlock(t *testing.T) {
 
 // Every block the mapper is given has to reach the response. minutely, hourly and
 // alerts are opt-in at the route level, which is an exposure decision taken after
-// the mapper runs, not a reason for the mapper to drop them.
+// the mapper runs, not a reason for the mapper to drop them. The three are asked
+// for by name here, because the route now withholds whatever a caller does not
+// request and a projection that dropped a block on its own would be invisible to
+// this test otherwise.
 func TestSevenDayRouteCarriesEveryUpstreamBlock(t *testing.T) {
-	data := requestSevenDayRoute(t, newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t)))
+	data := requestSevenDayRouteTarget(t, newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t)), sevenDayTarget+"&blocks=minutely,hourly,alerts")
 
 	onecall := block(t, data, "onecall")
 	minutely := array(t, onecall, "minutely")
@@ -1084,7 +1146,10 @@ func TestSevenDayRouteNullsUnmeasurableDailyMembers(t *testing.T) {
 
 func TestSevenDayOptInBlockKeysDistinguishAbsentFromEmpty(t *testing.T) {
 	// Three states a caller has to tell apart, and a plain slice with omitempty cannot
-	// hold the middle one: nil and an empty slice are both dropped.
+	// hold the middle one: nil and an empty slice are both dropped. The route asks for
+	// alerts in every case, so the states asserted here are the mapper's and not the
+	// projection's; the projection's own absent state is asserted by
+	// TestSevenDayRouteOmitsUnrequestedBlocks.
 	for _, tc := range []struct {
 		name    string
 		optIn   string
@@ -1097,13 +1162,15 @@ func TestSevenDayOptInBlockKeysDistinguishAbsentFromEmpty(t *testing.T) {
 		// alerts has to be told there are none, which is not the same as being told
 		// nothing.
 		{"empty", `,"alerts":[]`, true, 0},
-		// The upstream sent no alerts key at all, so the block is absent. This is also
-		// the state a projection produces for a block the caller did not ask for, and
-		// the response is built the same way in both cases.
+		// The upstream sent no alerts key at all, so the block is absent. This is the
+		// same state a projection produces for a block the caller did not ask for, and
+		// the response is built the same way in both cases, so a caller who asked for
+		// alerts cannot tell an upstream that sent none from a route that withheld it.
 		{"absent", "", false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			data := requestSevenDayRouteBody(t, mustOneCallBody(t, oneCallCurrentBlock, tc.optIn, sevenDayRouteDays(t)))
+			router := newSevenDayRouteRouter(t, mustOneCallBody(t, oneCallCurrentBlock, tc.optIn, sevenDayRouteDays(t)))
+			data := requestSevenDayRouteTarget(t, router, sevenDayTarget+"&blocks=alerts")
 			onecall := block(t, data, "onecall")
 
 			if !tc.wantKey {
@@ -1295,6 +1362,288 @@ func TestSevenDayLegacyDateRendersInUTC(t *testing.T) {
 	// the epoch, and this test pins the rendering of the legacy alias only.
 	if days[1]["date"] != "2026-03-02T12:00:00Z" {
 		t.Fatalf("expected the second legacy date to render as %q, got %#v", "2026-03-02T12:00:00Z", days[1]["date"])
+	}
+}
+
+// The three large blocks are opt-in at the route, so a caller who asks for none of
+// them gets no hourly, minutely or alerts key at all. The envelope is not opt-in:
+// the same response still carries lat, lon, timezone, current and daily, which is
+// the difference between clearing three members of a copy and dropping a subtree.
+func TestSevenDayRouteOmitsUnrequestedBlocks(t *testing.T) {
+	data := requestSevenDayRoute(t, newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t)))
+
+	onecall := block(t, data, "onecall")
+	for _, name := range []string{"hourly", "minutely", "alerts"} {
+		// Absent means no key at all, not a null one and not an empty array.
+		if value, ok := onecall[name]; ok {
+			t.Fatalf("expected no %s key on a lean request, got %#v", name, value)
+		}
+	}
+
+	// Everything the envelope always carries survives the projection. A test that
+	// only checked the three absences would pass on a projection that emptied the
+	// whole namespace.
+	if onecall["lat"] != 51.5074 || onecall["lon"] != -0.1278 || onecall["timezone"] != "Europe/London" {
+		t.Fatalf("expected the envelope scalars to survive a lean request, got %#v", onecall)
+	}
+	if onecall["current"] == nil {
+		t.Fatal("expected the faithful current block to survive a lean request")
+	}
+	if days := array(t, onecall, "daily"); len(days) != sevenDayRouteDayCount {
+		t.Fatalf("expected %d faithful days on a lean request, got %d", sevenDayRouteDayCount, len(days))
+	}
+	// The legacy half is untouched by the opt-in either way.
+	if days := array(t, data, "forecast"); len(days) != 7 {
+		t.Fatalf("expected 7 legacy days on a lean request, got %d", len(days))
+	}
+}
+
+// A block the caller asks for comes back with its entries, and the two it did not
+// ask for are still withheld. The point of the name is the second half: asking for
+// hourly must not turn into asking for everything.
+func TestSevenDayRouteIncludesRequestedBlocks(t *testing.T) {
+	data := requestSevenDayRouteTarget(t, newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t)), sevenDayTarget+"&blocks=hourly")
+
+	onecall := block(t, data, "onecall")
+	hourly := array(t, onecall, "hourly")
+	if len(hourly) != 1 || hourly[0]["temp"] != 11.5 || hourly[0]["pop"] != 0.2 {
+		t.Fatalf("expected the fixture's single hourly entry, got %#v", hourly)
+	}
+	for _, name := range []string{"minutely", "alerts"} {
+		if value, ok := onecall[name]; ok {
+			t.Fatalf("expected no %s key when only hourly was requested, got %#v", name, value)
+		}
+	}
+}
+
+// The allowlist is a fixed set and a typo is a 400 rather than a silently ignored
+// parameter. A silently ignored one is the worse outcome: a caller who misspells
+// "alerts" gets a lean body and no indication that the blocks they asked for are
+// missing from it.
+func TestSevenDayRouteRejectsUnknownBlock(t *testing.T) {
+	for _, raw := range []string{"bogus", "hourly,bogus"} {
+		t.Run(raw, func(t *testing.T) {
+			router := newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t))
+			w := sevenDayGet(router, sevenDayTarget+"&blocks="+raw)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("blocks=%s: expected 400 got %d body=%s", raw, w.Code, w.Body.String())
+			}
+
+			var resp struct {
+				Success bool           `json:"success"`
+				Data    map[string]any `json:"data"`
+				Error   struct {
+					Code    int    `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("blocks=%s: failed to decode %q: %v", raw, w.Body.String(), err)
+			}
+			if resp.Success {
+				t.Fatalf("blocks=%s: expected a failure response, got %q", raw, w.Body.String())
+			}
+			if resp.Error.Code != http.StatusBadRequest {
+				t.Fatalf("blocks=%s: expected error.code 400, got %q", raw, w.Body.String())
+			}
+			// The rejected list exposes no block at all, including the valid part of a
+			// partly valid list. The needle is the quoted JSON key rather than the word,
+			// because the error message legitimately names hourly as one of the choices.
+			if strings.Contains(w.Body.String(), `"hourly":`) {
+				t.Fatalf("blocks=%s: expected the rejected list to expose no block, got %q", raw, w.Body.String())
+			}
+			// The offending token has to reach the caller. SendError renders the message
+			// and drops the details slot, so a message that did not name the token would
+			// leave a 400 telling the caller only that they were wrong.
+			if !strings.Contains(resp.Error.Message, "bogus") {
+				t.Fatalf("blocks=%s: expected the message to name the offending token, got %q", raw, resp.Error.Message)
+			}
+		})
+	}
+}
+
+// The parameter is a list, so a caller can ask for a subset in one request. A
+// boolean would have made "just hourly" a different question from "everything".
+func TestSevenDayRouteAcceptsMultipleBlocks(t *testing.T) {
+	data := requestSevenDayRouteTarget(t, newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t)), sevenDayTarget+"&blocks=hourly,alerts")
+
+	onecall := block(t, data, "onecall")
+	if hourly := array(t, onecall, "hourly"); len(hourly) != 1 {
+		t.Fatalf("expected the fixture's single hourly entry, got %#v", hourly)
+	}
+	alerts := array(t, onecall, "alerts")
+	if len(alerts) != 1 || alerts[0]["event"] != "Flood warning" {
+		t.Fatalf("expected the fixture's single alert, got %#v", alerts)
+	}
+	if value, ok := onecall["minutely"]; ok {
+		t.Fatalf("expected no minutely key when only hourly and alerts were requested, got %#v", value)
+	}
+}
+
+// The blocks parameter decides what is exposed, not what is fetched. The upstream is
+// always asked for everything, the cached value is always complete, and one entry
+// therefore serves every variant: putting blocks in the cache key would buy a struct
+// copy with a second call against the free tier quota.
+func TestSevenDayRouteBlocksDoNotCostAnUpstreamCall(t *testing.T) {
+	var calls int32
+	router := newSevenDayBlocksRouter(t, &calls)
+
+	lean := sevenDayGet(router, sevenDayTarget)
+	if lean.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d body=%s", lean.Code, lean.Body.String())
+	}
+	if got := lean.Header().Get("X-Cache"); got != "MISS" {
+		t.Fatalf("expected the first request to miss the cache, got %q", got)
+	}
+
+	fat := sevenDayGet(router, sevenDayTarget+"&blocks=hourly")
+	if fat.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d body=%s", fat.Code, fat.Body.String())
+	}
+	// A HIT here is the claim: the second request was served by the entry the lean
+	// one populated, not by a fetch of its own.
+	if got := fat.Header().Get("X-Cache"); got != "HIT" {
+		t.Fatalf("expected the block request to be served from the cache, got %q", got)
+	}
+	if hourly := array(t, block(t, decodeData(t, fat.Body), "onecall"), "hourly"); len(hourly) != 1 {
+		t.Fatalf("expected the cached entry to still hold the hourly block, got %#v", hourly)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected 1 upstream call across the lean and block requests, got %d", got)
+	}
+}
+
+// cachedFetchTracked stores a *SevenDayResponse and hands that same pointer to every
+// caller for the life of the entry, so a lean request and a block request for one
+// location share one object. A projection that trimmed the cached response in place
+// would strip hourly from the object the fat request is about to serialise, and
+// because the mutation is sticky every fat response after it would be lean too. The
+// failure is silent, intermittent and invisible to a sequential test, which is why
+// this one is concurrent and this is why it asserts the call count: the warm-up
+// below pins the cache entry first, so the shared pointer is a fact here rather than
+// a likelihood, and one upstream call across every request is the proof of it.
+func TestConcurrentBlockRequestsDoNotCorruptEachOther(t *testing.T) {
+	var calls int32
+	router := newSevenDayBlocksRouter(t, &calls)
+
+	warm := sevenDayGet(router, sevenDayTarget)
+	if warm.Code != http.StatusOK {
+		t.Fatalf("expected the warm-up request to succeed, got %d body=%s", warm.Code, warm.Body.String())
+	}
+
+	// More than one request per side, so the -race detector has overlapping accesses
+	// to the shared entry to work with and a mutation has somewhere to land.
+	const iterations = 8
+	sides := []struct {
+		query      string
+		wantHourly bool
+	}{
+		{"", false},
+		{"&blocks=hourly", true},
+	}
+
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		bodies   int
+		problems []string
+	)
+	for _, side := range sides {
+		for range iterations {
+			wg.Add(1)
+			go func(query string, wantHourly bool) {
+				defer wg.Done()
+				w := sevenDayGet(router, sevenDayTarget+query)
+				if w.Code != http.StatusOK {
+					mu.Lock()
+					problems = append(problems, fmt.Sprintf("blocks=%q returned %d", query, w.Code))
+					mu.Unlock()
+					return
+				}
+				var resp struct {
+					Data struct {
+						OneCall map[string]any `json:"onecall"`
+					} `json:"data"`
+				}
+				if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+					mu.Lock()
+					problems = append(problems, fmt.Sprintf("blocks=%q failed to decode: %v", query, err))
+					mu.Unlock()
+					return
+				}
+				_, hourly := resp.Data.OneCall["hourly"]
+				mu.Lock()
+				bodies++
+				if hourly != wantHourly {
+					problems = append(problems, fmt.Sprintf("blocks=%q saw onecall.hourly present=%t, want %t", query, hourly, wantHourly))
+				}
+				mu.Unlock()
+			}(side.query, side.wantHourly)
+		}
+	}
+	wg.Wait()
+
+	if len(problems) > 0 {
+		t.Fatalf("concurrent lean and block requests disagreed about the shared cached response: %s",
+			strings.Join(problems, "; "))
+	}
+	// Without this a test that collected nothing would pass on a projection that
+	// serialised nothing at all.
+	if want := 2 * iterations; bodies != want {
+		t.Fatalf("expected %d responses to check, got %d", want, bodies)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected every request to share the one cached entry, got %d upstream calls", got)
+	}
+}
+
+// The POST route carries the same opt-in as the GET one, so a caller is not pushed
+// onto the query string to see hourly.
+func TestPostSevenDayForecastAcceptsBlocksField(t *testing.T) {
+	var calls int32
+	router := newSevenDayBlocksRouter(t, &calls)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/weather/forecast/7day",
+		strings.NewReader(`{"location":"London,UK","units":"metric","blocks":"hourly"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d body=%s", w.Code, w.Body.String())
+	}
+	onecall := block(t, decodeData(t, w.Body), "onecall")
+	if hourly := array(t, onecall, "hourly"); len(hourly) != 1 || hourly[0]["temp"] != 11.5 {
+		t.Fatalf("expected the fixture's single hourly entry, got %#v", hourly)
+	}
+	for _, name := range []string{"minutely", "alerts"} {
+		if value, ok := onecall[name]; ok {
+			t.Fatalf("expected no %s key when the body asked only for hourly, got %#v", name, value)
+		}
+	}
+	// The POST route reads the same cached entry as the GET one, so the opt-in
+	// changes what is exposed and not what is fetched.
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected 1 upstream call, got %d", got)
+	}
+}
+
+func TestPostSevenDayForecastRejectsUnknownBlockField(t *testing.T) {
+	var calls int32
+	router := newSevenDayBlocksRouter(t, &calls)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/weather/forecast/7day",
+		strings.NewReader(`{"location":"London,UK","units":"metric","blocks":"bogus"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d body=%s", w.Code, w.Body.String())
+	}
+	// The blocks parameter is validated before the fetch, so a typo costs no quota.
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("expected a rejected blocks value to cost no upstream call, got %d", got)
 	}
 }
 

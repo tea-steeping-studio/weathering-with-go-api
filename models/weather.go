@@ -93,6 +93,10 @@ type WeatherRequest struct {
 	Days     int    `json:"days,omitempty" form:"days"`
 	Units    string `json:"units,omitempty" form:"units"` // metric, imperial, kelvin
 	Keys     string `json:"keys,omitempty" form:"keys"`
+	// Blocks is the comma separated opt-in block list the 7-day route reads, so a POST
+	// caller can reach hourly, minutely and alerts without falling back to the query
+	// string. The other two routes ignore it.
+	Blocks string `json:"blocks,omitempty" form:"blocks"`
 }
 
 // ErrorResponse represents API error response

@@ -1,6 +1,10 @@
 package models
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // The block types below describe what a route reports, not what it decodes. Every
 // member is a pointer, because a value the upstream genuinely measured as 0 has
@@ -535,7 +539,7 @@ type OneCallDailyPoint struct {
 //
 // Clearing a block is therefore a matter of nil-ing the pointer, and it has to happen
 // on a copy: the cached response is shared by every concurrent caller and must never
-// be trimmed in place. The projection that does so is not written yet.
+// be trimmed in place. SevenDayResponse.Project is what does so.
 //
 // The four scalars are values. The upstream documents all of them as sent whenever
 // the endpoint answers, and a latitude of 0 and a timezone offset of 0 are both real
@@ -632,6 +636,94 @@ type SevenDayResponse struct {
 	Current     Current    `json:"current"`
 	Forecast    []Forecast `json:"forecast"`
 	RequestTime time.Time  `json:"request_time"`
+}
+
+// Blocks is which of the three large One Call blocks a caller asked to be exposed.
+//
+// The three are pointer-to-slice members of OneCallEnvelope with omitempty, and a
+// request decides only whether a caller sees them. It is a set of three booleans
+// rather than a boolean or a list of strings so that "hourly only" and "everything"
+// are different requests, and so that adding a fourth block later is an addition
+// here rather than a change of shape.
+type Blocks struct {
+	Hourly   bool
+	Minutely bool
+	Alerts   bool
+}
+
+// blockNames is the allowlist, in the order the error message and the doc read
+// best. It is the whole of what a caller may ask for: the upstream document names
+// no other array on this endpoint.
+var blockNames = []string{"hourly", "minutely", "alerts"}
+
+// ParseBlocks reads a raw blocks parameter, which is a comma separated list, into a
+// Blocks. Names are trimmed and lowercased, so " Hourly , ALERTS " is the same
+// request as "hourly,alerts" and neither is a reason to fail.
+//
+// An empty or absent raw value is the zero Blocks and no error: a caller that sends
+// no blocks parameter is asking for the lean body, which is the default, and a client
+// library sending blocks="" is not broken.
+//
+// A token outside the allowlist is an error naming that token, and it fails the whole
+// list rather than the one entry. Honouring the valid part would be the worse
+// outcome, because a caller who misspells "alerts" would get a body missing the very
+// block they asked for and nothing in the response to say the request was misread.
+func ParseBlocks(raw string) (Blocks, error) {
+	var blocks Blocks
+	if strings.TrimSpace(raw) == "" {
+		return blocks, nil
+	}
+
+	for _, token := range strings.Split(raw, ",") {
+		name := strings.ToLower(strings.TrimSpace(token))
+		switch name {
+		case "hourly":
+			blocks.Hourly = true
+		case "minutely":
+			blocks.Minutely = true
+		case "alerts":
+			blocks.Alerts = true
+		default:
+			return Blocks{}, fmt.Errorf("unknown block %q: want one of %s", name, strings.Join(blockNames, ", "))
+		}
+	}
+	return blocks, nil
+}
+
+// Project returns a copy of the response exposing only the opt-in blocks the caller
+// asked for. Every block it was not asked for becomes an absent key, and the
+// envelope itself is always kept, so a lean request still reports lat, lon,
+// timezone, timezone_offset, current and daily. That is why the members are cleared
+// inside a copy of the envelope rather than by dropping a whole subtree.
+//
+// The receiver is never written to. The response this is called on is the one the
+// service handed back, and cachedFetchTracked stores that pointer and returns the
+// identical pointer to every caller for the life of the cache entry. Clearing a
+// member through the receiver would strip the block from the shared object and
+// every concurrent request that asked for it would serialise a lean body. The top
+// level copy is a few words; the nested slices are shared but never written, so
+// there is no second copy of the hourly array per request.
+//
+// It returns a value rather than a pointer, so a caller cannot keep a handle on
+// something it believes to be its own copy and mutate it later.
+func (r *SevenDayResponse) Project(blocks Blocks) SevenDayResponse {
+	out := *r
+	if out.OneCall == nil {
+		return out
+	}
+
+	onecall := *out.OneCall
+	if !blocks.Hourly {
+		onecall.Hourly = nil
+	}
+	if !blocks.Minutely {
+		onecall.Minutely = nil
+	}
+	if !blocks.Alerts {
+		onecall.Alerts = nil
+	}
+	out.OneCall = &onecall
+	return out
 }
 
 // SevenDayPayload is a pointer-shaped mirror of the /data/3.0/onecall body and the

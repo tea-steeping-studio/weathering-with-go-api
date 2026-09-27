@@ -498,3 +498,75 @@ var sevenDayPayloadNarrowed = map[string]string{
 	"daily.feels_like.morn":  oneCallBreakdownSent,
 	"daily.feels_like.eve":   oneCallBreakdownSent,
 }
+
+// ParseBlocks is the whole allowlist, and the parse is the only place a caller can
+// be told its typo was a typo. The two states that matter are the zero value an
+// absent parameter produces and the error a token outside the set produces; a
+// boolean or a silently ignored unknown would make a misspelled "alerts" look like
+// a working request for a lean body.
+func TestParseBlocks(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		raw     string
+		want    Blocks
+		wantErr string
+	}{
+		// An absent or empty parameter is not a request for anything, and must not be
+		// an error either: a client library sending blocks="" is not broken.
+		{"absent", "", Blocks{}, ""},
+		{"whitespace only", "  ", Blocks{}, ""},
+		{"single", "hourly", Blocks{Hourly: true}, ""},
+		{"all three", "hourly,minutely,alerts", Blocks{Hourly: true, Minutely: true, Alerts: true}, ""},
+		{"subset", "hourly,alerts", Blocks{Hourly: true, Alerts: true}, ""},
+		// Case and spacing are the two ways a correct request is written that is not
+		// byte-identical to a doc example, and neither is a reason to fail.
+		{"upper case", "HOURLY", Blocks{Hourly: true}, ""},
+		{"padded", " Hourly , ALERTS ", Blocks{Hourly: true, Alerts: true}, ""},
+		// A repeated name is the same request asked twice, not an error.
+		{"repeated", "hourly,hourly", Blocks{Hourly: true}, ""},
+		// The error names the offending token, because "invalid blocks parameter" on
+		// its own tells a caller nothing about which of the three to fix.
+		{"unknown", "bogus", Blocks{}, "bogus"},
+		// A list fails whole. Honouring the valid part would return a body missing the
+		// very block that was misspelled, with no sign that anything went wrong.
+		{"partly valid", "hourly,bogus", Blocks{}, "bogus"},
+		// An empty token is a trailing or doubled comma, which is a typo too, and the
+		// empty string is not one of the three names.
+		{"trailing comma", "hourly,", Blocks{}, `""`},
+		{"doubled comma", "hourly,,alerts", Blocks{}, `""`},
+		{"comma only", ",", Blocks{}, `""`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseBlocks(tc.raw)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ParseBlocks(%q) returned %v", tc.raw, err)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("ParseBlocks(%q) accepted it as a block list, want an error", tc.raw)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("ParseBlocks(%q) error %q does not name %q", tc.raw, err, tc.wantErr)
+				}
+			}
+			if got != tc.want {
+				t.Fatalf("ParseBlocks(%q) = %+v, want %+v", tc.raw, got, tc.want)
+			}
+		})
+	}
+
+	// The error message advertises blockNames and the parse accepts the literals in its
+	// own switch, so the two are pinned against each other here. A block added to one
+	// and not the other would make a 400 promise something the parser then rejects.
+	for _, name := range blockNames {
+		got, err := ParseBlocks(name)
+		if err != nil {
+			t.Errorf("blockNames advertises %q but ParseBlocks rejects it: %v", name, err)
+			continue
+		}
+		if got == (Blocks{}) {
+			t.Errorf("blockNames advertises %q but ParseBlocks selects no block for it", name)
+		}
+	}
+}
