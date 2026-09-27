@@ -209,9 +209,14 @@ func sevenDayRouteDays(t *testing.T) []string {
 			// 0.29 is the probability whose percentage truncates: 0.29*100 is
 			// 28.999999999999996 in binary floating point, so chance_of_rain has to
 			// be rounded to answer 29 rather than 28.
-			"pop":  0.29,
+			"pop": 0.29,
+			// A day that fell on both, with two volumes that are both non-zero. The
+			// snow was 0 until the alias table added a row pinning the legacy
+			// precipitation to rain plus snow: with a snow of 0 the total is 1.5 with
+			// or without it, so that row could only ever have been proving
+			// precipitation equals rain. See aliasRows in alias_test.go.
 			"rain": 1.5,
-			"snow": 0,
+			"snow": 0.4,
 			"uvi":  3.5,
 		})
 		rendered, err := json.Marshal(day)
