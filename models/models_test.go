@@ -44,6 +44,8 @@ func TestWeatherRequestTags(t *testing.T) {
 // expected json tag and is a plain value type. A decode-only assertion cannot
 // catch a missing tag on a lower-case name, because encoding/json matches field
 // names case-insensitively, and the exact tag string also rules out omitempty.
+// The type guard covers slice element types too, so a pointer smuggled in as
+// []*T is rejected just like a bare *T field.
 func assertJSONTags(t *testing.T, v any, want map[string]string) {
 	t.Helper()
 	rt := reflect.TypeOf(v)
@@ -58,6 +60,9 @@ func assertJSONTags(t *testing.T, v any, want map[string]string) {
 		}
 		if f.Type.Kind() == reflect.Pointer {
 			t.Errorf("%s.%s: must be a plain value type, got %s", rt.Name(), field, f.Type)
+		}
+		if f.Type.Kind() == reflect.Slice && f.Type.Elem().Kind() == reflect.Pointer {
+			t.Errorf("%s.%s: slice element must be a plain value type, got %s", rt.Name(), field, f.Type)
 		}
 	}
 }
@@ -147,13 +152,13 @@ func TestOneCallModelsBindDocumentedFields(t *testing.T) {
 	"minutely":[{"dt":1595243460,"precipitation":0.02}],
 	"hourly":[{"dt":1595242800,"sunrise":1595243663,"sunset":1595294958,"temp":299.41,"feels_like":300.32,
 	"pressure":1014,"humidity":89,"dew_point":297.15,"uvi":5.53,"clouds":75,"visibility":10000,
-	"wind_speed":3.12,"wind_deg":210,"wind_gust":6.2,"pop":0.32,"rain":0.12,"snow":0.0,
+	"wind_speed":3.12,"wind_deg":210,"wind_gust":6.2,"pop":0.32,"rain":0.12,"snow":0.2,
 	"weather":[{"id":500,"main":"Rain","description":"light rain","icon":"10d"}]}],
 	"daily":[{"dt":1595242800,"sunrise":1595243663,"sunset":1595294958,"moonrise":1595245402,"moonset":1595293300,
 	"moon_phase":0.07,"temp":{"day":299.02,"min":288.79,"max":300.19,"night":289.58,"morn":292.15,"eve":296.5},
 	"feels_like":{"day":298.77,"night":285.88,"eve":295.1,"morn":290.15},"pressure":1015,"humidity":65,
 	"dew_point":292.35,"wind_speed":5.68,"wind_deg":225,"wind_gust":9.68,"clouds":40,"pop":0.62,
-	"rain":1.25,"snow":0,"uvi":8.53,"weather":[{"id":500,"main":"Rain","description":"light rain","icon":"10d"}]}],
+	"rain":1.25,"snow":0.35,"uvi":8.53,"weather":[{"id":500,"main":"Rain","description":"light rain","icon":"10d"}]}],
 	"alerts":[{"sender_name":"NWS Tulsa","event":"Heat Advisory","start":1595246400,"end":1595293200,
 	"description":"HEAT ADVISORY REMAINS IN EFFECT UNTIL 9 PM CDT.","tags":["Extreme temperature value","Heat"]}]}`
 
@@ -186,7 +191,7 @@ func TestOneCallModelsBindDocumentedFields(t *testing.T) {
 	if h.Temp != 299.41 || h.FeelsLike != 300.32 || h.DewPoint != 297.15 {
 		t.Fatalf("unexpected hourly temps: temp=%v feels_like=%v dew_point=%v", h.Temp, h.FeelsLike, h.DewPoint)
 	}
-	if h.Uvi != 5.53 || h.Pop != 0.32 || h.Rain != 0.12 || h.Snow != 0 {
+	if h.Uvi != 5.53 || h.Pop != 0.32 || h.Rain != 0.12 || h.Snow != 0.2 {
 		t.Fatalf("unexpected hourly float fields: uvi=%v pop=%v rain=%v snow=%v", h.Uvi, h.Pop, h.Rain, h.Snow)
 	}
 	if h.WindSpeed != 3.12 || h.WindGust != 6.2 {
@@ -221,6 +226,9 @@ func TestOneCallModelsBindDocumentedFields(t *testing.T) {
 	}
 	if d.Pop != 0.62 {
 		t.Fatalf("expected daily pop 0.62, got %v", d.Pop)
+	}
+	if d.Snow != 0.35 {
+		t.Fatalf("expected daily snow 0.35, got %v", d.Snow)
 	}
 
 	if len(resp.Alerts) != 1 {
