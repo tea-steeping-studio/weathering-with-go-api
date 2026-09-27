@@ -906,7 +906,6 @@ func mapForecastSlot(item models.ForecastItem, presence models.ForecastPayloadIt
 			Humidity:  &humidity,
 			SeaLevel:  presence.Main.SeaLevel,
 			GrndLevel: presence.Main.GrndLevel,
-			// TempKF stays null: /data/2.5/forecast does not document it for a slot.
 		}
 	}
 
@@ -951,6 +950,16 @@ func mapForecastSlot(item models.ForecastItem, presence models.ForecastPayloadIt
 //
 // dateStr and slots always come from mapForecast's grouping, so slots is never
 // empty: a day is created from a slot, never the other way round.
+//
+// The three block reads below dereference a member of a slot's main, wind and clouds
+// block with no check of its own. That is safe because mapForecastSlot populates all
+// three blocks unconditionally whenever the presence view says the upstream sent them,
+// and leaves them nil otherwise, so a block that is non-nil always has all of its
+// members bound. The invariant is this function's to depend on and the mapper's to keep,
+// so it is stated here rather than left implicit. The guard is the second half of that:
+// a block that is somehow not fully populated skips the slot rather than panicking on a
+// nil member, because a rollup that skips one reading is wrong in a way a caller can
+// see and a 500 is not.
 func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay {
 	date, _ := time.Parse("2006-01-02", dateStr)
 	day := models.ForecastDay{Date: date, Hourly: slots}
@@ -977,7 +986,11 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 	)
 
 	for _, slot := range slots {
-		if main := slot.Main; main != nil {
+		// Each block is skipped whole when it is not fully populated, rather than each
+		// member being skipped. A half-accumulated mean is a number derived from fewer
+		// readings than it claims to be, which is worse than a null for a member the
+		// route could not measure.
+		if main := slot.Main; main != nil && main.Temp != nil && main.Humidity != nil && main.Pressure != nil {
 			temp := *main.Temp
 			if !tempSeen || temp < tempMin {
 				tempMin = temp
@@ -996,7 +1009,7 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 			pressureCount++
 		}
 
-		if wind := slot.Wind; wind != nil {
+		if wind := slot.Wind; wind != nil && wind.Speed != nil && wind.Deg != nil {
 			speed := *wind.Speed
 			windSum += speed
 			windCount++
@@ -1014,7 +1027,7 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 			}
 		}
 
-		if clouds := slot.Clouds; clouds != nil {
+		if clouds := slot.Clouds; clouds != nil && clouds.All != nil {
 			cloudSum += float64(*clouds.All)
 			cloudCount++
 		}
