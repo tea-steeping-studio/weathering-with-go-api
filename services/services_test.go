@@ -28,8 +28,10 @@ func TestMapCurrentWeather(t *testing.T) {
 	if data.Location.Name != "Testville" {
 		t.Fatalf("expected location name Testville got %s", data.Location.Name)
 	}
-	if data.Current.Condition != "Clear" {
-		t.Fatalf("expected condition Clear got %s", data.Current.Condition)
+	// The legacy block is pointer shaped, so a reading is reached through its pointer.
+	// The value is the one this test asserted before the change.
+	if data.Current.Condition == nil || *data.Current.Condition != "Clear" {
+		t.Fatalf("expected condition Clear got %v", data.Current.Condition)
 	}
 }
 
@@ -498,29 +500,24 @@ func TestMapForecastPopulatesCurrent(t *testing.T) {
 
 	data := NewWeatherService("dummy").mapForecast(owm, payload, 5)
 
-	wantUpdated := time.Unix(1772000000, 0)
+	// The expected values are the ones this test asserted before models.Current became
+	// pointer shaped. Only the comparison changed: a reading is now reached through
+	// its pointer, so a value that disappears fails here as loudly as it ever did.
 	got := data.Current
-	if got.Temperature != 18.0 || got.FeelsLike != 17.2 {
-		t.Fatalf("unexpected current temperatures %+v", got)
-	}
-	if got.Humidity != 70 || got.Pressure != 1012 {
-		t.Fatalf("unexpected current humidity/pressure %+v", got)
-	}
-	if got.WindSpeed != 5.0 || got.WindDirection != 90 || got.WindGust != 7.5 {
-		t.Fatalf("unexpected current wind %+v", got)
-	}
-	if got.CloudCover != 80 {
-		t.Fatalf("expected cloud_cover 80, got %d", got.CloudCover)
-	}
-	if got.Condition != "Rain" || got.Icon != "10d" || got.Description != "Light Rain" {
-		t.Fatalf("unexpected current condition %+v", got)
-	}
-	if got.MinTemp != 15.0 || got.MaxTemp != 21.0 {
-		t.Fatalf("unexpected current min/max %+v", got)
-	}
-	if !got.LastUpdated.Equal(wantUpdated) {
-		t.Fatalf("expected last_updated %s got %s", wantUpdated, got.LastUpdated)
-	}
+	requireFloat(t, "the current temperature", got.Temperature, 18.0)
+	requireFloat(t, "the current feels_like", got.FeelsLike, 17.2)
+	requireInt(t, "the current humidity", got.Humidity, 70)
+	requireFloat(t, "the current pressure", got.Pressure, 1012)
+	requireFloat(t, "the current wind_speed", got.WindSpeed, 5.0)
+	requireInt(t, "the current wind_direction", got.WindDirection, 90)
+	requireFloat(t, "the current wind_gust", got.WindGust, 7.5)
+	requireInt(t, "the current cloud_cover", got.CloudCover, 80)
+	requireString(t, "the current condition", got.Condition, "Rain")
+	requireString(t, "the current icon", got.Icon, "10d")
+	requireString(t, "the current description", got.Description, "Light Rain")
+	requireFloat(t, "the current min_temperature", got.MinTemp, 15.0)
+	requireFloat(t, "the current max_temperature", got.MaxTemp, 21.0)
+	requireTime(t, "the current last_updated", got.LastUpdated, time.Unix(1772000000, 0))
 }
 
 // The mapper is handed a payload shorter than the upstream list, which cannot
@@ -577,16 +574,19 @@ func TestMapForecastWithoutAPayloadStillRollsUpDays(t *testing.T) {
 	}
 }
 
-func TestMapForecastWithNoItemsLeavesCurrentZero(t *testing.T) {
+// An empty response has no slot to read a current block from, so every member of it
+// is null. Before the block was pointer shaped this test asserted zeroes, and the
+// 0 of last_updated was 0001-01-01 rather than a date anybody measured.
+func TestMapForecastWithNoItemsLeavesCurrentNull(t *testing.T) {
 	svc := NewWeatherService("dummy")
 
 	data := svc.mapForecast(models.OpenWeatherMapForecastResponse{}, models.ForecastPayload{}, 5)
 
-	if data.Current.Temperature != 0 || data.Current.Condition != "" {
-		t.Fatalf("expected zero current for an empty response, got %+v", data.Current)
+	if data.Current.Temperature != nil || data.Current.Condition != nil {
+		t.Fatalf("expected a null current for an empty response, got %+v", data.Current)
 	}
-	if !data.Current.LastUpdated.IsZero() {
-		t.Fatalf("expected zero last_updated, got %s", data.Current.LastUpdated)
+	if data.Current.LastUpdated != nil {
+		t.Fatalf("expected a null last_updated for an empty response, got %s", data.Current.LastUpdated)
 	}
 	if len(data.Forecast) != 0 {
 		t.Fatalf("expected no days for an empty response, got %d", len(data.Forecast))
@@ -637,37 +637,46 @@ func TestMapOneCallPopulatesCurrent(t *testing.T) {
 		},
 	}
 
-	// The legacy block is derived from the decode struct alone. The faithful twin is
-	// built from the same upstream object and needs a presence view to read a
-	// measurement, which is why the payload is passed here even though the legacy
-	// assertions above would pass without one.
-	temp, humidity := 12.4, 64
-	payload := models.SevenDayPayload{Current: &models.SevenDayPayloadCurrent{Temp: &temp, Humidity: &humidity}}
+	// The legacy block and the faithful one are both built from this presence view, so
+	// every reading the test asserts has to be declared in it. The three timestamps
+	// and the weather array are read from the decode struct, which is why they are
+	// not here.
+	temp, feelsLike, dewPoint, uvi, speed, gust := 12.4, 11.0, 7.7, 2.1, 4.2, 6.0
+	pressure, humidity, clouds, visibility, deg := 1008, 64, 30, 9000, 210
+	payload := models.SevenDayPayload{Current: &models.SevenDayPayloadCurrent{
+		Temp:       &temp,
+		FeelsLike:  &feelsLike,
+		Pressure:   &pressure,
+		Humidity:   &humidity,
+		DewPoint:   &dewPoint,
+		Uvi:        &uvi,
+		Clouds:     &clouds,
+		Visibility: &visibility,
+		WindSpeed:  &speed,
+		WindDeg:    &deg,
+		WindGust:   &gust,
+	}}
 
 	data := svc.mapOneCall(owm, payload, &models.Location{Name: "London"})
 
-	wantUpdated := time.Unix(1772000000, 0)
+	// Same expected values as before the block became pointer shaped; the comparison
+	// is what changed. This route's legacy block and its faithful twin are built from
+	// one presence view, so neither can report a reading the other has not got.
 	got := data.Current
-	if got.Temperature != 12.4 || got.FeelsLike != 11.0 {
-		t.Fatalf("unexpected current temperatures %+v", got)
-	}
-	if got.Pressure != 1008 || got.Humidity != 64 {
-		t.Fatalf("unexpected current pressure/humidity %+v", got)
-	}
-	if got.Visibility != 9000 || got.CloudCover != 30 {
-		t.Fatalf("unexpected current visibility/clouds %+v", got)
-	}
-	if got.WindSpeed != 4.2 || got.WindDirection != 210 || got.WindGust != 6.0 {
-		t.Fatalf("unexpected current wind %+v", got)
-	}
-	if got.Condition != "Clouds" || got.Icon != "04d" || got.Description != "Broken Clouds" {
-		t.Fatalf("unexpected current condition %+v", got)
-	}
-	if !got.LastUpdated.Equal(wantUpdated) {
-		t.Fatalf("expected last_updated %s got %s", wantUpdated, got.LastUpdated)
-	}
-	// The legacy block is derived from the decode struct alone, so the faithful twin
-	// is built from the same value and reports the same readings beside it.
+	requireFloat(t, "the current temperature", got.Temperature, 12.4)
+	requireFloat(t, "the current feels_like", got.FeelsLike, 11.0)
+	requireFloat(t, "the current pressure", got.Pressure, 1008)
+	requireInt(t, "the current humidity", got.Humidity, 64)
+	requireFloat(t, "the current visibility", got.Visibility, 9000)
+	requireInt(t, "the current cloud_cover", got.CloudCover, 30)
+	requireFloat(t, "the current wind_speed", got.WindSpeed, 4.2)
+	requireInt(t, "the current wind_direction", got.WindDirection, 210)
+	requireFloat(t, "the current wind_gust", got.WindGust, 6.0)
+	requireString(t, "the current condition", got.Condition, "Clouds")
+	requireString(t, "the current icon", got.Icon, "04d")
+	requireString(t, "the current description", got.Description, "Broken Clouds")
+	requireTime(t, "the current last_updated", got.LastUpdated, time.Unix(1772000000, 0))
+	// The faithful block is built from the same presence view, so the two read alike.
 	if data.OneCall == nil || data.OneCall.Current == nil {
 		t.Fatal("expected the faithful current block to be present, got none")
 	}
@@ -685,8 +694,14 @@ func TestMapOneCallWithoutCurrentBlock(t *testing.T) {
 
 	data := svc.mapOneCall(models.OneCallResponse{}, models.SevenDayPayload{}, &models.Location{Name: "London"})
 
-	if data.Current.Temperature != 0 || data.Current.Condition != "" {
-		t.Fatalf("expected zero current when the block is absent, got %+v", data.Current)
+	// Every member of the legacy block is null, not 0. The old zero value reported a
+	// temperature of 0 degrees and a last_updated of 1970 beside a faithful block
+	// that said null, which is five fabrications and one invented date.
+	if data.Current.Temperature != nil || data.Current.Condition != nil {
+		t.Fatalf("expected a null legacy current when the block is absent, got %+v", data.Current)
+	}
+	if data.Current.LastUpdated != nil {
+		t.Fatalf("expected a null last_updated when the block is absent, got %s", data.Current.LastUpdated)
 	}
 	// The faithful block is the one place the route can say outright that the
 	// upstream reported no current conditions, which the legacy vocabulary has no

@@ -268,15 +268,17 @@ var forecastPayloadNarrowed = map[string]string{
 	"list.sys.pod":         forecastSlotSent,
 }
 
-// The one call route has the same drift hazard as the other two, and one more
-// surface: it reports the current block and the whole daily array, so a member
-// added to either decode struct and forgotten here is reported as null forever.
-// OneCallResponse and SevenDayPayload are the pair to keep in step.
+// The one call route has the same drift hazard as the other two, and a larger
+// surface: it reports the current block, the whole daily array and all three opt-in
+// arrays, so a member added to any decode struct and forgotten here is reported as
+// null forever. OneCallResponse and SevenDayPayload are the pair to keep in step.
 //
-// The walk covers every block, not just the two the payload is pointer-shaped for.
-// The three opt-in arrays are reported through their upstream decode types, so
-// every member of them is a deliberate narrowing and each one is named below rather
-// than left to a paragraph in a comment.
+// The walk covers every block. The three opt-in arrays used to be allowlisted whole,
+// because their response types were the upstream decode types and no payload could
+// have told the mapper anything those types could act on. They are pointer shaped
+// now, so there is nothing left to allowlist on them: the payload is the full mirror
+// of every block the response reports, and the only remaining entries are claims
+// about members the upstream documents as unconditionally sent.
 func TestSevenDayPayloadCoversDecodedFields(t *testing.T) {
 	upstream := jsonMemberPaths(reflect.TypeOf(OneCallResponse{}))
 	// jsonMemberPaths reports a slice as a leaf and descends into a block, so the
@@ -289,9 +291,12 @@ func TestSevenDayPayloadCoversDecodedFields(t *testing.T) {
 	collectJSONMemberPaths(reflect.TypeOf(Alert{}), "alerts", upstream)
 	collectJSONMemberPaths(reflect.TypeOf(DailyForecast{}), "daily", upstream)
 
-	// The same two passes over the payload: jsonMemberPaths already walked the
-	// current block as its members and reported the daily array as a leaf.
+	// The same four passes over the payload: jsonMemberPaths already walked the
+	// current block as its members and reported the four arrays as leaves.
 	payload := jsonMemberPaths(reflect.TypeOf(SevenDayPayload{}))
+	collectJSONMemberPaths(reflect.TypeOf(SevenDayPayloadMinutely{}), "minutely", payload)
+	collectJSONMemberPaths(reflect.TypeOf(SevenDayPayloadHourly{}), "hourly", payload)
+	collectJSONMemberPaths(reflect.TypeOf(SevenDayPayloadAlert{}), "alerts", payload)
 	collectJSONMemberPaths(reflect.TypeOf(SevenDayPayloadDaily{}), "daily", payload)
 
 	if len(upstream) == 0 {
@@ -355,12 +360,6 @@ const (
 	// SevenDayPayload asks of a member both come out no, so the mapper reads the
 	// value from the decode struct and its zero is a real reading.
 	oneCallDailySent = "documented as sent on every /data/3.0/onecall daily entry, and read by no legacy key on this route, so its zero is a real reading, not an absent member"
-	// oneCallOptInBlock names a member of the three opt-in arrays. The brief fixes
-	// their response types as the upstream decode types, which cannot tell a
-	// measured zero from an absent member, so every one of these is a narrowing the
-	// guard records rather than one it can close. It is the one place on this route
-	// where a measured zero and an absent member are reported identically.
-	oneCallOptInBlock = "reported through its upstream decode type, which cannot tell a measured zero from an absent member; only the current and daily blocks are pointer-shaped"
 )
 
 // sevenDayPayloadNarrowed lists every JSON member OneCallResponse declares that
@@ -395,34 +394,4 @@ var sevenDayPayloadNarrowed = map[string]string{
 	"daily.feels_like.night": oneCallBreakdownSent,
 	"daily.feels_like.morn":  oneCallBreakdownSent,
 	"daily.feels_like.eve":   oneCallBreakdownSent,
-
-	"minutely":               oneCallOptInBlock,
-	"minutely.dt":            oneCallOptInBlock,
-	"minutely.precipitation": oneCallOptInBlock,
-	"hourly":                 oneCallOptInBlock,
-	"hourly.dt":              oneCallOptInBlock,
-	"hourly.sunrise":         oneCallOptInBlock,
-	"hourly.sunset":          oneCallOptInBlock,
-	"hourly.temp":            oneCallOptInBlock,
-	"hourly.feels_like":      oneCallOptInBlock,
-	"hourly.pressure":        oneCallOptInBlock,
-	"hourly.humidity":        oneCallOptInBlock,
-	"hourly.dew_point":       oneCallOptInBlock,
-	"hourly.uvi":             oneCallOptInBlock,
-	"hourly.clouds":          oneCallOptInBlock,
-	"hourly.visibility":      oneCallOptInBlock,
-	"hourly.wind_speed":      oneCallOptInBlock,
-	"hourly.wind_deg":        oneCallOptInBlock,
-	"hourly.wind_gust":       oneCallOptInBlock,
-	"hourly.pop":             oneCallOptInBlock,
-	"hourly.rain":            oneCallOptInBlock,
-	"hourly.snow":            oneCallOptInBlock,
-	"hourly.weather":         oneCallOptInBlock,
-	"alerts":                 oneCallOptInBlock,
-	"alerts.sender_name":     oneCallOptInBlock,
-	"alerts.event":           oneCallOptInBlock,
-	"alerts.start":           oneCallOptInBlock,
-	"alerts.end":             oneCallOptInBlock,
-	"alerts.description":     oneCallOptInBlock,
-	"alerts.tags":            oneCallOptInBlock,
 }

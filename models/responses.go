@@ -527,22 +527,78 @@ type OneCallDailyPoint struct {
 // readings at the places that have them.
 //
 // Daily has no omitempty, so the key is there even when the upstream sent no day at
-// all, in which case it is null.
+// all, in which case it is null. Tags has none either, so an alert the upstream sent
+// with no tag list reports a null array and one it sent with an empty list reports an
+// empty array.
 type OneCallEnvelope struct {
-	Lat            float64              `json:"lat"`
-	Lon            float64              `json:"lon"`
-	Timezone       string               `json:"timezone"`
-	TimezoneOffset int                  `json:"timezone_offset"`
-	Current        *OneCallCurrentPoint `json:"current"`
-	Daily          []OneCallDailyPoint  `json:"daily"`
-	// Minutely, Hourly and Alerts reuse the upstream decode types, which is the one
-	// narrowing this route carries: a measured zero inside one of them is
-	// indistinguishable from an absent member. They carry no omitempty of their own,
-	// so nothing in them can drop a reading the upstream measured; see
-	// SevenDayPayload, whose doc says what is pointer-shaped here and what is not.
-	Minutely []Minutely `json:"minutely,omitempty"`
-	Hourly   []Hourly   `json:"hourly,omitempty"`
-	Alerts   []Alert    `json:"alerts,omitempty"`
+	Lat            float64                `json:"lat"`
+	Lon            float64                `json:"lon"`
+	Timezone       string                 `json:"timezone"`
+	TimezoneOffset int                    `json:"timezone_offset"`
+	Current        *OneCallCurrentPoint   `json:"current"`
+	Daily          []OneCallDailyPoint    `json:"daily"`
+	Minutely       []OneCallMinutelyPoint `json:"minutely,omitempty"`
+	Hourly         []OneCallHourlyPoint   `json:"hourly,omitempty"`
+	Alerts         []OneCallAlertPoint    `json:"alerts,omitempty"`
+}
+
+// OneCallMinutelyPoint is one entry of the faithful minutely array.
+//
+// Precipitation is a probability over the minute, not a volume of rain, and this
+// endpoint is the only place that reports it as one: the hourly and daily blocks
+// carry volumes. Reading it as a volume would be a different number entirely, so the
+// member is named for what the upstream documents and the doc says what it is.
+type OneCallMinutelyPoint struct {
+	Dt            *int64   `json:"dt"`
+	Precipitation *float64 `json:"precipitation"`
+}
+
+// OneCallHourlyPoint is one entry of the faithful hourly array, in the upstream field
+// order.
+//
+// Rain and Snow are volumes in millimetres over the hour and are plain floats on this
+// endpoint, exactly as they are on the daily entry, so they take neither RainBlock
+// nor SnowBlock: those describe a {1h} or {3h} window inside a block and this
+// endpoint has no window to describe. It omits them for an hour nothing fell on, so
+// a measured 0 and an absent member are two different readings and every member here
+// is a pointer.
+type OneCallHourlyPoint struct {
+	Dt         *int64    `json:"dt"`
+	Sunrise    *int64    `json:"sunrise"`
+	Sunset     *int64    `json:"sunset"`
+	Temp       *float64  `json:"temp"`
+	FeelsLike  *float64  `json:"feels_like"`
+	Pressure   *int      `json:"pressure"`
+	Humidity   *int      `json:"humidity"`
+	DewPoint   *float64  `json:"dew_point"`
+	Uvi        *float64  `json:"uvi"`
+	Clouds     *int      `json:"clouds"`
+	Visibility *int      `json:"visibility"`
+	WindSpeed  *float64  `json:"wind_speed"`
+	WindDeg    *int      `json:"wind_deg"`
+	WindGust   *float64  `json:"wind_gust"`
+	Pop        *float64  `json:"pop"`
+	Rain       *float64  `json:"rain"`
+	Snow       *float64  `json:"snow"`
+	Weather    []Weather `json:"weather"`
+}
+
+// OneCallAlertPoint is one entry of the faithful alerts array: a government weather
+// alert covering a span of time.
+//
+// Every member is a pointer, so an alert the upstream sent with an empty sender name
+// reports "" and one that sent no sender name at all reports null. Those are
+// different statements, and a government alert with no sender is worth telling apart
+// from one whose sender is the empty string. Tags is a slice and not a pointer: nil
+// means the upstream sent no list and [] means it sent an empty one, which is the
+// same distinction with a slice.
+type OneCallAlertPoint struct {
+	SenderName  *string  `json:"sender_name"`
+	Event       *string  `json:"event"`
+	Start       *int64   `json:"start"`
+	End         *int64   `json:"end"`
+	Description *string  `json:"description"`
+	Tags        []string `json:"tags"`
 }
 
 // SevenDayResponse is the body of GET|POST /api/v1/weather/forecast/7day, served
@@ -578,29 +634,32 @@ type SevenDayResponse struct {
 // TestSevenDayPayloadCoversDecodedFields is the guard on that, and its allowlist
 // names every JSON member this type deliberately narrows.
 //
-// The rule for what is declared here is two questions asked of each member of the
-// current and daily blocks: can the upstream omit it for reasons of its own, and does
-// anything the response reports derive from it? A member that fails both is read
-// from the upstream struct and allowlisted, because its zero is a real reading. A
-// member that passes either is declared, so an absent one is null rather than a
-// fabricated number. That is why humidity and wind_speed are here and pressure and
-// clouds are not: the first two are the readings the legacy array is built from, so
-// an absent one has to be able to reach that array as a null.
+// The rule for what is declared here is two questions asked of each member: can the
+// upstream omit it for reasons of its own, and does anything the response reports
+// derive from it? A member that fails both is read from the upstream struct and
+// allowlisted, because its zero is a real reading. A member that passes either is
+// declared, so an absent one is null rather than a fabricated number. That is why
+// humidity and wind_speed are declared on a day and pressure and clouds are not: the
+// first two are the readings the legacy array is built from, so an absent one has to
+// be able to reach that array as a null.
 //
-// The three opt-in arrays are not declared. Their response types are the upstream
-// decode types, so there is nothing for a payload to tell the mapper that those
-// types could not then act on, and every member of them is allowlisted with that
-// reason rather than left to a comment. That is the one place on this route where a
-// measured zero and an absent member are reported the same way.
+// The current block, the daily array and all three opt-in arrays are covered, so
+// every block the response reports is pointer-shaped and no block on this route is a
+// place where a measured zero is indistinguishable from an absent member. Only the
+// members the allowlist names are not, and each of those is a claim about the
+// upstream rather than a type choice.
 //
-// The current block and the daily array are walked by index: index i of Daily is the
-// presence view of index i of OneCallResponse.Daily. Both decodes read one array in
-// the same order, so a body whose daily array is longer than this one's cannot
-// happen, and a member either of them cannot type fails the request rather than
-// shortening it.
+// The four arrays are walked by index: index i of Daily is the presence view of index
+// i of OneCallResponse.Daily, and the same holds for Minutely, Hourly and Alerts. All
+// of them are decodes of one body, so the arrays line up; a body whose array is longer
+// than this one's cannot happen, and a member either of them cannot type fails the
+// request rather than shortening it.
 type SevenDayPayload struct {
-	Current *SevenDayPayloadCurrent `json:"current"`
-	Daily   []SevenDayPayloadDaily  `json:"daily"`
+	Current  *SevenDayPayloadCurrent   `json:"current"`
+	Daily    []SevenDayPayloadDaily    `json:"daily"`
+	Minutely []SevenDayPayloadMinutely `json:"minutely"`
+	Hourly   []SevenDayPayloadHourly   `json:"hourly"`
+	Alerts   []SevenDayPayloadAlert    `json:"alerts"`
 }
 
 // SevenDayPayloadCurrent declares the current block's measurements. The timestamps
@@ -643,4 +702,56 @@ type SevenDayPayloadDaily struct {
 	Rain      *float64  `json:"rain"`
 	Snow      *float64  `json:"snow"`
 	Uvi       *float64  `json:"uvi"`
+}
+
+// SevenDayPayloadMinutely declares the one member of a minutely entry that the
+// upstream can omit. Precipitation is a probability over the minute, and an upstream
+// that measured it as 0 and one that sent no entry are different readings.
+type SevenDayPayloadMinutely struct {
+	Dt            *int64   `json:"dt"`
+	Precipitation *float64 `json:"precipitation"`
+}
+
+// SevenDayPayloadHourly declares every member of an hourly entry. None of them is
+// read from the decode struct: the two precipitation volumes in particular are
+// omitted by the upstream for an hour nothing fell on, so reading their zero from a
+// non-pointer field would report 1.2 millimetres of rain on a dry hour. The
+// timestamps and the weather array are declared too, so the payload is the full
+// mirror of this block.
+type SevenDayPayloadHourly struct {
+	Dt         *int64   `json:"dt"`
+	Sunrise    *int64   `json:"sunrise"`
+	Sunset     *int64   `json:"sunset"`
+	Temp       *float64 `json:"temp"`
+	FeelsLike  *float64 `json:"feels_like"`
+	Pressure   *int     `json:"pressure"`
+	Humidity   *int     `json:"humidity"`
+	DewPoint   *float64 `json:"dew_point"`
+	Uvi        *float64 `json:"uvi"`
+	Clouds     *int     `json:"clouds"`
+	Visibility *int     `json:"visibility"`
+	WindSpeed  *float64 `json:"wind_speed"`
+	WindDeg    *int     `json:"wind_deg"`
+	WindGust   *float64 `json:"wind_gust"`
+	Pop        *float64 `json:"pop"`
+	Rain       *float64 `json:"rain"`
+	Snow       *float64 `json:"snow"`
+	// Weather is a slice, not a presence marker: an array cannot be decoded into a
+	// struct, and a slice already says what a marker would. Nil is no entry and [] is
+	// an empty one, which is the same distinction the response reports.
+	Weather []Weather `json:"weather"`
+}
+
+// SevenDayPayloadAlert declares every member of a government alert. An alert with
+// no sender is a different thing from an alert whose sender is the empty string, and
+// this is the only block on the route where that difference can arise. Tags is a
+// slice because nil already says "no list" and an empty one says "an empty list",
+// which is the same distinction without a pointer.
+type SevenDayPayloadAlert struct {
+	SenderName  *string  `json:"sender_name"`
+	Event       *string  `json:"event"`
+	Start       *int64   `json:"start"`
+	End         *int64   `json:"end"`
+	Description *string  `json:"description"`
+	Tags        []string `json:"tags"`
 }

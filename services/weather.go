@@ -312,12 +312,20 @@ func (w *WeatherService) mapOneCall(owm models.OneCallResponse, payload models.S
 		Lon:            owm.Lon,
 		Timezone:       owm.Timezone,
 		TimezoneOffset: owm.TimezoneOffset,
-		// The three opt-in blocks are carried as the upstream sent them. Whether a
-		// caller sees one is a decision taken after this body is built, so the cached
-		// response always holds them all and one upstream call serves every variant.
-		Minutely: owm.Minutely,
-		Hourly:   owm.Hourly,
-		Alerts:   owm.Alerts,
+	}
+
+	// The three opt-in blocks are carried as the upstream sent them, mapped one entry
+	// at a time from their own presence views. Whether a caller sees one is a decision
+	// taken after this body is built, so the cached response always holds them all and
+	// one upstream call serves every variant.
+	for i := range owm.Minutely {
+		envelope.Minutely = append(envelope.Minutely, oneCallMinutelyPoint(oneCallMinutelyPresence(payload, i)))
+	}
+	for i := range owm.Hourly {
+		envelope.Hourly = append(envelope.Hourly, oneCallHourlyPoint(oneCallHourlyPresence(payload, i)))
+	}
+	for i := range owm.Alerts {
+		envelope.Alerts = append(envelope.Alerts, oneCallAlertPoint(oneCallAlertPresence(payload, i)))
 	}
 
 	if owm.Current != nil {
@@ -344,7 +352,7 @@ func (w *WeatherService) mapOneCall(owm models.OneCallResponse, payload models.S
 		// coordinates. Two sources for one pair of numbers, so they are read from
 		// where each has always come from rather than being made to agree here.
 		Location:    *loc,
-		Current:     currentFromOneCall(owm.Current),
+		Current:     currentFromOneCall(owm.Current, payload.Current),
 		Forecast:    forecasts,
 		RequestTime: w.now(),
 	}
@@ -359,6 +367,87 @@ func oneCallPresence(payload models.SevenDayPayload, i int) models.SevenDayPaylo
 		return payload.Daily[i]
 	}
 	return models.SevenDayPayloadDaily{}
+}
+
+// The three opt-in presence lookups follow oneCallPresence, one per array, because
+// one function cannot return three different presence types. Each is a bounds check
+// and nothing else, and each exists so a payload that is somehow shorter than the
+// upstream array reports nulls rather than panicking.
+func oneCallMinutelyPresence(payload models.SevenDayPayload, i int) models.SevenDayPayloadMinutely {
+	if i < len(payload.Minutely) {
+		return payload.Minutely[i]
+	}
+	return models.SevenDayPayloadMinutely{}
+}
+
+func oneCallHourlyPresence(payload models.SevenDayPayload, i int) models.SevenDayPayloadHourly {
+	if i < len(payload.Hourly) {
+		return payload.Hourly[i]
+	}
+	return models.SevenDayPayloadHourly{}
+}
+
+func oneCallAlertPresence(payload models.SevenDayPayload, i int) models.SevenDayPayloadAlert {
+	if i < len(payload.Alerts) {
+		return payload.Alerts[i]
+	}
+	return models.SevenDayPayloadAlert{}
+}
+
+// oneCallMinutelyPoint maps one upstream minutely entry. Precipitation is a
+// probability over the minute rather than a volume, and both the value and its
+// presence come from the payload so an entry the upstream left it out of is null
+// rather than a measured zero.
+func oneCallMinutelyPoint(presence models.SevenDayPayloadMinutely) models.OneCallMinutelyPoint {
+	return models.OneCallMinutelyPoint{
+		Dt:            presence.Dt,
+		Precipitation: presence.Precipitation,
+	}
+}
+
+// oneCallHourlyPoint maps one upstream hourly entry. Every member comes from the
+// payload, value and presence together: the two precipitation volumes are the reason
+// this type exists, since the upstream omits them for an hour nothing fell on and a
+// decode struct's zero would report that omission as a dry hour that measured 0 mm.
+func oneCallHourlyPoint(presence models.SevenDayPayloadHourly) models.OneCallHourlyPoint {
+	point := models.OneCallHourlyPoint{
+		Dt:         presence.Dt,
+		Sunrise:    presence.Sunrise,
+		Sunset:     presence.Sunset,
+		Temp:       presence.Temp,
+		FeelsLike:  presence.FeelsLike,
+		Pressure:   presence.Pressure,
+		Humidity:   presence.Humidity,
+		DewPoint:   presence.DewPoint,
+		Uvi:        presence.Uvi,
+		Clouds:     presence.Clouds,
+		Visibility: presence.Visibility,
+		WindSpeed:  presence.WindSpeed,
+		WindDeg:    presence.WindDeg,
+		WindGust:   presence.WindGust,
+		Pop:        presence.Pop,
+		Rain:       presence.Rain,
+		Snow:       presence.Snow,
+		// The weather array is a slice, so a nil payload member is a null array rather
+		// than a block of nulls, and an empty one is an empty array.
+		Weather: presence.Weather,
+	}
+	return point
+}
+
+// oneCallAlertPoint maps one government alert. The strings are pointers so an alert
+// whose sender the upstream sent as the empty string and one whose sender it left out
+// are different readings, which is the distinction a weather warning is most likely
+// to be misread on.
+func oneCallAlertPoint(presence models.SevenDayPayloadAlert) models.OneCallAlertPoint {
+	return models.OneCallAlertPoint{
+		SenderName:  presence.SenderName,
+		Event:       presence.Event,
+		Start:       presence.Start,
+		End:         presence.End,
+		Description: presence.Description,
+		Tags:        presence.Tags,
+	}
 }
 
 // oneCallCurrentPoint maps the upstream current block. The timestamps and the weather
@@ -477,7 +566,12 @@ func oneCallLegacyDay(day models.DailyForecast, presence models.SevenDayPayloadD
 	}
 
 	legacy := models.Forecast{
-		Date:        time.Unix(day.Dt, 0),
+		// UTC, not the server's zone. The upstream documents a daily dt in UTC, and a
+		// time.Time built from time.Unix renders in the process's zone, so the day
+		// component of this string would shift with TZ and the same upstream body
+		// would serialise differently on two hosts. The instant is unchanged either
+		// way; only the rendering is pinned.
+		Date:        time.Unix(day.Dt, 0).UTC(),
 		Condition:   condition,
 		Description: strings.Title(description),
 		Icon:        icon,
@@ -518,33 +612,60 @@ func oneCallLegacyDay(day models.DailyForecast, presence models.SevenDayPayloadD
 
 // currentFromOneCall maps the One Call current block onto our model. The block is
 // absent on some responses, in which case the zero value is returned.
-func currentFromOneCall(current *models.OneCallCurrent) models.Current {
-	if current == nil {
+//
+// The zero value of a pointer-shaped block is every member null, which is the point
+// of the change: an absent block used to report a temperature of 0, a pressure of 0,
+// a visibility of 0 and a last_updated of 1970, beside a faithful block that
+// correctly said null. Every reading here comes from the presence view the faithful
+// block is built from, so the two vocabularies report one set of readings and cannot
+// disagree about whether a reading exists.
+func currentFromOneCall(current *models.OneCallCurrent, presence *models.SevenDayPayloadCurrent) models.Current {
+	if current == nil || presence == nil {
 		return models.Current{}
 	}
 
 	condition, description, icon := "", "", ""
 	if len(current.Weather) > 0 {
 		condition = current.Weather[0].Main
-		description = current.Weather[0].Description
+		// The legacy description has always been title cased, and it stays that way:
+		// the change here is to the nullability of the field, not to its text.
+		description = strings.Title(current.Weather[0].Description)
 		icon = current.Weather[0].Icon
 	}
 
-	return models.Current{
-		Temperature:   current.Temp,
-		FeelsLike:     current.FeelsLike,
-		Humidity:      current.Humidity,
-		Pressure:      float64(current.Pressure),
-		Visibility:    float64(current.Visibility),
-		WindSpeed:     current.WindSpeed,
-		WindDirection: current.WindDeg,
-		WindGust:      current.WindGust,
-		Condition:     condition,
-		Description:   strings.Title(description),
-		Icon:          icon,
-		CloudCover:    current.Clouds,
-		LastUpdated:   time.Unix(current.Dt, 0),
+	updated := time.Unix(current.Dt, 0)
+
+	legacy := models.Current{
+		Temperature:   presence.Temp,
+		FeelsLike:     presence.FeelsLike,
+		Humidity:      presence.Humidity,
+		WindSpeed:     presence.WindSpeed,
+		WindDirection: presence.WindDeg,
+		WindGust:      presence.WindGust,
+		CloudCover:    presence.Clouds,
+		LastUpdated:   &updated,
 	}
+	// Pressure and visibility are ints on the block and floats here, so they are
+	// widened rather than reinterpreted. An absent reading stays absent through the
+	// conversion.
+	if presence.Pressure != nil {
+		pressure := float64(*presence.Pressure)
+		legacy.Pressure = &pressure
+	}
+	if presence.Visibility != nil {
+		visibility := float64(*presence.Visibility)
+		legacy.Visibility = &visibility
+	}
+	// The condition, description and icon are the first weather entry's. This block
+	// documents no extremes of its own, so max_temperature and min_temperature stay
+	// null: the day carries them, as a time of day breakdown.
+	if len(current.Weather) > 0 {
+		legacy.Condition = &condition
+		legacy.Description = &description
+		legacy.Icon = &icon
+	}
+
+	return legacy
 }
 
 // resolveAPIKey prefers a caller supplied key over the server side key.
@@ -590,6 +711,11 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 	dt := owm.Dt
 	sysType, sysID := owm.Sys.Type, owm.Sys.ID
 	sunrise, sunset := owm.Sys.Sunrise, owm.Sys.Sunset
+	// The legacy current block reads the same locals by address, so the two
+	// vocabularies cannot disagree about a value the upstream measured.
+	pressureFloat, visibilityFloat := float64(pressure), float64(visibility)
+	dtTime := time.Unix(dt, 0)
+	description = strings.Title(description)
 
 	var main *models.MainBlock
 	if payload.Main != nil {
@@ -659,19 +785,23 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 			Longitude: lon,
 		},
 		Current: models.Current{
-			Temperature:   temp,
-			FeelsLike:     feelsLike,
-			Humidity:      humidity,
-			Pressure:      float64(pressure),
-			WindSpeed:     speed,
-			WindDirection: deg,
-			WindGust:      gust,
-			Visibility:    float64(visibility),
-			Condition:     condition,
-			Description:   strings.Title(description),
-			Icon:          icon,
-			CloudCover:    cloudCover,
-			LastUpdated:   time.Unix(dt, 0),
+			Temperature:   &temp,
+			FeelsLike:     &feelsLike,
+			Humidity:      &humidity,
+			Pressure:      &pressureFloat,
+			WindSpeed:     &speed,
+			WindDirection: &deg,
+			WindGust:      &gust,
+			Visibility:    &visibilityFloat,
+			Condition:     &condition,
+			Description:   &description,
+			Icon:          &icon,
+			CloudCover:    &cloudCover,
+			LastUpdated:   &dtTime,
+			// max_temperature and min_temperature stay null. This endpoint reports no
+			// extremes and the route has never measured any, so the 0 they used to
+			// carry was a reading nobody made; every other key above is the upstream's
+			// own value, taken from the same locals the faithful block is built from.
 		},
 		RequestTime: w.now(),
 	}
@@ -1029,24 +1159,43 @@ func currentFromForecast(items []models.ForecastItem) models.Current {
 	condition, description, icon := "", "", ""
 	if len(nearest.Weather) > 0 {
 		condition = nearest.Weather[0].Main
-		description = nearest.Weather[0].Description
+		// Title cased, as it has always been on this route. The change here is to the
+		// nullability of the field, not to its text.
+		description = strings.Title(nearest.Weather[0].Description)
 		icon = nearest.Weather[0].Icon
 	}
 
-	return models.Current{
-		Temperature:   nearest.Main.Temp,
-		FeelsLike:     nearest.Main.FeelsLike,
-		Humidity:      nearest.Main.Humidity,
-		Pressure:      float64(nearest.Main.Pressure),
-		WindSpeed:     nearest.Wind.Speed,
-		WindDirection: nearest.Wind.Deg,
-		WindGust:      nearest.Wind.Gust,
-		Condition:     condition,
-		Description:   strings.Title(description),
-		Icon:          icon,
-		MaxTemp:       nearest.Main.TempMax,
-		MinTemp:       nearest.Main.TempMin,
-		CloudCover:    nearest.Clouds.All,
-		LastUpdated:   time.Unix(nearest.Dt, 0),
+	// The values are the ones this function has always read, taken by address because
+	// models.Current is pointer shaped. An empty list returns the all-null zero
+	// value above, which is what the block is now able to say; on a real body every
+	// key below is a reading and the JSON is unchanged.
+	temp, feelsLike := nearest.Main.Temp, nearest.Main.FeelsLike
+	humidity, pressure := nearest.Main.Humidity, float64(nearest.Main.Pressure)
+	speed, deg, gust := nearest.Wind.Speed, nearest.Wind.Deg, nearest.Wind.Gust
+	maxTemp, minTemp := nearest.Main.TempMax, nearest.Main.TempMin
+	cloudCover := nearest.Clouds.All
+	updated := time.Unix(nearest.Dt, 0)
+
+	legacy := models.Current{
+		Temperature:   &temp,
+		FeelsLike:     &feelsLike,
+		Humidity:      &humidity,
+		Pressure:      &pressure,
+		WindSpeed:     &speed,
+		WindDirection: &deg,
+		WindGust:      &gust,
+		MaxTemp:       &maxTemp,
+		MinTemp:       &minTemp,
+		CloudCover:    &cloudCover,
+		LastUpdated:   &updated,
 	}
+	// The condition, description and icon need no weather array to be absent-aware: a
+	// slot with no weather entry reports them null rather than as three empty strings.
+	if len(nearest.Weather) > 0 {
+		legacy.Condition = &condition
+		legacy.Description = &description
+		legacy.Icon = &icon
+	}
+
+	return legacy
 }

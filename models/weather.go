@@ -12,24 +12,38 @@ type Location struct {
 	Timezone  string  `json:"timezone,omitempty"`
 }
 
-// Current represents current weather conditions
+// Current represents current weather conditions.
+//
+// Every member is a pointer, and that is the one change this type has had since it
+// was written. All three routes derive this block rather than observing it, and when
+// the upstream sends no current block at all the old zero value reported a
+// temperature of 0 degrees, a pressure of 0 hPa, a visibility of 0 metres and a
+// last_updated of 1970: five fabrications and one invented date, beside a faithful
+// block that correctly said null. The keys are all still there, and for every route
+// that has a current block the JSON is byte identical, because a non-nil pointer to
+// a value serialises as that value. Only the case with nothing to report changes,
+// and it now says so.
+//
+// WindGust keeps its omitempty, which on a pointer drops only nil. A measured gust
+// of 0 m/s is a reading and is reported; an upstream that sent no gust leaves the key
+// absent, as it always has.
 type Current struct {
-	Temperature   float64 `json:"temperature"`
-	FeelsLike     float64 `json:"feels_like"`
-	Humidity      int     `json:"humidity"`
-	Pressure      float64 `json:"pressure"`
-	Visibility    float64 `json:"visibility"`
-	WindSpeed     float64 `json:"wind_speed"`
-	WindDirection int     `json:"wind_direction"`
-	WindGust      float64 `json:"wind_gust,omitempty"`
-	Condition     string  `json:"condition"`
-	Description   string  `json:"description"`
-	Icon          string  `json:"icon"`
+	Temperature   *float64 `json:"temperature"`
+	FeelsLike     *float64 `json:"feels_like"`
+	Humidity      *int     `json:"humidity"`
+	Pressure      *float64 `json:"pressure"`
+	Visibility    *float64 `json:"visibility"`
+	WindSpeed     *float64 `json:"wind_speed"`
+	WindDirection *int     `json:"wind_direction"`
+	WindGust      *float64 `json:"wind_gust,omitempty"`
+	Condition     *string  `json:"condition"`
+	Description   *string  `json:"description"`
+	Icon          *string  `json:"icon"`
 	// UVIndex       float64   `json:"uv_index"`
-	MaxTemp     float64   `json:"max_temperature"`
-	MinTemp     float64   `json:"min_temperature"`
-	CloudCover  int       `json:"cloud_cover"`
-	LastUpdated time.Time `json:"last_updated"`
+	MaxTemp     *float64   `json:"max_temperature"`
+	MinTemp     *float64   `json:"min_temperature"`
+	CloudCover  *int       `json:"cloud_cover"`
+	LastUpdated *time.Time `json:"last_updated"`
 }
 
 // Forecast represents weather forecast for a specific day.

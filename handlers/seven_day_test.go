@@ -162,12 +162,17 @@ const oneCallOptInBlocks = `,"minutely":[{"dt":1772000060,"precipitation":0.12}]
 	`"alerts":[{"sender_name":"Met Office","event":"Flood warning","start":1772000000,` +
 	`"end":1772600000,"description":"Flooding is possible.","tags":["Flood"]}]`
 
-// mustOneCallBody renders a whole /data/3.0/onecall body around rendered days.
-func mustOneCallBody(t *testing.T, days []string) string {
+// mustOneCallBody renders a whole /data/3.0/onecall body around rendered days. An
+// empty current block leaves the member out of the body entirely, which is how a
+// fixture says the upstream sent no current conditions at all, as distinct from
+// sending a current block with members missing from it.
+func mustOneCallBody(t *testing.T, current string, days []string) string {
 	t.Helper()
-	return `{"lat":51.5074,"lon":-0.1278,"timezone":"Europe/London","timezone_offset":0,` +
-		`"current":` + oneCallCurrentBlock +
-		`,"daily":[` + strings.Join(days, ",") + `]` + oneCallOptInBlocks + `}`
+	body := `{"lat":51.5074,"lon":-0.1278,"timezone":"Europe/London","timezone_offset":0,`
+	if current != "" {
+		body += `"current":` + current + `,`
+	}
+	return body + `"daily":[` + strings.Join(days, ",") + `]` + oneCallOptInBlocks + `}`
 }
 
 // sevenDayRouteFullJSON carries sevenDayRouteDayCount days with every member the
@@ -206,7 +211,7 @@ func sevenDayRouteFullJSON(t *testing.T) string {
 		}
 		days = append(days, string(rendered))
 	}
-	return mustOneCallBody(t, days)
+	return mustOneCallBody(t, oneCallCurrentBlock, days)
 }
 
 // sevenDayRouteSparseDayJSON is the pair of states the faithful mirror has to keep
@@ -235,7 +240,32 @@ func sevenDayRouteSparseDayJSON(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("failed to render the zero rain day fixture: %v", err)
 	}
-	return mustOneCallBody(t, []string{string(sparse), string(zeroRain)})
+	return mustOneCallBody(t, oneCallCurrentBlock, []string{string(sparse), string(zeroRain)})
+}
+
+// sevenDayRouteNoCurrentJSON is a body whose current block is missing entirely. The
+// two vocabularies both have to say so: the faithful one can report the block as null
+// and the legacy one, now that it is pointer shaped, reports every member as null
+// rather than as a row of zeroes and a date in 1970.
+func sevenDayRouteNoCurrentJSON(t *testing.T) string {
+	t.Helper()
+	day, err := json.Marshal(sevenDayDay(sevenDayRouteBase, map[string]any{
+		"temp":       map[string]any{"day": 15.0, "min": 10.0, "max": 20.0, "night": 9.0, "morn": 11.0, "eve": 16.0},
+		"feels_like": map[string]any{"day": 14.0, "night": 8.0, "morn": 10.0, "eve": 15.0},
+		"humidity":   60,
+		"dew_point":  7.7,
+		"wind_speed": 4.0,
+		"wind_deg":   200,
+		"wind_gust":  9.1,
+		"pop":        0.29,
+		"rain":       1.5,
+		"snow":       0,
+		"uvi":        3.5,
+	}))
+	if err != nil {
+		t.Fatalf("failed to render the no current fixture: %v", err)
+	}
+	return mustOneCallBody(t, "", []string{string(day)})
 }
 
 // newSevenDayRouteRouter serves one fixed upstream body to the seven day route, so
@@ -1040,14 +1070,13 @@ func TestSevenDayLegacyCurrentAliasesFaithfulCurrent(t *testing.T) {
 		}
 	}
 
-	// The legacy temperatures stay at 0 on this route, as they have always been: the
-	// One Call current block reports no min or max, so any value there would be
-	// invented. The faithful twin of the two is a time of day breakdown on the day,
+	// The legacy current temperatures are null on this route, and were 0 before the
+	// block became pointer shaped. The One Call current block reports no min or max,
+	// so the 0 was a reading nobody made, and an unmeasurable legacy key now says so
+	// instead. The faithful twin of the two is a time of day breakdown on the day,
 	// not on the current block.
-	if legacy["max_temperature"] != 0.0 || legacy["min_temperature"] != 0.0 {
-		t.Fatalf("expected the legacy current temperatures to stay 0, got %#v and %#v",
-			legacy["max_temperature"], legacy["min_temperature"])
-	}
+	nullKey(t, legacy, "max_temperature")
+	nullKey(t, legacy, "min_temperature")
 	if _, ok := current["temp_max"]; ok {
 		t.Fatalf("expected no max_temperature on the faithful current block, got %#v", current["temp_max"])
 	}
@@ -1066,6 +1095,75 @@ func TestSevenDayChanceOfRainRoundsTheDailyProbability(t *testing.T) {
 	}
 	if legacy[0]["chance_of_rain"] != 29.0 {
 		t.Fatalf("expected chance_of_rain 29 from pop 0.29, got %#v", legacy[0]["chance_of_rain"])
+	}
+}
+
+// Both vocabularies read the current block from one upstream object, so when there
+// is no object they have to agree that there is nothing. The legacy block used to
+// answer with a temperature of 0, a pressure of 0, a visibility of 0, a last_updated
+// of 1970 and an empty condition beside a faithful block that said null: five
+// fabrications and one invented date, and nothing in the body said so.
+func TestSevenDayRouteNullsLegacyCurrentWhenBlockAbsent(t *testing.T) {
+	data := requestSevenDayRoute(t, newSevenDayRouteRouter(t, sevenDayRouteNoCurrentJSON(t)))
+
+	nullKey(t, block(t, data, "onecall"), "current")
+
+	legacy := block(t, data, "current")
+	for _, name := range []string{
+		"temperature", "feels_like", "humidity", "pressure", "visibility",
+		"wind_speed", "wind_direction", "cloud_cover", "condition", "description",
+		"icon", "max_temperature", "min_temperature", "last_updated",
+	} {
+		nullKey(t, legacy, name)
+	}
+	// wind_gust is the one key that carries omitempty, so an absent gust is an absent
+	// key rather than a null one. That is unchanged from before: a zero was dropped
+	// by the same tag, and a nil is dropped by it now.
+	if value, ok := legacy["wind_gust"]; ok {
+		t.Fatalf("expected no wind_gust key on a current block that was never sent, got %#v", value)
+	}
+
+	// The rest of the response is unaffected: the day was there and the day is still
+	// reported, with the same rounded probability the full fixture produces.
+	legacyDays := array(t, data, "forecast")
+	if len(legacyDays) != 1 || legacyDays[0]["chance_of_rain"] != 29.0 {
+		t.Fatalf("expected the day to be reported with a rounded probability, got %#v", legacyDays)
+	}
+	days := array(t, block(t, data, "onecall"), "daily")
+	if len(days) != 1 || days[0]["temp"] == nil {
+		t.Fatalf("expected the faithful day to be reported, got %#v", days)
+	}
+}
+
+// The legacy date is the one rendering on this route that depends on the server's
+// zone. The upstream documents a daily dt in UTC, so the day component of this string
+// has to be the UTC one on every host: without .UTC() the same upstream body
+// serialises a different date in Berlin than in Auckland.
+func TestSevenDayLegacyDateRendersInUTC(t *testing.T) {
+	// The process zone is pinned for the duration of this test and restored after it.
+	// Without the pin the test passes in TZ=UTC whatever the code does, and CI runs
+	// UTC, so the guard would be inert where it matters most. Safe because no test in
+	// this package calls t.Parallel, so nothing else can observe the swap.
+	original := time.Local
+	time.Local = time.FixedZone("seven-day-test", 5*60*60)
+	t.Cleanup(func() { time.Local = original })
+
+	data := requestSevenDayRoute(t, newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t)))
+
+	days := array(t, data, "forecast")
+	if len(days) != 7 {
+		t.Fatalf("expected the 7 legacy days from the fixture, got %d", len(days))
+	}
+	// sevenDayRouteBase is 2026-03-01 12:00:00 UTC, and this is that instant written
+	// out literally rather than derived from the same expression the mapper uses. In
+	// the pinned +05:00 zone the day without .UTC() renders as 17:00+05:00.
+	if want := "2026-03-01T12:00:00Z"; days[0]["date"] != want {
+		t.Fatalf("expected the legacy date to render as %q, got %#v", want, days[0]["date"])
+	}
+	// The faithful side has no date member of its own: the upstream's dt is reported as
+	// the epoch, and this test pins the rendering of the legacy alias only.
+	if days[1]["date"] != "2026-03-02T12:00:00Z" {
+		t.Fatalf("expected the second legacy date to render as %q, got %#v", "2026-03-02T12:00:00Z", days[1]["date"])
 	}
 }
 
