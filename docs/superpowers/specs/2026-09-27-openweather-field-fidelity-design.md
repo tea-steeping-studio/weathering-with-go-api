@@ -66,7 +66,7 @@ original bug detectable rather than silent.
 
 | Field | `/data/2.5/weather` | `/data/2.5/forecast` | `/data/3.0/onecall` |
 |---|---|---|---|
-| `pop` | absent | per three-hour slot | `daily[]` only |
+| `pop` | absent | per three-hour slot | `daily[]` and `hourly[]` |
 | `temp.day/night/morn/eve` | absent | absent | `daily[]` only |
 | `temp.min/max` | `temp_min`/`temp_max`, city-moment | `temp_min`/`temp_max`, city-moment | true daily extremes |
 | `feels_like` breakdown | absent | absent | `daily[]` |
@@ -160,6 +160,17 @@ consumers and is deliberate:
   derives real day-level extremes.
 - The legacy `date` field renders in UTC rather than the server's local zone, so the day
   component of the rendered string no longer shifts with the server's `TZ`.
+- `current.last_updated` is likewise rendered in UTC, on all three routes. It is an
+  instant rather than a calendar day, so this is not a correctness fix, but the response
+  is cached per process and two instances rendering the same instant in different zones
+  would be host-dependent output.
+
+`models.Current` and `models.Forecast` became pointer-shaped so that a route which cannot
+measure a legacy key reports `null` rather than a fabricated `0` or `""`. For any real
+upstream body the JSON is byte-identical. The one visible consequence is the degenerate
+case where the upstream block is absent entirely — an empty `list` on `/weather/forecast`,
+or a missing `current` on `/weather/forecast/7day` — where every legacy `current` key now
+reads `null` rather than `0`. That is the intended behaviour, not a regression.
 
 `humidity` deliberately keeps its truncating mean, because the legacy field is an `int`
 and truncating is what it has always done. `pressure`, `clouds` and `visibility` have no
