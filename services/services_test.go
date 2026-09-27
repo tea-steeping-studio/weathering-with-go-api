@@ -36,3 +36,120 @@ func TestCalculateDailyForecastEmpty(t *testing.T) {
 		t.Fatalf("expected non-zero date")
 	}
 }
+
+func forecastResponseFixture() models.OpenWeatherMapForecastResponse {
+	return models.OpenWeatherMapForecastResponse{
+		List: []models.ForecastItem{
+			{
+				Dt:      1772000000,
+				Main:    models.Main{Temp: 18.0, FeelsLike: 17.2, TempMin: 15.0, TempMax: 21.0, Pressure: 1012, Humidity: 70},
+				Weather: []models.Weather{{Main: "Rain", Description: "light rain", Icon: "10d"}},
+				Clouds:  models.Clouds{All: 80},
+				Wind:    models.Wind{Speed: 5.0, Deg: 90, Gust: 7.5},
+			},
+			{
+				Dt:      1772010800,
+				Main:    models.Main{Temp: 19.0, FeelsLike: 18.0, TempMin: 16.0, TempMax: 22.0, Pressure: 1011, Humidity: 65},
+				Weather: []models.Weather{{Main: "Clear", Description: "clear sky", Icon: "01d"}},
+				Wind:    models.Wind{Speed: 3.0, Deg: 100},
+			},
+		},
+		City: models.City{Name: "London", Country: "GB", Coord: models.Coordinates{Lat: 51.51, Lon: -0.13}},
+	}
+}
+
+func TestConvertForecastResponsePopulatesCurrent(t *testing.T) {
+	svc := NewWeatherService("dummy")
+
+	data := svc.convertForecastResponse(forecastResponseFixture(), 5)
+
+	wantUpdated := time.Unix(1772000000, 0)
+	got := data.Current
+	if got.Temperature != 18.0 || got.FeelsLike != 17.2 {
+		t.Fatalf("unexpected current temperatures %+v", got)
+	}
+	if got.Humidity != 70 || got.Pressure != 1012 {
+		t.Fatalf("unexpected current humidity/pressure %+v", got)
+	}
+	if got.WindSpeed != 5.0 || got.WindDirection != 90 || got.WindGust != 7.5 {
+		t.Fatalf("unexpected current wind %+v", got)
+	}
+	if got.CloudCover != 80 {
+		t.Fatalf("expected cloud_cover 80, got %d", got.CloudCover)
+	}
+	if got.Condition != "Rain" || got.Icon != "10d" || got.Description != "Light Rain" {
+		t.Fatalf("unexpected current condition %+v", got)
+	}
+	if got.MinTemp != 15.0 || got.MaxTemp != 21.0 {
+		t.Fatalf("unexpected current min/max %+v", got)
+	}
+	if !got.LastUpdated.Equal(wantUpdated) {
+		t.Fatalf("expected last_updated %s got %s", wantUpdated, got.LastUpdated)
+	}
+}
+
+func TestConvertForecastResponseWithNoItemsLeavesCurrentZero(t *testing.T) {
+	svc := NewWeatherService("dummy")
+
+	data := svc.convertForecastResponse(models.OpenWeatherMapForecastResponse{}, 5)
+
+	if data.Current.Temperature != 0 || data.Current.Condition != "" {
+		t.Fatalf("expected zero current for an empty response, got %+v", data.Current)
+	}
+	if !data.Current.LastUpdated.IsZero() {
+		t.Fatalf("expected zero last_updated, got %s", data.Current.LastUpdated)
+	}
+}
+
+func TestConvertOneCallResponsePopulatesCurrent(t *testing.T) {
+	svc := NewWeatherService("dummy")
+	owm := models.OneCallResponse{
+		Current: &models.OneCallCurrent{
+			Dt:         1772000000,
+			Temp:       12.4,
+			FeelsLike:  11.0,
+			Pressure:   1008,
+			Humidity:   64,
+			UVI:        2.1,
+			Clouds:     30,
+			Visibility: 9000,
+			WindSpeed:  4.2,
+			WindDeg:    210,
+			WindGust:   6.0,
+			Weather:    []models.Weather{{Main: "Clouds", Description: "broken clouds", Icon: "04d"}},
+		},
+	}
+
+	data := svc.convertOneCallResponse(owm, &models.Location{Name: "London"})
+
+	wantUpdated := time.Unix(1772000000, 0)
+	got := data.Current
+	if got.Temperature != 12.4 || got.FeelsLike != 11.0 {
+		t.Fatalf("unexpected current temperatures %+v", got)
+	}
+	if got.Pressure != 1008 || got.Humidity != 64 {
+		t.Fatalf("unexpected current pressure/humidity %+v", got)
+	}
+	if got.Visibility != 9000 || got.CloudCover != 30 {
+		t.Fatalf("unexpected current visibility/clouds %+v", got)
+	}
+	if got.WindSpeed != 4.2 || got.WindDirection != 210 || got.WindGust != 6.0 {
+		t.Fatalf("unexpected current wind %+v", got)
+	}
+	if got.Condition != "Clouds" || got.Icon != "04d" || got.Description != "Broken Clouds" {
+		t.Fatalf("unexpected current condition %+v", got)
+	}
+	if !got.LastUpdated.Equal(wantUpdated) {
+		t.Fatalf("expected last_updated %s got %s", wantUpdated, got.LastUpdated)
+	}
+}
+
+func TestConvertOneCallResponseWithoutCurrentBlock(t *testing.T) {
+	svc := NewWeatherService("dummy")
+
+	data := svc.convertOneCallResponse(models.OneCallResponse{}, &models.Location{Name: "London"})
+
+	if data.Current.Temperature != 0 || data.Current.Condition != "" {
+		t.Fatalf("expected zero current when the block is absent, got %+v", data.Current)
+	}
+}

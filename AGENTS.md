@@ -28,6 +28,7 @@ Go 1.25 + Gin REST API wrapping OpenWeatherMap. Single module with the bare path
 - `WeatherService.now` is a func field, not `time.Now()` calls. Tests advance it to exercise TTL expiry; never bypass it or the expiry tests stop being deterministic.
 - Handlers surface cache state as `X-Cache: HIT|MISS` via `utils.SendCachedSuccess`. On a hit, `request_time` intentionally stays at the original fetch time.
 - The cache is per-process, so on Cloud Run N instances mean up to N× the calls.
+- The `current` block on both forecast routes is derived from data already present in the same upstream response (`list[0]` for the 5-day route, the One Call `current` object for the 7-day route). Never add a second upstream call to fill it; `TestForecastHandlerDoesNotCallCurrentEndpoint` guards that.
 
 ## Testing quirks
 

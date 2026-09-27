@@ -150,6 +150,22 @@ curl "http://localhost:8080/api/v1/weather/forecast?location=Tokyo,JP&units=metr
       "latitude": 35.6762,
       "longitude": 139.6503
     },
+    "current": {
+      "temperature": 19.4,
+      "feels_like": 18.9,
+      "humidity": 68,
+      "pressure": 1011.0,
+      "visibility": 0,
+      "wind_speed": 4.2,
+      "wind_direction": 180,
+      "condition": "Clouds",
+      "description": "Scattered Clouds",
+      "icon": "03d",
+      "max_temperature": 22.1,
+      "min_temperature": 16.4,
+      "cloud_cover": 40,
+      "last_updated": "2025-09-21T12:00:00Z"
+    },
     "forecast": [
       {
         "date": "2025-09-22T00:00:00Z",
@@ -169,6 +185,12 @@ curl "http://localhost:8080/api/v1/weather/forecast?location=Tokyo,JP&units=metr
   }
 }
 ```
+
+The `current` block is derived from the 3-hour slot nearest to now in the same upstream response, so
+it costs no extra OpenWeatherMap call. Two consequences: it can be up to 3 hours old, which is why
+`last_updated` is the slot timestamp rather than the request time, and `visibility` is always `0`
+because the 5-day endpoint does not report it. Use `/weather/current` when you need a live reading
+or visibility.
 
 #### POST /weather/forecast
 Get weather forecast using JSON request body.
@@ -210,6 +232,22 @@ curl -i "http://localhost:8080/api/v1/weather/forecast/7day?location=Tokyo,JP&un
       "latitude": 35.6895,
       "longitude": 139.6917
     },
+    "current": {
+      "temperature": 16.2,
+      "feels_like": 15.8,
+      "humidity": 61,
+      "pressure": 1014.0,
+      "visibility": 10000,
+      "wind_speed": 3.1,
+      "wind_direction": 190,
+      "condition": "Clouds",
+      "description": "Scattered Clouds",
+      "icon": "03d",
+      "max_temperature": 0,
+      "min_temperature": 0,
+      "cloud_cover": 40,
+      "last_updated": "2026-03-01T06:00:00Z"
+    },
     "forecast": [
       {
         "date": "2026-03-01T12:00:00Z",
@@ -230,6 +268,10 @@ curl -i "http://localhost:8080/api/v1/weather/forecast/7day?location=Tokyo,JP&un
   }
 }
 ```
+
+The `current` block comes from the `current` object in the same One Call response, so it is genuinely
+current and also costs no extra call. One Call reports no daily extremes in that block, so
+`max_temperature` and `min_temperature` are always `0` here.
 
 #### POST /weather/forecast/7day
 Same as the GET endpoint, with a JSON body. `days` is not accepted: this route always returns 7 days.

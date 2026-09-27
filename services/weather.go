@@ -285,8 +285,40 @@ func (w *WeatherService) convertOneCallResponse(owm models.OneCallResponse, loc 
 
 	return &models.WeatherData{
 		Location:    *loc,
+		Current:     currentFromOneCall(owm.Current),
 		Forecast:    forecasts,
 		RequestTime: w.now(),
+	}
+}
+
+// currentFromOneCall maps the One Call current block onto our model. The block is
+// absent on some responses, in which case the zero value is returned.
+func currentFromOneCall(current *models.OneCallCurrent) models.Current {
+	if current == nil {
+		return models.Current{}
+	}
+
+	condition, description, icon := "", "", ""
+	if len(current.Weather) > 0 {
+		condition = current.Weather[0].Main
+		description = current.Weather[0].Description
+		icon = current.Weather[0].Icon
+	}
+
+	return models.Current{
+		Temperature:   current.Temp,
+		FeelsLike:     current.FeelsLike,
+		Humidity:      current.Humidity,
+		Pressure:      float64(current.Pressure),
+		Visibility:    float64(current.Visibility),
+		WindSpeed:     current.WindSpeed,
+		WindDirection: current.WindDeg,
+		WindGust:      current.WindGust,
+		Condition:     condition,
+		Description:   strings.Title(description),
+		Icon:          icon,
+		CloudCover:    current.Clouds,
+		LastUpdated:   time.Unix(current.Dt, 0),
 	}
 }
 
@@ -365,8 +397,46 @@ func (w *WeatherService) convertForecastResponse(owm models.OpenWeatherMapForeca
 			Latitude:  owm.City.Coord.Lat,
 			Longitude: owm.City.Coord.Lon,
 		},
+		Current:     currentFromForecast(owm.List),
 		Forecast:    forecasts,
 		RequestTime: time.Now(),
+	}
+}
+
+// currentFromForecast maps the nearest forecast slot onto our model. The 5 day
+// endpoint returns 3 hour slots rather than true current conditions, and it carries
+// no visibility, so that field stays 0. The slot timestamp is reported as
+// last_updated so callers can see how stale the reading is.
+func currentFromForecast(items []models.ForecastItem) models.Current {
+	if len(items) == 0 {
+		return models.Current{}
+	}
+
+	// OpenWeatherMap returns list ascending from the current 3 hour boundary.
+	nearest := items[0]
+
+	condition, description, icon := "", "", ""
+	if len(nearest.Weather) > 0 {
+		condition = nearest.Weather[0].Main
+		description = nearest.Weather[0].Description
+		icon = nearest.Weather[0].Icon
+	}
+
+	return models.Current{
+		Temperature:   nearest.Main.Temp,
+		FeelsLike:     nearest.Main.FeelsLike,
+		Humidity:      nearest.Main.Humidity,
+		Pressure:      float64(nearest.Main.Pressure),
+		WindSpeed:     nearest.Wind.Speed,
+		WindDirection: nearest.Wind.Deg,
+		WindGust:      nearest.Wind.Gust,
+		Condition:     condition,
+		Description:   strings.Title(description),
+		Icon:          icon,
+		MaxTemp:       nearest.Main.TempMax,
+		MinTemp:       nearest.Main.TempMin,
+		CloudCover:    nearest.Clouds.All,
+		LastUpdated:   time.Unix(nearest.Dt, 0),
 	}
 }
 

@@ -129,7 +129,28 @@ type OneCallResponse struct {
 	Lat      float64         `json:"lat"`
 	Lon      float64         `json:"lon"`
 	Timezone string          `json:"timezone"`
+	Current  *OneCallCurrent `json:"current"`
 	Daily    []DailyForecast `json:"daily"`
+}
+
+// OneCallCurrent represents the current conditions block of the One Call 3.0 response.
+// It is a pointer on OneCallResponse because the block is absent on some responses.
+type OneCallCurrent struct {
+	Dt         int64     `json:"dt"`
+	Sunrise    int64     `json:"sunrise"`
+	Sunset     int64     `json:"sunset"`
+	Temp       float64   `json:"temp"`
+	FeelsLike  float64   `json:"feels_like"`
+	Pressure   int       `json:"pressure"`
+	Humidity   int       `json:"humidity"`
+	DewPoint   float64   `json:"dew_point"`
+	UVI        float64   `json:"uvi"`
+	Clouds     int       `json:"clouds"`
+	Visibility int       `json:"visibility"`
+	WindSpeed  float64   `json:"wind_speed"`
+	WindDeg    int       `json:"wind_deg"`
+	WindGust   float64   `json:"wind_gust"`
+	Weather    []Weather `json:"weather"`
 }
 
 // DailyForecast represents one day from the One Call 3.0 daily forecast

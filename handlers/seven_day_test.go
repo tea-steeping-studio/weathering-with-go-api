@@ -27,7 +27,7 @@ func sevenDayJSON() string {
 		days = append(days, fmt.Sprintf(`{"dt":%d,"temp":{"day":%d.0,"min":%d.0,"max":%d.0},"pressure":1015,"humidity":%d,"wind_speed":4.0,"wind_deg":200,"clouds":40,"pop":0.25,"uvi":3.5,"weather":[{"id":801,"main":"Clouds","description":"scattered clouds","icon":"03d"}]}`,
 			base.AddDate(0, 0, i).Unix(), 15+i, 10+i, 20+i, 60+i))
 	}
-	return fmt.Sprintf(`{"lat":51.5074,"lon":-0.1278,"timezone":"Europe/London","daily":[%s]}`, strings.Join(days, ","))
+	return fmt.Sprintf(`{"lat":51.5074,"lon":-0.1278,"timezone":"Europe/London","current":{"dt":1772000000,"sunrise":1771960000,"sunset":1772010000,"temp":11.5,"feels_like":10.2,"pressure":1009,"humidity":78,"dew_point":7.7,"uvi":1.8,"clouds":75,"visibility":8000,"wind_speed":6.2,"wind_deg":240,"wind_gust":9.1,"weather":[{"id":803,"main":"Clouds","description":"broken clouds","icon":"04d"}]},"daily":[%s]}`, strings.Join(days, ","))
 }
 
 type upstreamStub struct {
@@ -79,6 +79,11 @@ func newStubbedRouter(t *testing.T, stub *upstreamStub) *gin.Engine {
 
 func decodeForecastCount(t *testing.T, body *bytes.Buffer) int {
 	t.Helper()
+	return len(decodeForecast(t, body))
+}
+
+func decodeForecast(t *testing.T, body *bytes.Buffer) []map[string]any {
+	t.Helper()
 	var resp struct {
 		Success bool `json:"success"`
 		Data    struct {
@@ -95,7 +100,102 @@ func decodeForecastCount(t *testing.T, body *bytes.Buffer) int {
 	if !resp.Success {
 		t.Fatalf("expected success response, got %q", body.String())
 	}
-	return len(resp.Data.Forecast)
+	return resp.Data.Forecast
+}
+
+func decodeCurrent(t *testing.T, body *bytes.Buffer) map[string]any {
+	t.Helper()
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Current map[string]any `json:"current"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response %q: %v", body.String(), err)
+	}
+	if !resp.Success {
+		t.Fatalf("expected success response, got %q", body.String())
+	}
+	return resp.Data.Current
+}
+
+func TestForecastHandlerReturnsCurrentData(t *testing.T) {
+	stub := &upstreamStub{}
+	router := newStubbedRouter(t, stub)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/weather/forecast?location=London,UK&units=metric", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d body=%s", w.Code, w.Body.String())
+	}
+
+	current := decodeCurrent(t, w.Body)
+	if current == nil {
+		t.Fatal("expected a current block in the forecast response")
+	}
+	if current["temperature"] != 18.0 {
+		t.Fatalf("expected current temperature 18 got %v", current["temperature"])
+	}
+	if current["condition"] != "Rain" || current["description"] != "Light Rain" {
+		t.Fatalf("unexpected current condition %v", current)
+	}
+	if updated, _ := current["last_updated"].(string); strings.HasPrefix(updated, "0001-01-01") {
+		t.Fatalf("expected a real last_updated, got %q", updated)
+	}
+}
+
+// The forecast route must keep costing exactly one upstream call: current data is
+// derived from the forecast payload, never fetched separately.
+func TestForecastHandlerDoesNotCallCurrentEndpoint(t *testing.T) {
+	stub := &upstreamStub{}
+	router := newStubbedRouter(t, stub)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/weather/forecast?location=London,UK&units=metric", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d body=%s", w.Code, w.Body.String())
+	}
+	if got := atomic.LoadInt32(&stub.forecastCalls); got != 1 {
+		t.Fatalf("expected 1 forecast call, got %d", got)
+	}
+	if got := atomic.LoadInt32(&stub.currentCalls); got != 0 {
+		t.Fatalf("expected no current weather calls, got %d", got)
+	}
+}
+
+func TestSevenDayForecastHandlerReturnsCurrentData(t *testing.T) {
+	stub := &upstreamStub{}
+	router := newStubbedRouter(t, stub)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/weather/forecast/7day?location=London,UK&units=metric", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d body=%s", w.Code, w.Body.String())
+	}
+
+	current := decodeCurrent(t, w.Body)
+	if current == nil {
+		t.Fatal("expected a current block in the seven day response")
+	}
+	if current["temperature"] != 11.5 || current["humidity"] != 78.0 {
+		t.Fatalf("unexpected current conditions %v", current)
+	}
+	if current["visibility"] != 8000.0 {
+		t.Fatalf("expected current visibility 8000, got %v", current["visibility"])
+	}
+	if current["condition"] != "Clouds" {
+		t.Fatalf("expected current condition Clouds, got %v", current["condition"])
+	}
+	if got := atomic.LoadInt32(&stub.currentCalls); got != 0 {
+		t.Fatalf("expected no current weather calls, got %d", got)
+	}
 }
 
 func TestGetSevenDayForecastHandler(t *testing.T) {
