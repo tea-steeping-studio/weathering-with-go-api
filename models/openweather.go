@@ -152,7 +152,7 @@ type OneCallCurrent struct {
 	Pressure   int       `json:"pressure"`
 	Humidity   int       `json:"humidity"`
 	DewPoint   float64   `json:"dew_point"`
-	UVI        float64   `json:"uvi"`
+	Uvi        float64   `json:"uvi"`
 	Clouds     int       `json:"clouds"`
 	Visibility int       `json:"visibility"`
 	WindSpeed  float64   `json:"wind_speed"`

@@ -140,7 +140,7 @@ func TestConvertOneCallResponsePopulatesCurrent(t *testing.T) {
 			FeelsLike:  11.0,
 			Pressure:   1008,
 			Humidity:   64,
-			UVI:        2.1,
+			Uvi:        2.1,
 			Clouds:     30,
 			Visibility: 9000,
 			WindSpeed:  4.2,
