@@ -140,17 +140,27 @@ Legacy block: `location`, `current` (still derived from `list[0]`), and per day 
 `max_temperature`, `min_temperature`, `avg_temperature`, `condition`, `description`,
 `icon`, `humidity`, `wind_speed`, `precipitation`, `chance_of_rain`, `uv_index`.
 
-**Four legacy keys change value, not shape.** This is a breaking change for existing
-consumers and is deliberate:
+**Legacy keys that change value, not shape.** This is a breaking change for existing
+consumers and is deliberate. The list below was completed against `git show master:` after
+implementation, and is fuller than the four originally enumerated during design:
 
 - `max_temperature` and `min_temperature` previously carried the upstream `temp_max` and
   `temp_min`, which on the `/data/2.5` endpoints are documented as the extremes *in the
   city at the moment of calculation*, not the day's extremes. Labelling them
   `max_temperature`/`min_temperature` was a mislabel. They now carry the same derived
   day-level extremes as `temp.max` and `temp.min`, which is what the names claim.
-- `chance_of_rain` was a permanent `0`; it is now the rounded daily probability.
-- `uv_index` was a fabricated `0`; the three-hour endpoint has no `uvi`, so it is now
-  `null`.
+- `chance_of_rain` was a permanent `0`; it is now the rounded daily probability. This also
+  changes the 7-day route, which previously truncated — `pop` of `0.29` reported `28` and
+  now reports `29`.
+- `precipitation` was `0` for any day with no reported volume; it is now `null` when no
+  slot reports one. A day whose slots report a measured zero still yields `0`.
+- `uv_index` was a fabricated `0` on the forecast routes; the three-hour endpoint has no
+  `uvi`, so it is now `null`.
+- `current.visibility` on `/weather/forecast` was `0`; it now reports the first slot's
+  documented `visibility`, or `null` when the slot omits it.
+- `current.wind_gust` moves in the opposite direction, and improves. It was a plain
+  `float64` carrying `omitempty`, which drops a measured zero — so a gust of exactly `0`
+  was silently omitted. It is now a pointer, and a measured zero is reported as `0`.
 - On `/weather/current` and `/weather/forecast/7day`, `current.max_temperature` and
   `current.min_temperature` move from `0` to `null`. Neither was ever a real reading:
   the upstream `temp_min`/`temp_max` on the `/data/2.5` endpoints are documented as
@@ -158,12 +168,14 @@ consumers and is deliberate:
   them `min_temperature`/`max_temperature` was a mislabel. `null` says the route does not
   report a daily extreme there. `/weather/forecast` is unaffected, because that route
   derives real day-level extremes.
+- The legacy `forecast` array lost `omitempty`, so an empty one is reported as `[]` rather
+  than omitted. Neither forecast route produces an empty array in practice.
 - The legacy `date` field renders in UTC rather than the server's local zone, so the day
   component of the rendered string no longer shifts with the server's `TZ`.
-- `current.last_updated` is likewise rendered in UTC, on all three routes. It is an
-  instant rather than a calendar day, so this is not a correctness fix, but the response
-  is cached per process and two instances rendering the same instant in different zones
-  would be host-dependent output.
+- `current.last_updated` and `request_time` are likewise rendered in UTC, on all three
+  routes. They are instants rather than calendar days, so this is not a correctness fix,
+  but the response is cached per process and two instances rendering the same instant in
+  different zones would be host-dependent output.
 
 `models.Current` and `models.Forecast` became pointer-shaped so that a route which cannot
 measure a legacy key reports `null` rather than a fabricated `0` or `""`. For any real
