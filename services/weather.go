@@ -480,9 +480,14 @@ func oneCallDailyPoint(day models.DailyForecast, presence models.SevenDayPayload
 // Every reading the route may be unable to measure is a pointer on models.Forecast,
 // which is what keeps a day the upstream sent without a temp, pop or uvi from
 // becoming a row of zeroes. The condition, description and icon come from the first
-// weather entry, as they always have. Precipitation is the sum of the two volumes the
-// upstream reported, and a day that reported neither is a total of 0 rather than a
-// null, because nothing falling on a day is an answer and not an absence.
+// weather entry and are null when the day carries none.
+//
+// Precipitation is the sum of the two volumes the upstream reported, and it is reported
+// only when at least one volume was reported. A day whose upstream measured a rain
+// volume of 0 has a total of 0, which is an answer; a day that reported neither rain
+// nor snow has no total, which is a gap, and reporting 0 for it said nothing fell and
+// measured nothing at the same time. The five day route's ForecastDay.Precipitation
+// follows the same rule.
 func oneCallLegacyDay(day models.DailyForecast, presence models.SevenDayPayloadDaily) models.Forecast {
 	var condition, description, icon string
 	if len(day.Weather) > 0 {
@@ -1122,9 +1127,12 @@ func currentFromForecast(items []models.ForecastItem) models.Current {
 	}
 
 	// The values are the ones this function has always read, taken by address because
-	// models.Current is pointer shaped. An empty list returns the all-null zero
-	// value above, which is what the block is now able to say; on a real body every
-	// key below is a reading and the JSON is unchanged.
+	// models.Current is pointer shaped. An empty list returns the all-null zero value
+	// above, which is what the block is now able to say. On a real body every key set
+	// below is a reading and its JSON is unchanged, with one exception that has always
+	// been there: visibility is not assigned at all, because the three hour endpoint
+	// reports no visibility, so that member is null on every response this route
+	// produces.
 	temp, feelsLike := nearest.Main.Temp, nearest.Main.FeelsLike
 	humidity, pressure := nearest.Main.Humidity, float64(nearest.Main.Pressure)
 	speed, deg, gust := nearest.Wind.Speed, nearest.Wind.Deg, nearest.Wind.Gust
@@ -1147,8 +1155,10 @@ func currentFromForecast(items []models.ForecastItem) models.Current {
 		CloudCover:    &cloudCover,
 		LastUpdated:   &updated,
 	}
-	// The condition, description and icon need no weather array to be absent-aware: a
-	// slot with no weather entry reports them null rather than as three empty strings.
+	// The condition, description and icon are the first weather entry's, and they are
+	// only set when there is one: a slot with no weather entry reports them null rather
+	// than as three empty strings, which is the rule the legacy current block follows
+	// for the same upstream condition.
 	if len(nearest.Weather) > 0 {
 		legacy.Condition = &condition
 		legacy.Description = &description

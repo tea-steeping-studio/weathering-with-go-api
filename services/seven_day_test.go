@@ -176,6 +176,16 @@ func requireInt64(t *testing.T, what string, got *int64, want int64) {
 	}
 }
 
+// quoted renders a pointer-shaped member for a failure message, printing null rather
+// than dereferencing, so a partially nil set reports which member is at fault instead
+// of panicking inside the message.
+func quoted(got *string) string {
+	if got == nil {
+		return "null"
+	}
+	return fmt.Sprintf("%q", *got)
+}
+
 func requireString(t *testing.T, what string, got *string, want string) {
 	t.Helper()
 	if got == nil {
@@ -493,8 +503,11 @@ func TestSevenDayLegacyDayNullsTheConditionTrioWithoutWeather(t *testing.T) {
 
 	legacy := data.Forecast[0]
 	if legacy.Condition != nil || legacy.Description != nil || legacy.Icon != nil {
-		t.Fatalf("expected a null legacy condition trio, got %q %q %q",
-			*legacy.Condition, *legacy.Description, *legacy.Icon)
+		// The values go through a helper rather than being dereferenced inline: one nil
+		// among the three would panic inside the failure message and destroy the
+		// diagnostic this assertion exists to give.
+		t.Fatalf("expected a null legacy condition trio, got condition %s, description %s, icon %s",
+			quoted(legacy.Condition), quoted(legacy.Description), quoted(legacy.Icon))
 	}
 	// The rest of the day is unaffected, so this is a day with one gap rather than an
 	// empty object. pop is there and measured at 0, so the chance of rain is a real

@@ -19,10 +19,11 @@ type Location struct {
 // the upstream sends no current block at all the old zero value reported a
 // temperature of 0 degrees, a pressure of 0 hPa, a visibility of 0 metres and a
 // last_updated of 1970: five fabrications and one invented date, beside a faithful
-// block that correctly said null. The keys are all still there, and for every route
-// that has a current block the JSON is byte identical, because a non-nil pointer to
-// a value serialises as that value. Only the case with nothing to report changes,
-// and it now says so.
+// block that correctly said null. The keys are all still there and a non-nil pointer
+// to a value serialises as that value, so on a real body the JSON is byte identical
+// with two exceptions: max_temperature and min_temperature are null on the two routes
+// that never measured them, where they were a fabricated 0, and the members of a block
+// the upstream did not send are null where they were 0 as well.
 //
 // WindGust keeps its omitempty, which on a pointer drops only nil. A measured gust
 // of 0 m/s is a reading and is reported; an upstream that sent no gust leaves the key
@@ -48,14 +49,14 @@ type Current struct {
 
 // Forecast represents weather forecast for a specific day.
 //
-// This is the legacy vocabulary of the seven day route, and every reading on it is
-// a pointer except the two that are not measurements. The route can fail to measure
-// any of them: a daily entry the upstream sent without a temp block has no
-// temperature, one sent without pop has no probability, and one sent without uvi has
-// no ultraviolet index. As values those three cases would have been a row of zeroes,
-// which reads as a forecast of exactly average weather rather than as a gap, so they
-// are pointers and an unmeasurable day reports null. For a real body the JSON is byte
-// identical, because a non-nil pointer to a value serialises as that value.
+// This is the legacy vocabulary of the seven day route, and every member of it is a
+// pointer except Date. The route can fail to measure any of the others: a daily entry
+// the upstream sent without a temp block has no temperature, one sent without pop has
+// no probability, and one sent without uvi has no ultraviolet index. As values those
+// cases would have been a row of zeroes, which reads as a forecast of exactly average
+// weather rather than as a gap, so they are pointers and an unmeasurable day reports
+// null. For a real body the JSON is byte identical, because a non-nil pointer to a
+// value serialises as that value.
 //
 // Date is the one member that stays a value: it is a timestamp the upstream sends on
 // every daily entry, and a time.Time marshals to the same string either way.

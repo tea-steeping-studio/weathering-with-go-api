@@ -18,10 +18,11 @@ import "time"
 // decode targets whose zero values are correct, and several of them carry
 // omitempty, which drops a measured 0 on the floor.
 //
-// CurrentWeatherPayload, ForecastPayload and SevenDayPayload, the last three
-// types in this file, are the decode-side types among them: pointer-shaped views of
-// the same bodies, kept beside the upstream structs they complement and the schemas
-// they feed. Their own doc comments say why they have to exist.
+// CurrentWeatherPayload, ForecastPayload and SevenDayPayload are the decode-side
+// types among them: pointer-shaped views of the same bodies, kept beside the upstream
+// structs they complement and the schemas they feed. They are not all at the end of
+// this file any more, since the one call response types were added after them; each
+// one's doc comment says why it has to exist.
 
 // MainBlock represents the main block of the /data/2.5 endpoints. sea_level and
 // grnd_level are reported only for points near sea level or the ground, so they
@@ -711,7 +712,7 @@ type SevenDayPayloadCurrent struct {
 // Temp and FeelsLike carry no members on purpose. The six and four members inside
 // those blocks are documented as unconditionally sent, so the mapper reads those
 // values from the upstream struct and needs only the pointer to know the block was
-// there at all. The eleven measurements below are read from here, value and
+// there at all. The nine measurements below them are read from here, value and
 // presence together, so the response and the legacy array cannot report a reading
 // this body did not carry.
 //
