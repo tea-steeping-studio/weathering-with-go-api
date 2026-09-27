@@ -94,6 +94,17 @@ func SendSuccess(c *gin.Context, data interface{}) {
 	c.JSON(http.StatusOK, response)
 }
 
+// SendCachedSuccess sends a successful response and reports whether the data was
+// served from cache, so callers can observe upstream call savings.
+func SendCachedSuccess(c *gin.Context, data interface{}, cacheHit bool) {
+	if cacheHit {
+		c.Header("X-Cache", "HIT")
+	} else {
+		c.Header("X-Cache", "MISS")
+	}
+	SendSuccess(c, data)
+}
+
 // ValidateLocation validates a location parameter
 func ValidateLocation(location string) error {
 	if location == "" {

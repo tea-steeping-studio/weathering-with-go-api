@@ -5,7 +5,8 @@ A modern, high-performance weather API built with Go and the Gin web framework. 
 ## ✨ Features
 
 - **Current Weather**: Get real-time weather data for any location
-- **Weather Forecasts**: 5-day weather forecasts with 3-hour intervals
+- **Weather Forecasts**: 5-day weather forecasts with 3-hour intervals, plus a 7-day daily forecast
+- **Response Caching**: 15-minute in-memory cache to protect your OpenWeatherMap quota
 - **Multiple Units**: Support for metric, imperial, and Kelvin units
 - **RESTful API**: Clean, well-documented REST endpoints
 - **Error Handling**: Comprehensive error handling with detailed responses
@@ -18,7 +19,7 @@ A modern, high-performance weather API built with Go and the Gin web framework. 
 
 ### Prerequisites
 
-- Go 1.19 or higher
+- Go 1.25 or higher
 - OpenWeatherMap API key (free at [openweathermap.org](https://openweathermap.org/api))
 
 ### Installation
@@ -55,7 +56,8 @@ http://localhost:8080/api/v1
 ```
 
 ### Authentication
-No authentication required. The OpenWeatherMap API key is configured server-side.
+No authentication required. The OpenWeatherMap API key is configured server-side, and a request may
+override it (see [API key per request](#api-key-per-request)).
 
 ### Endpoints
 
@@ -182,6 +184,86 @@ Get weather forecast using JSON request body.
 
 **Response:** Same as GET endpoint
 
+#### GET /weather/forecast/7day
+Get a 7-day daily forecast. Backed by the OpenWeatherMap **One Call 3.0** API, which needs its own
+"One Call by Call" subscription (separate from the free 5-day/3-hour plan). The location name is
+geocoded first, so each uncached request costs one Geocoding call plus one One Call call.
+
+**Parameters:**
+- `location` (required): City name, state code, and country code
+- `units` (optional): Temperature units - `metric` (default), `imperial`, or `kelvin`
+
+**Example:**
+```bash
+curl -i "http://localhost:8080/api/v1/weather/forecast/7day?location=Tokyo,JP&units=metric"
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "location": {
+      "name": "Tokyo",
+      "country": "JP",
+      "region": "Tokyo",
+      "latitude": 35.6895,
+      "longitude": 139.6917
+    },
+    "forecast": [
+      {
+        "date": "2026-03-01T12:00:00Z",
+        "max_temperature": 20.0,
+        "min_temperature": 10.0,
+        "avg_temperature": 15.0,
+        "condition": "Clouds",
+        "description": "Scattered Clouds",
+        "icon": "03d",
+        "humidity": 60,
+        "wind_speed": 4,
+        "precipitation": 1.5,
+        "chance_of_rain": 25,
+        "uv_index": 3.5
+      }
+    ],
+    "request_time": "2026-03-01T06:00:00Z"
+  }
+}
+```
+
+#### POST /weather/forecast/7day
+Same as the GET endpoint, with a JSON body. `days` is not accepted: this route always returns 7 days.
+
+```bash
+curl -X POST "http://localhost:8080/api/v1/weather/forecast/7day" \
+  -H "Content-Type: application/json" \
+  -d '{"location":"Tokyo,JP","units":"metric"}'
+```
+
+### API key per request
+
+The server-side key is used by default, but any weather route accepts a caller-supplied key:
+
+| Where | How |
+|-------|-----|
+| All weather routes | `X-API-Key: <key>` header |
+| GET routes | `?key=<key>` query parameter |
+| POST routes | `"keys": "<key>"` in the JSON body |
+
+### Caching
+
+Weather responses are cached in memory for 15 minutes to keep OpenWeatherMap usage inside the free
+tier quota.
+
+- Cache keys include the api key actually used for the request (hashed), so each key has its own
+  entries and a caller's key is never used to serve another caller's request.
+- Concurrent identical requests collapse into a single upstream call, so a cold-cache burst costs
+  one call, not one per request.
+- Only successful responses are cached; errors are retried on the next request.
+- Every weather response carries `X-Cache: HIT` or `X-Cache: MISS` so you can verify the savings.
+- A cache hit returns the original `request_time`, which is when the data was actually fetched.
+- The cache lives in the process, so every running instance has its own (relevant on Cloud Run).
+
 ### Error Responses
 
 All errors follow a consistent format:
@@ -233,6 +315,7 @@ weathering-with-go/
 │   ├── openweather.go     # OpenWeatherMap API models
 │   └── weather.go         # Internal data models
 ├── services/
+│   ├── cache.go           # 15 minute response cache with request collapsing
 │   └── weather.go         # Weather service logic
 ├── utils/
 │   └── errors.go          # Error handling utilities

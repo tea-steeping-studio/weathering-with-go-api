@@ -115,3 +115,54 @@ type City struct {
 	Sunset   int64       `json:"sunset"`
 }
 
+// GeocodingResult represents a single OpenWeatherMap geocoding result
+type GeocodingResult struct {
+	Name    string  `json:"name"`
+	Lat     float64 `json:"lat"`
+	Lon     float64 `json:"lon"`
+	Country string  `json:"country"`
+	State   string  `json:"state"`
+}
+
+// OneCallResponse represents the One Call 3.0 response
+type OneCallResponse struct {
+	Lat      float64         `json:"lat"`
+	Lon      float64         `json:"lon"`
+	Timezone string          `json:"timezone"`
+	Daily    []DailyForecast `json:"daily"`
+}
+
+// DailyForecast represents one day from the One Call 3.0 daily forecast
+type DailyForecast struct {
+	Dt        int64          `json:"dt"`
+	Temp      DailyTemp      `json:"temp"`
+	FeelsLike DailyFeelsLike `json:"feels_like"`
+	Pressure  int            `json:"pressure"`
+	Humidity  int            `json:"humidity"`
+	WindSpeed float64        `json:"wind_speed"`
+	WindDeg   int            `json:"wind_deg"`
+	Clouds    int            `json:"clouds"`
+	Pop       float64        `json:"pop"`
+	Rain      float64        `json:"rain"`
+	Snow      float64        `json:"snow"`
+	Uvi       float64        `json:"uvi"`
+	Weather   []Weather      `json:"weather"`
+}
+
+// DailyTemp represents the temperature breakdown for a forecast day
+type DailyTemp struct {
+	Day   float64 `json:"day"`
+	Min   float64 `json:"min"`
+	Max   float64 `json:"max"`
+	Night float64 `json:"night"`
+	Morn  float64 `json:"morn"`
+	Eve   float64 `json:"eve"`
+}
+
+// DailyFeelsLike represents the apparent temperature breakdown for a forecast day
+type DailyFeelsLike struct {
+	Day   float64 `json:"day"`
+	Night float64 `json:"night"`
+	Eve   float64 `json:"eve"`
+	Morn  float64 `json:"morn"`
+}

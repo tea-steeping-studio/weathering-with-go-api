@@ -6,9 +6,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
 	"weathering-with-go/models"
 )
 
@@ -16,6 +19,12 @@ const (
 	OpenWeatherMapBaseURL  = "https://api.openweathermap.org/data/2.5"
 	CurrentWeatherEndpoint = "/weather"
 	ForecastEndpoint       = "/forecast"
+	GeocodingBaseURL       = "https://api.openweathermap.org/geo/1.0"
+	GeocodingEndpoint      = "/direct"
+	OneCallBaseURL         = "https://api.openweathermap.org/data/3.0"
+	OneCallEndpoint        = "/onecall"
+	OneCallExcludes        = "minutely,hourly,alerts"
+	SevenDayCount          = 7
 	DefaultUnits           = "metric"
 	DefaultTimeout         = 10 * time.Second
 )
@@ -24,6 +33,11 @@ const (
 type WeatherService struct {
 	APIKey     string
 	HTTPClient *http.Client
+
+	now   func() time.Time
+	mu    sync.RWMutex
+	cache map[string]cacheEntry
+	group singleflight.Group
 }
 
 // NewWeatherService creates a new weather service instance
@@ -33,28 +47,33 @@ func NewWeatherService(apiKey string) *WeatherService {
 		HTTPClient: &http.Client{
 			Timeout: DefaultTimeout,
 		},
+		now:   time.Now,
+		cache: make(map[string]cacheEntry),
 	}
 }
 
 // GetCurrentWeather fetches current weather data for a given location
-func (w *WeatherService) GetCurrentWeather(location, units string, apikey string) (*models.WeatherData, error) {
+func (w *WeatherService) GetCurrentWeather(location, units, apikey string) (*models.WeatherData, bool, error) {
 	if location == "" {
-		return nil, fmt.Errorf("location cannot be empty")
+		return nil, false, fmt.Errorf("location cannot be empty")
 	}
 
 	if units == "" {
 		units = DefaultUnits
 	}
 
+	key := weatherCacheKey(apikey, currentCacheEndpoint, location, units, 0)
+	return cachedFetchTracked(w, key, func() (*models.WeatherData, error) {
+		return w.fetchCurrentWeather(location, units, apikey)
+	})
+}
+
+func (w *WeatherService) fetchCurrentWeather(location, units, apikey string) (*models.WeatherData, error) {
 	// Build URL
 	endpoint := fmt.Sprintf("%s%s", OpenWeatherMapBaseURL, CurrentWeatherEndpoint)
 	params := url.Values{}
 	params.Add("q", location)
-	if apikey == "" {
-		params.Add("appid", w.APIKey)
-	} else {
-		params.Add("appid", apikey)
-	}
+	params.Add("appid", w.resolveAPIKey(apikey))
 	params.Add("units", units)
 
 	fullURL := fmt.Sprintf("%s?%s", endpoint, params.Encode())
@@ -84,9 +103,9 @@ func (w *WeatherService) GetCurrentWeather(location, units string, apikey string
 }
 
 // GetWeatherForecast fetches weather forecast data for a given location
-func (w *WeatherService) GetWeatherForecast(location, units string, days int, apikey string) (*models.WeatherData, error) {
+func (w *WeatherService) GetWeatherForecast(location, units string, days int, apikey string) (*models.WeatherData, bool, error) {
 	if location == "" {
-		return nil, fmt.Errorf("location cannot be empty")
+		return nil, false, fmt.Errorf("location cannot be empty")
 	}
 
 	if units == "" {
@@ -97,15 +116,18 @@ func (w *WeatherService) GetWeatherForecast(location, units string, days int, ap
 		days = 5 // OpenWeatherMap free tier supports up to 5 days
 	}
 
+	key := weatherCacheKey(apikey, forecastCacheEndpoint, location, units, days)
+	return cachedFetchTracked(w, key, func() (*models.WeatherData, error) {
+		return w.fetchWeatherForecast(location, units, days, apikey)
+	})
+}
+
+func (w *WeatherService) fetchWeatherForecast(location, units string, days int, apikey string) (*models.WeatherData, error) {
 	// Build URL
 	endpoint := fmt.Sprintf("%s%s", OpenWeatherMapBaseURL, ForecastEndpoint)
 	params := url.Values{}
 	params.Add("q", location)
-	if apikey == "" {
-		params.Add("appid", w.APIKey)
-	} else {
-		params.Add("appid", apikey)
-	}
+	params.Add("appid", w.resolveAPIKey(apikey))
 	params.Add("units", units)
 
 	fullURL := fmt.Sprintf("%s?%s", endpoint, params.Encode())
@@ -132,6 +154,148 @@ func (w *WeatherService) GetWeatherForecast(location, units string, days int, ap
 	// Convert to our internal model
 	weatherData := w.convertForecastResponse(owmResp, days)
 	return weatherData, nil
+}
+
+// GetSevenDayForecast fetches a seven day daily forecast for a location.
+// The location is geocoded first because One Call 3.0 works on coordinates.
+func (w *WeatherService) GetSevenDayForecast(location, units, apikey string) (*models.WeatherData, bool, error) {
+	if location == "" {
+		return nil, false, fmt.Errorf("location cannot be empty")
+	}
+
+	if units == "" {
+		units = DefaultUnits
+	}
+
+	key := weatherCacheKey(apikey, sevenDayCacheEndpoint, location, units, SevenDayCount)
+	return cachedFetchTracked(w, key, func() (*models.WeatherData, error) {
+		loc, err := w.geocodeLocation(location, apikey)
+		if err != nil {
+			return nil, err
+		}
+		return w.fetchSevenDayForecast(loc, units, apikey)
+	})
+}
+
+// geocodeLocation resolves a location name to coordinates, caching the result.
+func (w *WeatherService) geocodeLocation(location, apikey string) (*models.Location, error) {
+	key := weatherCacheKey(apikey, geocodeCacheEndpoint, location, "", 0)
+	loc, err := cachedFetch(w, key, func() (*models.Location, error) {
+		return w.fetchGeocodedLocation(location, apikey)
+	})
+	return loc, err
+}
+
+func (w *WeatherService) fetchGeocodedLocation(location, apikey string) (*models.Location, error) {
+	params := url.Values{}
+	params.Add("q", location)
+	params.Add("limit", "1")
+	params.Add("appid", w.resolveAPIKey(apikey))
+
+	fullURL := fmt.Sprintf("%s%s?%s", GeocodingBaseURL, GeocodingEndpoint, params.Encode())
+
+	resp, err := w.HTTPClient.Get(fullURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to geocode %q: %w", location, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var results []models.GeocodingResult
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		return nil, fmt.Errorf("failed to parse geocoding response: %w", err)
+	}
+	if len(results) == 0 {
+		return nil, fmt.Errorf("API request failed with status 404: location %q not found", location)
+	}
+
+	result := results[0]
+	return &models.Location{
+		Name:      result.Name,
+		Country:   result.Country,
+		Region:    result.State,
+		Latitude:  result.Lat,
+		Longitude: result.Lon,
+	}, nil
+}
+
+func (w *WeatherService) fetchSevenDayForecast(loc *models.Location, units, apikey string) (*models.WeatherData, error) {
+	params := url.Values{}
+	params.Add("lat", strconv.FormatFloat(loc.Latitude, 'f', -1, 64))
+	params.Add("lon", strconv.FormatFloat(loc.Longitude, 'f', -1, 64))
+	params.Add("units", units)
+	params.Add("exclude", OneCallExcludes)
+	params.Add("appid", w.resolveAPIKey(apikey))
+
+	fullURL := fmt.Sprintf("%s%s?%s", OneCallBaseURL, OneCallEndpoint, params.Encode())
+
+	resp, err := w.HTTPClient.Get(fullURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch forecast data: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var owmResp models.OneCallResponse
+	if err := json.NewDecoder(resp.Body).Decode(&owmResp); err != nil {
+		return nil, fmt.Errorf("failed to parse API response: %w", err)
+	}
+
+	return w.convertOneCallResponse(owmResp, loc), nil
+}
+
+// convertOneCallResponse converts the One Call 3.0 daily forecast to our internal model
+func (w *WeatherService) convertOneCallResponse(owm models.OneCallResponse, loc *models.Location) *models.WeatherData {
+	forecasts := make([]models.Forecast, 0, SevenDayCount)
+	for i, day := range owm.Daily {
+		if i >= SevenDayCount {
+			break
+		}
+
+		var condition, description, icon string
+		if len(day.Weather) > 0 {
+			condition = day.Weather[0].Main
+			description = day.Weather[0].Description
+			icon = day.Weather[0].Icon
+		}
+
+		forecasts = append(forecasts, models.Forecast{
+			Date:          time.Unix(day.Dt, 0),
+			MaxTemp:       day.Temp.Max,
+			MinTemp:       day.Temp.Min,
+			AvgTemp:       day.Temp.Day,
+			Condition:     condition,
+			Description:   strings.Title(description),
+			Icon:          icon,
+			Humidity:      day.Humidity,
+			WindSpeed:     day.WindSpeed,
+			Precipitation: day.Rain + day.Snow,
+			ChanceOfRain:  int(day.Pop * 100),
+			UVIndex:       day.Uvi,
+		})
+	}
+
+	return &models.WeatherData{
+		Location:    *loc,
+		Forecast:    forecasts,
+		RequestTime: w.now(),
+	}
+}
+
+// resolveAPIKey prefers a caller supplied key over the server side key.
+func (w *WeatherService) resolveAPIKey(apikey string) string {
+	if apikey != "" {
+		return apikey
+	}
+	return w.APIKey
 }
 
 // convertCurrentWeatherResponse converts OpenWeatherMap response to our internal model

@@ -19,10 +19,12 @@ func SetupRoutes(router *gin.Engine, weatherService *services.WeatherService) {
 			// GET routes
 			weather.GET("/current", weatherHandler.GetCurrentWeather)
 			weather.GET("/forecast", weatherHandler.GetWeatherForecast)
-			
+			weather.GET("/forecast/7day", weatherHandler.GetSevenDayForecast)
+
 			// POST routes (for JSON body requests)
 			weather.POST("/current", weatherHandler.PostCurrentWeather)
 			weather.POST("/forecast", weatherHandler.PostWeatherForecast)
+			weather.POST("/forecast/7day", weatherHandler.PostSevenDayForecast)
 		}
 
 		// Health check
@@ -31,7 +33,7 @@ func SetupRoutes(router *gin.Engine, weatherService *services.WeatherService) {
 
 	// Root health check
 	router.GET("/health", weatherHandler.HealthCheck)
-	
+
 	// Root endpoint for API info
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(200, gin.H{
@@ -42,6 +44,7 @@ func SetupRoutes(router *gin.Engine, weatherService *services.WeatherService) {
 				"health":           "/health",
 				"current_weather":  "/api/v1/weather/current?location={location}&units={units}",
 				"weather_forecast": "/api/v1/weather/forecast?location={location}&units={units}&days={days}",
+				"forecast_7day":    "/api/v1/weather/forecast/7day?location={location}&units={units}",
 			},
 			"docs": "https://github.com/tea-LZL/weathering-with-go",
 		})
