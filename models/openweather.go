@@ -42,6 +42,7 @@ type Main struct {
 	Humidity  int     `json:"humidity"`
 	SeaLevel  int     `json:"sea_level,omitempty"`
 	GrndLevel int     `json:"grnd_level,omitempty"`
+	TempKF    float64 `json:"temp_kf"`
 }
 
 // Wind represents wind information
@@ -88,15 +89,17 @@ type OpenWeatherMapForecastResponse struct {
 
 // ForecastItem represents a single forecast item
 type ForecastItem struct {
-	Dt      int64       `json:"dt"`
-	Main    Main        `json:"main"`
-	Weather []Weather   `json:"weather"`
-	Clouds  Clouds      `json:"clouds"`
-	Wind    Wind        `json:"wind"`
-	Rain    Rain        `json:"rain,omitempty"`
-	Snow    Snow        `json:"snow,omitempty"`
-	Sys     ForecastSys `json:"sys"`
-	DtTxt   string      `json:"dt_txt"`
+	Dt         int64       `json:"dt"`
+	Main       Main        `json:"main"`
+	Weather    []Weather   `json:"weather"`
+	Clouds     Clouds      `json:"clouds"`
+	Wind       Wind        `json:"wind"`
+	Rain       Rain        `json:"rain,omitempty"`
+	Snow       Snow        `json:"snow,omitempty"`
+	Sys        ForecastSys `json:"sys"`
+	DtTxt      string      `json:"dt_txt"`
+	Pop        float64     `json:"pop"`
+	Visibility int         `json:"visibility"`
 }
 
 // ForecastSys represents forecast system information
@@ -106,13 +109,14 @@ type ForecastSys struct {
 
 // City represents city information in forecast response
 type City struct {
-	ID       int         `json:"id"`
-	Name     string      `json:"name"`
-	Coord    Coordinates `json:"coord"`
-	Country  string      `json:"country"`
-	Timezone int         `json:"timezone"`
-	Sunrise  int64       `json:"sunrise"`
-	Sunset   int64       `json:"sunset"`
+	ID         int         `json:"id"`
+	Name       string      `json:"name"`
+	Coord      Coordinates `json:"coord"`
+	Country    string      `json:"country"`
+	Population int         `json:"population"`
+	Timezone   int         `json:"timezone"`
+	Sunrise    int64       `json:"sunrise"`
+	Sunset     int64       `json:"sunset"`
 }
 
 // GeocodingResult represents a single OpenWeatherMap geocoding result
@@ -126,11 +130,15 @@ type GeocodingResult struct {
 
 // OneCallResponse represents the One Call 3.0 response
 type OneCallResponse struct {
-	Lat      float64         `json:"lat"`
-	Lon      float64         `json:"lon"`
-	Timezone string          `json:"timezone"`
-	Current  *OneCallCurrent `json:"current"`
-	Daily    []DailyForecast `json:"daily"`
+	Lat            float64         `json:"lat"`
+	Lon            float64         `json:"lon"`
+	Timezone       string          `json:"timezone"`
+	TimezoneOffset int             `json:"timezone_offset"`
+	Current        *OneCallCurrent `json:"current"`
+	Minutely       []Minutely      `json:"minutely"`
+	Hourly         []Hourly        `json:"hourly"`
+	Daily          []DailyForecast `json:"daily"`
+	Alerts         []Alert         `json:"alerts"`
 }
 
 // OneCallCurrent represents the current conditions block of the One Call 3.0 response.
@@ -153,21 +161,56 @@ type OneCallCurrent struct {
 	Weather    []Weather `json:"weather"`
 }
 
+// Minutely represents one entry from the One Call 3.0 minutely forecast
+type Minutely struct {
+	Dt            int64   `json:"dt"`
+	Precipitation float64 `json:"precipitation"`
+}
+
+// Hourly represents one entry from the One Call 3.0 hourly forecast
+type Hourly struct {
+	Dt         int64     `json:"dt"`
+	Sunrise    int64     `json:"sunrise"`
+	Sunset     int64     `json:"sunset"`
+	Temp       float64   `json:"temp"`
+	FeelsLike  float64   `json:"feels_like"`
+	Pressure   int       `json:"pressure"`
+	Humidity   int       `json:"humidity"`
+	DewPoint   float64   `json:"dew_point"`
+	Uvi        float64   `json:"uvi"`
+	Clouds     int       `json:"clouds"`
+	Visibility int       `json:"visibility"`
+	WindSpeed  float64   `json:"wind_speed"`
+	WindDeg    int       `json:"wind_deg"`
+	WindGust   float64   `json:"wind_gust"`
+	Pop        float64   `json:"pop"`
+	Rain       float64   `json:"rain"`
+	Snow       float64   `json:"snow"`
+	Weather    []Weather `json:"weather"`
+}
+
 // DailyForecast represents one day from the One Call 3.0 daily forecast
 type DailyForecast struct {
 	Dt        int64          `json:"dt"`
+	Sunrise   int64          `json:"sunrise"`
+	Sunset    int64          `json:"sunset"`
+	Moonrise  int64          `json:"moonrise"`
+	Moonset   int64          `json:"moonset"`
+	MoonPhase float64        `json:"moon_phase"`
 	Temp      DailyTemp      `json:"temp"`
 	FeelsLike DailyFeelsLike `json:"feels_like"`
 	Pressure  int            `json:"pressure"`
 	Humidity  int            `json:"humidity"`
+	DewPoint  float64        `json:"dew_point"`
 	WindSpeed float64        `json:"wind_speed"`
 	WindDeg   int            `json:"wind_deg"`
+	WindGust  float64        `json:"wind_gust"`
+	Weather   []Weather      `json:"weather"`
 	Clouds    int            `json:"clouds"`
 	Pop       float64        `json:"pop"`
 	Rain      float64        `json:"rain"`
 	Snow      float64        `json:"snow"`
 	Uvi       float64        `json:"uvi"`
-	Weather   []Weather      `json:"weather"`
 }
 
 // DailyTemp represents the temperature breakdown for a forecast day
@@ -186,4 +229,14 @@ type DailyFeelsLike struct {
 	Night float64 `json:"night"`
 	Eve   float64 `json:"eve"`
 	Morn  float64 `json:"morn"`
+}
+
+// Alert represents one government weather alert from the One Call 3.0 response
+type Alert struct {
+	SenderName  string   `json:"sender_name"`
+	Event       string   `json:"event"`
+	Start       int64    `json:"start"`
+	End         int64    `json:"end"`
+	Description string   `json:"description"`
+	Tags        []string `json:"tags"`
 }
