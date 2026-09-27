@@ -730,6 +730,52 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 		snow = &models.SnowBlock{OneHour: payload.Snow.OneHour}
 	}
 
+	// The legacy block is built in one literal from the same locals, so a legacy key
+	// cannot drift away from the faithful value it aliases, and the condition trio is
+	// added afterwards under the same gate the other two mappers use. It used to be
+	// assigned inside this literal, unconditionally, which meant the gate above
+	// computed the right answer and then threw it away: a body with no weather entry
+	// left condition, description and icon as "", and the address of "" is
+	// serialised, so the three keys reported a fabricated value beside a faithful
+	// weather[] that correctly said null. Computing the right answer and discarding it
+	// is worse than having no gate, because the code reads as if the case is handled.
+	legacy := models.Current{
+		Temperature:   &temp,
+		FeelsLike:     &feelsLike,
+		Humidity:      &humidity,
+		Pressure:      &pressureFloat,
+		WindSpeed:     &speed,
+		WindDirection: &deg,
+		// The gust and the visibility are the two members this route reads from
+		// the payload rather than from the decode struct, and for the same reason
+		// each time: the decode field is a value where a member the upstream never
+		// sent and a member it measured as 0 are the same value, and taking its
+		// address fabricated the 0. Every other key here is the upstream's own
+		// value, taken from the same locals the faithful block is built from.
+		WindGust: payloadWindGust(payload),
+		// Visibility is an int on the faithful block and a float here, so it is
+		// widened rather than reinterpreted by the same helper the forecast route
+		// uses for its slot visibility. An absent reading stays absent through the
+		// conversion, so it is null on both sides rather than a 0 either of them
+		// measured.
+		Visibility:  floatPtr(payload.Visibility),
+		CloudCover:  &cloudCover,
+		LastUpdated: &dtTime,
+		// max_temperature and min_temperature stay null. This endpoint reports no
+		// extremes and the route has never measured any, so the 0 they used to
+		// carry was a reading nobody made; every other key above is the upstream's
+		// own value, taken from the same locals the faithful block is built from.
+	}
+	// The condition, description and icon are the first weather entry's, and a body
+	// the upstream sent with no weather entry has none, so the trio stays null rather
+	// than reporting three empty strings. One route, one case, one rule: the same
+	// shape models.Forecast and ForecastDay take on the two forecast routes.
+	if len(owm.Weather) > 0 {
+		legacy.Condition = &condition
+		legacy.Description = &description
+		legacy.Icon = &icon
+	}
+
 	return &models.CurrentWeatherResponse{
 		Coord:      models.Coordinates{Lon: lon, Lat: lat},
 		Weather:    owm.Weather,
@@ -752,36 +798,7 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 			Latitude:  lat,
 			Longitude: lon,
 		},
-		Current: models.Current{
-			Temperature:   &temp,
-			FeelsLike:     &feelsLike,
-			Humidity:      &humidity,
-			Pressure:      &pressureFloat,
-			WindSpeed:     &speed,
-			WindDirection: &deg,
-			// The gust and the visibility are the two members this route reads from
-			// the payload rather than from the decode struct, and for the same reason
-			// each time: the decode field is a value where a member the upstream never
-			// sent and a member it measured as 0 are the same value, and taking its
-			// address fabricated the 0. Every other key here is the upstream's own
-			// value, taken from the same locals the faithful block is built from.
-			WindGust: payloadWindGust(payload),
-			// Visibility is an int on the faithful block and a float here, so it is
-			// widened rather than reinterpreted by the same helper the forecast route
-			// uses for its slot visibility. An absent reading stays absent through the
-			// conversion, so it is null on both sides rather than a 0 either of them
-			// measured.
-			Visibility:  floatPtr(payload.Visibility),
-			Condition:   &condition,
-			Description: &description,
-			Icon:        &icon,
-			CloudCover:  &cloudCover,
-			LastUpdated: &dtTime,
-			// max_temperature and min_temperature stay null. This endpoint reports no
-			// extremes and the route has never measured any, so the 0 they used to
-			// carry was a reading nobody made; every other key above is the upstream's
-			// own value, taken from the same locals the faithful block is built from.
-		},
+		Current: legacy,
 		// UTC, like the seven day route's request_time: a cache entry that renders in
 		// the server's zone is host dependent output.
 		RequestTime: w.now().UTC(),

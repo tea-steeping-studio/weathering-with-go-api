@@ -308,10 +308,10 @@ type ForecastSlot struct {
 // three hour endpoint reports no uvi, and Pressure is null when no slot carried a
 // main block.
 type ForecastDay struct {
-	Date        time.Time `json:"date"`
-	MaxTemp     *float64  `json:"max_temperature"`
-	MinTemp     *float64  `json:"min_temperature"`
-	AvgTemp     *float64  `json:"avg_temperature"`
+	Date    time.Time `json:"date"`
+	MaxTemp *float64  `json:"max_temperature"`
+	MinTemp *float64  `json:"min_temperature"`
+	AvgTemp *float64  `json:"avg_temperature"`
 	// Condition, Description and Icon are the middle slot's weather entry, and they
 	// are null when that slot carried no weather array at all. As plain strings they
 	// reported "" there, which is a fabricated value sitting in a block whose every

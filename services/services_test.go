@@ -109,6 +109,109 @@ func TestMapCurrentWeatherCarriesTheGustTheWayTheUpstreamMeant(t *testing.T) {
 	}
 }
 
+// A /data/2.5/weather body the upstream sent with no weather[] at all. The endpoint
+// documents weather[] on every response, so this is not a shape a real body has; it
+// is here because the legacy condition, description and icon are read from it, and a
+// body with no weather entry has no condition.
+//
+// The weather member is the whole of the fixture's difference, so the two cases below
+// differ by one key in the JSON and nothing at all in the Go structs the test reads.
+const currentBodyNoWeather = `{"coord":{"lon":-0.13,"lat":51.51},"main":{"temp":15.0,"feels_like":14.8,` +
+	`"temp_min":14.0,"temp_max":17.0,"pressure":1013,"humidity":72},"wind":{"speed":3.6,"deg":230},` +
+	`"clouds":{"all":40},"visibility":10000,"dt":1772000000,"sys":{"country":"GB"},"name":"London","cod":200}`
+
+const currentBodyWithWeather = `{"coord":{"lon":-0.13,"lat":51.51},"weather":[{"id":802,"main":"Clouds",` +
+	`"description":"scattered clouds","icon":"03d"}],"main":{"temp":15.0,"feels_like":14.8,` +
+	`"temp_min":14.0,"temp_max":17.0,"pressure":1013,"humidity":72},"wind":{"speed":3.6,"deg":230},` +
+	`"clouds":{"all":40},"visibility":10000,"dt":1772000000,"sys":{"country":"GB"},"name":"London","cod":200}`
+
+// One route, one case, one rule: a body with no weather entry has no condition, no
+// description and no icon, and the legacy keys report null rather than the three empty
+// strings they used to. The other three legacy blocks in this project already answer
+// that way for the same upstream condition, and the three mappers that build a current
+// block assign the trio only under a gate; this route's mapper computed the gated
+// answer and then assigned the three fields unconditionally, so the address of ""
+// was serialised.
+//
+// Both vocabularies are asserted. The faithful weather[] is a slice with no
+// omitempty, so an absent one is null, and the legacy trio has to say the same thing
+// rather than three empty strings beside it. The JSON is marshalled as well, because
+// "null rather than \"\"" is a claim about the response and not only about the pointer.
+func TestMapCurrentWeatherNullsTheConditionTrioWithoutWeather(t *testing.T) {
+	decode := func(t *testing.T, raw string) (models.OpenWeatherMapResponse, models.CurrentWeatherPayload) {
+		t.Helper()
+		var owm models.OpenWeatherMapResponse
+		if err := json.Unmarshal([]byte(raw), &owm); err != nil {
+			t.Fatalf("failed to decode the fixture into the upstream struct: %v", err)
+		}
+		var payload models.CurrentWeatherPayload
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			t.Fatalf("failed to decode the fixture into the payload: %v", err)
+		}
+		return owm, payload
+	}
+	renders := func(t *testing.T, current models.Current) string {
+		t.Helper()
+		out, err := json.Marshal(current)
+		if err != nil {
+			t.Fatalf("failed to render the legacy current block: %v", err)
+		}
+		return string(out)
+	}
+
+	owm, payload := decode(t, currentBodyNoWeather)
+	data := NewWeatherService("dummy").mapCurrentWeather(owm, payload)
+
+	// The faithful mirror: an absent weather array is null, since the slice carries no
+	// omitempty and there is no reading behind it.
+	if data.Weather != nil {
+		t.Fatalf("expected a null faithful weather array, got %#v", data.Weather)
+	}
+	// The legacy trio. The values go through a helper rather than being dereferenced
+	// inline: one nil among the three would panic inside the failure message and
+	// destroy the diagnostic this assertion exists to give.
+	if data.Current.Condition != nil || data.Current.Description != nil || data.Current.Icon != nil {
+		t.Fatalf("expected a null legacy condition trio, got condition %s, description %s, icon %s",
+			quoted(data.Current.Condition), quoted(data.Current.Description), quoted(data.Current.Icon))
+	}
+	// On the serialised block, all three keys are present and null. Present matters as
+	// much as null: omitting them would answer the same question with an absent key,
+	// which this route does not do for any other reading.
+	var rendered map[string]any
+	if err := json.Unmarshal([]byte(renders(t, data.Current)), &rendered); err != nil {
+		t.Fatalf("failed to decode the rendered block: %v", err)
+	}
+	for _, key := range []string{"condition", "description", "icon"} {
+		value, present := rendered[key]
+		if !present {
+			t.Fatalf("expected the key %q to be present, got %v", key, rendered)
+		}
+		if value != nil {
+			t.Fatalf("expected the key %q to be null, got %#v", key, value)
+		}
+	}
+	// The rest of the block is unaffected, so this is one gap rather than an empty
+	// object: every other reading is a real number beside the three nulls.
+	requireFloat(t, "the temperature on a body with no weather", data.Current.Temperature, 15.0)
+	requireInt(t, "the humidity on a body with no weather", data.Current.Humidity, 72)
+	if data.Current.CloudCover == nil || *data.Current.CloudCover != 40 {
+		t.Fatalf("expected a cloud cover of 40 on a body with no weather, got %v", data.Current.CloudCover)
+	}
+
+	// The same body with a weather[] entry reports the trio, and the description is the
+	// title-cased upstream string the legacy vocabulary has always carried. Without
+	// this the nulls above would pass on a mapper that dropped the trio entirely.
+	withOWM, withPayload := decode(t, currentBodyWithWeather)
+	reported := NewWeatherService("dummy").mapCurrentWeather(withOWM, withPayload)
+
+	if len(reported.Weather) != 1 {
+		t.Fatalf("expected one faithful weather entry, got %d", len(reported.Weather))
+	}
+	requireString(t, "the condition", reported.Current.Condition, "Clouds")
+	requireString(t, "the description", reported.Current.Description, "Scattered Clouds")
+	requireString(t, "the icon", reported.Current.Icon, "03d")
+}
+
 // Fixed slots for ordering tests, so results never depend on the wall clock.
 var (
 	firstFeb  = time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC).Unix()
