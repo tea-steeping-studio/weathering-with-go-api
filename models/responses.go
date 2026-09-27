@@ -18,10 +18,10 @@ import "time"
 // decode targets whose zero values are correct, and several of them carry
 // omitempty, which drops a measured 0 on the floor.
 //
-// CurrentWeatherPayload, the last type in this file, is the one decode-side type
-// among them: a pointer-shaped view of the same body, kept beside the upstream
-// struct it complements and the schema it feeds. Its own doc comment says why it
-// has to exist.
+// CurrentWeatherPayload and ForecastPayload, the last two types in this file, are
+// the decode-side types among them: pointer-shaped views of the same bodies, kept
+// beside the upstream structs they complement and the schemas they feed. Their own
+// doc comments say why they have to exist.
 
 // MainBlock represents the main block of the /data/2.5 endpoints. sea_level and
 // grnd_level are reported only for points near sea level or the ground, so they
@@ -183,4 +183,213 @@ type currentPayloadWind struct {
 // because /data/2.5/weather does not document it; see RainBlock.
 type currentPayloadPrecip struct {
 	OneHour *float64 `json:"1h"`
+}
+
+// TempPoint is a time of day temperature breakdown. /data/3.0/onecall fills every
+// member it documents. /data/2.5/forecast has no breakdown at all: it fills only
+// Min and Max there, and those two are derived by the mapper from the day's slots
+// rather than measured by the upstream. The rest stay null, because a value the
+// endpoint cannot supply is not a zero.
+type TempPoint struct {
+	Day   *float64 `json:"day"`
+	Min   *float64 `json:"min"`
+	Max   *float64 `json:"max"`
+	Night *float64 `json:"night"`
+	Morn  *float64 `json:"morn"`
+	Eve   *float64 `json:"eve"`
+}
+
+// FeelsLikePoint is the apparent temperature breakdown. Every member is null on
+// /forecast, which reports no breakdown; /forecast/7day fills all four.
+type FeelsLikePoint struct {
+	Day   *float64 `json:"day"`
+	Night *float64 `json:"night"`
+	Morn  *float64 `json:"morn"`
+	Eve   *float64 `json:"eve"`
+}
+
+// ForecastSlot is one raw three hour slot from the list[] array, carried on the day
+// it belongs to so a client can read a single period instead of a daily rollup.
+// The members the upstream did not send are null, so a slot that measures a zero
+// and a slot that was never told about the quantity are different readings.
+//
+// Sys is the one place a response type here points at an upstream struct rather
+// than a pointer shaped one: pod is a string the endpoint sends whenever the sys
+// block is there, so the pointer on this field is the whole of the presence
+// signal, and a second pointer for a string the endpoint does document would add
+// nothing.
+//
+// Rain and Snow carry the shared block types, so their 1h key is present and null:
+// the shared tags make the documented window required, and this endpoint documents
+// only 3h. The two routes need opposite tags on the same member, which one shared
+// type cannot express. The null is a statement about what this endpoint documents,
+// never a reading the upstream sent.
+type ForecastSlot struct {
+	Dt         int64        `json:"dt"`
+	Main       *MainBlock   `json:"main"`
+	Weather    []Weather    `json:"weather"`
+	Clouds     *CloudsBlock `json:"clouds"`
+	Wind       *WindBlock   `json:"wind"`
+	Visibility *int         `json:"visibility"`
+	Pop        *float64     `json:"pop"`
+	Rain       *RainBlock   `json:"rain"`
+	Snow       *SnowBlock   `json:"snow"`
+	Sys        *ForecastSys `json:"sys"`
+	DtTxt      string       `json:"dt_txt"`
+}
+
+// ForecastDay is one entry of the forecast route's forecast[] array, in the
+// upstream field order of /data/2.5/forecast rolled up to a day, carrying the
+// legacy vocabulary alongside it.
+//
+// Three JSON keys are wanted by both vocabularies and two Go fields cannot share
+// one tag, so one field serves each pair. Date is the day the slots fell on.
+// Humidity is the day's mean, which is what legacy Forecast.Humidity has always
+// been. WindSpeed is the day's mean, which is what legacy Forecast.WindSpeed has
+// always been. Their JSON is byte identical to the response this type replaces.
+//
+// MaxTemp, MinTemp and AvgTemp are value fields because the route always produces
+// them. ChanceOfRain and UVIndex are pointers because it does not: no slot
+// carrying pop leaves chance_of_rain null rather than reporting a fabricated zero,
+// and the three hour endpoint reports no uvi at all.
+type ForecastDay struct {
+	Date          time.Time `json:"date"`
+	MaxTemp       float64   `json:"max_temperature"`
+	MinTemp       float64   `json:"min_temperature"`
+	AvgTemp       float64   `json:"avg_temperature"`
+	Condition     string    `json:"condition"`
+	Description   string    `json:"description"`
+	Icon          string    `json:"icon"`
+	Humidity      *int      `json:"humidity"`
+	WindSpeed     *float64  `json:"wind_speed"`
+	Precipitation float64   `json:"precipitation"`
+	ChanceOfRain  *int      `json:"chance_of_rain"`
+	UVIndex       *float64  `json:"uv_index"`
+
+	// Pop is the highest probability any slot of the day reported, PopMin the
+	// lowest and PopMean the mean of the slots that carried one. All three are null
+	// when no slot reported a probability, which is a different statement from a day
+	// whose probability was measured as zero.
+	//
+	// Temp.Min and Temp.Max are derived: the extremes of the day's slot
+	// temperatures. They are not the same quantity as a slot's main.temp_min and
+	// main.temp_max, which the upstream measures over its own three hour window.
+	//
+	// Clouds, Visibility, WindDeg, WindGust, Rain and Snow are the day's rollup as
+	// well. WindDeg is the direction of the slot with the day's strongest wind,
+	// matching the documented meaning of deg on the daily endpoints. Rain and Snow
+	// are sums of the slots' 3h windows and are null when no slot reported one.
+	//
+	// FeelsLike and Uvi are always null here: the three hour endpoint reports
+	// neither.
+	Pop        *float64        `json:"pop"`
+	PopMin     *float64        `json:"pop_min"`
+	PopMean    *float64        `json:"pop_mean"`
+	Temp       *TempPoint      `json:"temp"`
+	FeelsLike  *FeelsLikePoint `json:"feels_like"`
+	WindDeg    *int            `json:"wind_deg"`
+	WindGust   *float64        `json:"wind_gust"`
+	Clouds     *int            `json:"clouds"`
+	Visibility *int            `json:"visibility"`
+	Rain       *RainBlock      `json:"rain"`
+	Snow       *SnowBlock      `json:"snow"`
+	Uvi        *float64        `json:"uvi"`
+	Weather    []Weather       `json:"weather"`
+	Hourly     []ForecastSlot  `json:"hourly"`
+}
+
+// ForecastResponse is the body of GET|POST /api/v1/weather/forecast, served inside
+// the {"success":true,"data":{...}} envelope.
+//
+// The first group mirrors the /data/2.5/forecast envelope, in upstream field order.
+// cod is a string on this endpoint and cnt and message are the integers the decode
+// struct binds, so they are value fields: none of their zeroes is a reading a real
+// response makes. City is a pointer because the block can be absent.
+//
+// The second group is the legacy vocabulary, unchanged, so existing consumers keep
+// working. Forecast is a slice with no omitempty, so the key is always present even
+// when the upstream sent no slots.
+type ForecastResponse struct {
+	Cod     string `json:"cod"`
+	Message int    `json:"message"`
+	Cnt     int    `json:"cnt"`
+	City    *City  `json:"city"`
+
+	Location    Location      `json:"location"`
+	Current     Current       `json:"current"`
+	Forecast    []ForecastDay `json:"forecast"`
+	RequestTime time.Time     `json:"request_time"`
+}
+
+// ForecastPayload is a pointer-shaped mirror of the /data/2.5/forecast body and the
+// authority on which members the upstream actually sent. It declares the
+// conditional members the mapper cannot recover from
+// OpenWeatherMapForecastResponse: per slot, the main, wind, clouds, rain, snow and
+// sys blocks as pointers, main.sea_level, main.grnd_level, wind.gust, the rain and
+// snow 3h windows, and pop and visibility; and at the envelope level, the city
+// block.
+//
+// It exists beside OpenWeatherMapForecastResponse because models.ForecastItem and
+// the blocks it holds are non-pointer decode targets, where a member the upstream
+// measured as 0 and a member it never sent are the same zero. A response that has
+// to report the difference cannot be built from them, so the body is decoded twice
+// from the same already-fetched bytes: the mapper takes values from the upstream
+// struct and presence from here. That is one upstream request, not two. A newly
+// documented upstream field has to be added to both types, because a field missing
+// from this one is reported as absent even when the upstream did send it.
+// TestForecastPayloadCoversDecodedFields is the guard on that, and its allowlist
+// names every JSON member this type deliberately narrows.
+//
+// The two list[] decodes see the same array in the same order, so index i of List
+// is the presence view of index i of OpenWeatherMapForecastResponse.List. A body
+// whose list is longer than the payload's cannot happen: both decodes walk one
+// array, and a member one of them cannot type fails the request rather than
+// shortening it.
+//
+// pop is treated as conditional because the endpoint does not send it on every
+// slot, and the daily rollup excludes the slots that carry none from pop, pop_min
+// and pop_mean alike.
+type ForecastPayload struct {
+	// City carries no members on purpose. Every member the block reports is
+	// unconditionally sent, so the mapper reads those values from the upstream
+	// struct and needs only the pointer to know the block was there at all.
+	City *struct{}             `json:"city"`
+	List []ForecastPayloadItem `json:"list"`
+}
+
+// ForecastPayloadItem is the presence view of one three hour slot. Its members are
+// the slots' conditional ones; dt, dt_txt, weather, the always sent members of
+// main, wind and clouds, and sys.pod are read from the upstream struct.
+type ForecastPayloadItem struct {
+	Main       *ForecastPayloadMain   `json:"main"`
+	Wind       *ForecastPayloadWind   `json:"wind"`
+	Clouds     *struct{}              `json:"clouds"`
+	Rain       *ForecastPayloadPrecip `json:"rain"`
+	Snow       *ForecastPayloadPrecip `json:"snow"`
+	Sys        *struct{}              `json:"sys"`
+	Pop        *float64               `json:"pop"`
+	Visibility *int                   `json:"visibility"`
+}
+
+// ForecastPayloadMain holds the main block members of a slot that are conditional
+// rather than guaranteed: sea_level and grnd_level come only from points near sea
+// level or the ground. temp_kf is not declared here because /data/2.5/forecast does
+// not document it for a slot, so the response reports it null.
+type ForecastPayloadMain struct {
+	SeaLevel  *int `json:"sea_level"`
+	GrndLevel *int `json:"grnd_level"`
+}
+
+// ForecastPayloadWind holds wind.gust on a slot, which some regions report and
+// others omit. speed and deg are read from the upstream struct.
+type ForecastPayloadWind struct {
+	Gust *float64 `json:"gust"`
+}
+
+// ForecastPayloadPrecip holds the 3h window both rain and snow report on this
+// endpoint. A nil block means the upstream sent no block at all, which is not the
+// same as a block whose window measures 0. The 1h window is not declared here
+// because /data/2.5/forecast does not document it; see RainBlock.
+type ForecastPayloadPrecip struct {
+	ThreeHour *float64 `json:"3h"`
 }

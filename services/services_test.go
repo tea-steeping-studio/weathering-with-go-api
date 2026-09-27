@@ -1,6 +1,11 @@
 package services
 
 import (
+	"encoding/json"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,20 +34,244 @@ func TestMapCurrentWeather(t *testing.T) {
 	}
 }
 
-func TestCalculateDailyForecastEmpty(t *testing.T) {
-	svc := NewWeatherService("dummy")
-	f := svc.calculateDailyForecast("2025-01-02", nil)
-	if f.Date.IsZero() {
-		t.Fatalf("expected non-zero date")
-	}
-}
-
 // Fixed slots for ordering tests, so results never depend on the wall clock.
 var (
 	firstFeb  = time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC).Unix()
 	secondFeb = time.Date(2026, 2, 2, 12, 0, 0, 0, time.UTC).Unix()
 	thirdFeb  = time.Date(2026, 2, 3, 12, 0, 0, 0, time.UTC).Unix()
 )
+
+// mustSlotJSON renders one raw three hour slot. A fixture states only the members
+// it cares about, so a slot that omits pop is a slot the upstream did not measure
+// a probability for, which is not the same as a slot reporting 0.
+func mustSlotJSON(t *testing.T, slot map[string]any) string {
+	t.Helper()
+	body, err := json.Marshal(slot)
+	if err != nil {
+		t.Fatalf("failed to render a slot fixture: %v", err)
+	}
+	return string(body)
+}
+
+// forecastBody wraps rendered slots in a /data/2.5/forecast envelope.
+func forecastBody(t *testing.T, slots ...string) string {
+	t.Helper()
+	return `{"cod":"200","message":0,"cnt":` + strconv.Itoa(len(slots)) +
+		`,"list":[` + strings.Join(slots, ",") +
+		`],"city":{"id":2643743,"name":"London","coord":{"lon":-0.13,"lat":51.51},"country":"GB","population":7556900,"timezone":0,"sunrise":1771999200,"sunset":1772030400}}`
+}
+
+// decodeForecastBody decodes a body into both structs the mapper takes, exactly as
+// fetchWeatherForecast does. Going through the raw bytes is what lets a fixture
+// distinguish a member the upstream sent as 0 from one it never sent.
+func decodeForecastBody(t *testing.T, body string) (models.OpenWeatherMapForecastResponse, models.ForecastPayload) {
+	t.Helper()
+	var owm models.OpenWeatherMapForecastResponse
+	if err := json.Unmarshal([]byte(body), &owm); err != nil {
+		t.Fatalf("failed to decode the fixture into the upstream struct: %v", err)
+	}
+	var payload models.ForecastPayload
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("failed to decode the fixture into the payload: %v", err)
+	}
+	return owm, payload
+}
+
+func mapForecastBody(t *testing.T, body string, days int) *models.ForecastResponse {
+	t.Helper()
+	owm, payload := decodeForecastBody(t, body)
+	return NewWeatherService("dummy").mapForecast(owm, payload, days)
+}
+
+// assertClose compares a derived float against the value a reader expects, with
+// enough tolerance to absorb the representation error of an arithmetic mean.
+func assertClose(t *testing.T, what string, got, want float64) {
+	t.Helper()
+	if math.Abs(got-want) > 1e-9 {
+		t.Fatalf("expected %s to be %v, got %v", what, want, got)
+	}
+}
+
+// forecastLocalMidnight anchors the forecast fixtures. The route groups slots by the
+// date a timestamp formats to in this process's zone, so a fixed UTC instant would
+// land on two grouped days on some hosts. Anchoring on local midnight keeps every
+// fixture's slots on exactly one day wherever the tests run.
+var forecastLocalMidnight = time.Date(2026, 2, 1, 0, 0, 0, 0, time.Local)
+
+// popSlots renders a day of three hour slots, carrying only dt and the members a pop
+// test names. Index i of pops is the offset from the anchor in three hour steps, so
+// a missing index is a slot the upstream sent no pop for.
+func popSlots(t *testing.T, at time.Time, pops map[int]float64) string {
+	t.Helper()
+	indexes := make([]int, 0, len(pops))
+	for i := range pops {
+		indexes = append(indexes, i)
+	}
+	sort.Ints(indexes)
+
+	slots := make([]string, 0, len(indexes))
+	for _, i := range indexes {
+		slot := map[string]any{"dt": at.Add(time.Duration(3*i) * time.Hour).Unix()}
+		if pop, ok := pops[i]; ok {
+			slot["pop"] = pop
+		}
+		slots = append(slots, mustSlotJSON(t, slot))
+	}
+	return forecastBody(t, slots...)
+}
+
+func TestDailyPopIsMaxAcrossSlots(t *testing.T) {
+	body := popSlots(t, forecastLocalMidnight, map[int]float64{0: 0.1, 1: 0.8, 2: 0.3, 3: 0.2})
+
+	day := mapForecastBody(t, body, 5).Forecast[0]
+
+	if day.Pop == nil {
+		t.Fatal("expected a day pop, got none")
+	}
+	assertClose(t, "the day pop", *day.Pop, 0.8)
+	if day.PopMin == nil {
+		t.Fatal("expected a day pop_min, got none")
+	}
+	assertClose(t, "the day pop_min", *day.PopMin, 0.1)
+	if day.PopMean == nil {
+		t.Fatal("expected a day pop_mean, got none")
+	}
+	assertClose(t, "the day pop_mean", *day.PopMean, 0.35)
+}
+
+func TestDailyPopIgnoresSlotsWithoutPop(t *testing.T) {
+	body := popSlots(t, forecastLocalMidnight, map[int]float64{0: 0.5, 2: 0.9})
+
+	day := mapForecastBody(t, body, 5).Forecast[0]
+
+	if day.Pop == nil {
+		t.Fatal("expected a day pop, got none")
+	}
+	assertClose(t, "the day pop", *day.Pop, 0.9)
+	if day.PopMin == nil {
+		t.Fatal("expected a day pop_min, got none")
+	}
+	assertClose(t, "the day pop_min", *day.PopMin, 0.5)
+	if day.PopMean == nil {
+		t.Fatal("expected a day pop_mean, got none")
+	}
+	// The two slots with no pop are excluded from the mean rather than counted as
+	// zero, which would have diluted it to 0.35.
+	assertClose(t, "the day pop_mean", *day.PopMean, 0.7)
+}
+
+func TestLegacyChanceOfRainMatchesDailyPop(t *testing.T) {
+	body := popSlots(t, forecastLocalMidnight, map[int]float64{0: 0.42})
+
+	day := mapForecastBody(t, body, 5).Forecast[0]
+
+	if day.Pop == nil {
+		t.Fatal("expected a day pop, got none")
+	}
+	if day.ChanceOfRain == nil {
+		t.Fatal("expected a legacy chance_of_rain, got none")
+	}
+	if want := int(*day.Pop * 100); *day.ChanceOfRain != want {
+		t.Fatalf("expected chance_of_rain %d to match pop %v, got %d", want, *day.Pop, *day.ChanceOfRain)
+	}
+}
+
+// The three hour endpoint has no time of day breakdown, so the faithful half of
+// the day reports null for every member it has no source for. temp.min and
+// temp.max are the exception and they are derived, not measured.
+func TestForecastDayHasNoTimeOfDayBreakdown(t *testing.T) {
+	at := forecastLocalMidnight
+	slots := []string{
+		mustSlotJSON(t, map[string]any{
+			"dt":   at.Unix(),
+			"main": map[string]any{"temp": 18.0, "feels_like": 17.2, "temp_min": 15.0, "temp_max": 21.0, "pressure": 1012, "humidity": 70},
+		}),
+		mustSlotJSON(t, map[string]any{
+			"dt":   at.Add(3 * time.Hour).Unix(),
+			"main": map[string]any{"temp": 19.0, "feels_like": 18.0, "temp_min": 16.0, "temp_max": 22.0, "pressure": 1011, "humidity": 65},
+		}),
+	}
+
+	day := mapForecastBody(t, forecastBody(t, slots...), 5).Forecast[0]
+
+	if day.Temp == nil {
+		t.Fatal("expected a faithful temp block, got none")
+	}
+	for _, absent := range []struct {
+		name  string
+		value *float64
+	}{
+		{"temp.day", day.Temp.Day},
+		{"temp.night", day.Temp.Night},
+		{"temp.morn", day.Temp.Morn},
+		{"temp.eve", day.Temp.Eve},
+	} {
+		if absent.value != nil {
+			t.Fatalf("expected %s to be nil, the three hour endpoint has no breakdown, got %v", absent.name, *absent.value)
+		}
+	}
+	if day.Temp.Min == nil || day.Temp.Max == nil {
+		t.Fatalf("expected derived temp.min and temp.max, got %#v", day.Temp)
+	}
+	assertClose(t, "temp.min", *day.Temp.Min, 18.0)
+	assertClose(t, "temp.max", *day.Temp.Max, 19.0)
+
+	if day.FeelsLike == nil {
+		t.Fatal("expected a faithful feels_like block, got none")
+	}
+	for _, absent := range []struct {
+		name  string
+		value *float64
+	}{
+		{"feels_like.day", day.FeelsLike.Day},
+		{"feels_like.night", day.FeelsLike.Night},
+		{"feels_like.morn", day.FeelsLike.Morn},
+		{"feels_like.eve", day.FeelsLike.Eve},
+	} {
+		if absent.value != nil {
+			t.Fatalf("expected %s to be nil, the three hour endpoint has no breakdown, got %v", absent.name, *absent.value)
+		}
+	}
+	if day.Uvi != nil {
+		t.Fatalf("expected uvi to be nil, the three hour endpoint reports none, got %v", *day.Uvi)
+	}
+}
+
+// Slots are grouped by the date their timestamp formats to, and time.Unix returns
+// local time, so the boundary is the process's local midnight rather than UTC. The
+// plan and the brief describe this grouping as UTC; on any host whose offset is not
+// zero the two differ, and the fixtures in the other tests here are only split in
+// two because the test process is on UTC. The two slots below therefore sit an hour
+// either side of local midnight, so the split is the same on every host.
+//
+// The grouping itself is not this task's to change: it is the existing
+// Format("2006-01-02") behaviour, kept deliberately.
+func TestForecastDayGroupsSlotsAcrossUtcMidnight(t *testing.T) {
+	boundary := time.Date(2026, 2, 1, 0, 0, 0, 0, time.Local)
+	slots := []string{
+		mustSlotJSON(t, map[string]any{"dt": boundary.Add(-time.Hour).Unix(), "main": map[string]any{"temp": 4.0}}),
+		mustSlotJSON(t, map[string]any{"dt": boundary.Add(time.Hour).Unix(), "main": map[string]any{"temp": 2.0}}),
+	}
+
+	days := mapForecastBody(t, forecastBody(t, slots...), 5).Forecast
+
+	if len(days) != 2 {
+		t.Fatalf("expected the midnight to split the slots into 2 days, got %d: %+v", len(days), days)
+	}
+	want := []string{boundary.Add(-time.Hour).Format("2006-01-02"), boundary.Add(time.Hour).Format("2006-01-02")}
+	for i, day := range days {
+		if got := day.Date.Format("2006-01-02"); got != want[i] {
+			t.Fatalf("expected day %d to be %s got %s", i, want[i], got)
+		}
+		if len(day.Hourly) != 1 {
+			t.Fatalf("expected day %d to carry its own 1 slot, got %d", i, len(day.Hourly))
+		}
+	}
+	// The slots stayed with their own day rather than being merged, so each day's
+	// derived extremes come from one slot.
+	assertClose(t, "the first day's derived min", *days[0].Temp.Min, 4.0)
+	assertClose(t, "the second day's derived min", *days[1].Temp.Min, 2.0)
+}
 
 func forecastResponseFixture() models.OpenWeatherMapForecastResponse {
 	return models.OpenWeatherMapForecastResponse{
@@ -65,10 +294,24 @@ func forecastResponseFixture() models.OpenWeatherMapForecastResponse {
 	}
 }
 
-func TestConvertForecastResponsePopulatesCurrent(t *testing.T) {
-	svc := NewWeatherService("dummy")
+func TestMapForecastPopulatesCurrent(t *testing.T) {
+	owm, payload := decodeForecastBody(t, forecastBody(t,
+		mustSlotJSON(t, map[string]any{
+			"dt":      1772000000,
+			"main":    map[string]any{"temp": 18.0, "feels_like": 17.2, "temp_min": 15.0, "temp_max": 21.0, "pressure": 1012, "humidity": 70},
+			"weather": []any{map[string]any{"main": "Rain", "description": "light rain", "icon": "10d"}},
+			"clouds":  map[string]any{"all": 80},
+			"wind":    map[string]any{"speed": 5.0, "deg": 90, "gust": 7.5},
+		}),
+		mustSlotJSON(t, map[string]any{
+			"dt":      1772010800,
+			"main":    map[string]any{"temp": 19.0, "feels_like": 18.0, "temp_min": 16.0, "temp_max": 22.0, "pressure": 1011, "humidity": 65},
+			"weather": []any{map[string]any{"main": "Clear", "description": "clear sky", "icon": "01d"}},
+			"wind":    map[string]any{"speed": 3.0, "deg": 100},
+		}),
+	))
 
-	data := svc.convertForecastResponse(forecastResponseFixture(), 5)
+	data := NewWeatherService("dummy").mapForecast(owm, payload, 5)
 
 	wantUpdated := time.Unix(1772000000, 0)
 	got := data.Current
@@ -95,10 +338,57 @@ func TestConvertForecastResponsePopulatesCurrent(t *testing.T) {
 	}
 }
 
-func TestConvertForecastResponseWithNoItemsLeavesCurrentZero(t *testing.T) {
+// The mapper is handed a payload shorter than the upstream list, which cannot
+// happen from a real body but must not panic or index out of range if it ever does.
+// An empty payload leaves every slot reporting no presence, and the day then says
+// so rather than rolling up zeroes: no slot reported a main block, so there is no
+// temperature to derive and no humidity to average.
+func TestMapForecastWithoutAPayloadStillRollsUpDays(t *testing.T) {
+	owm := models.OpenWeatherMapForecastResponse{
+		List: []models.ForecastItem{
+			{Dt: forecastLocalMidnight.Unix(), Main: models.Main{Temp: 11}, Clouds: models.Clouds{All: 20}},
+			{Dt: forecastLocalMidnight.Add(12 * time.Hour).Unix(), Main: models.Main{Temp: 12}, Clouds: models.Clouds{All: 40}},
+		},
+		City: models.City{Name: "London", Country: "GB", Coord: models.Coordinates{Lat: 51.51, Lon: -0.13}},
+	}
+
+	data := NewWeatherService("dummy").mapForecast(owm, models.ForecastPayload{}, 5)
+
+	if len(data.Forecast) != 1 {
+		t.Fatalf("expected the two slots to make 1 day, got %d: %+v", len(data.Forecast), data.Forecast)
+	}
+	day := data.Forecast[0]
+	if day.Temp != nil {
+		t.Fatalf("expected no temp block when no slot reported a main block, got %#v", day.Temp)
+	}
+	if day.Humidity != nil || day.WindSpeed != nil || day.Clouds != nil || day.Visibility != nil {
+		t.Fatalf("expected a mean over no members to be null, got %+v", day)
+	}
+	// The feels_like block is documented on the daily schema, so its presence does
+	// not depend on what the slots carried.
+	if day.FeelsLike == nil {
+		t.Fatal("expected the documented feels_like block to be present, got none")
+	}
+	// The slots themselves are still reported, with every block the upstream did not
+	// send reported as null.
+	if len(day.Hourly) != 2 {
+		t.Fatalf("expected 2 slots on the day, got %d", len(day.Hourly))
+	}
+	if day.Hourly[0].Main != nil || day.Hourly[0].Clouds != nil || day.Hourly[0].Pop != nil {
+		t.Fatalf("expected no blocks on a slot with no presence, got %#v", day.Hourly[0])
+	}
+	if data.Location.Name != "London" || data.Location.Country != "GB" {
+		t.Fatalf("unexpected legacy location %+v", data.Location)
+	}
+	if data.Location.Latitude != 51.51 || data.Location.Longitude != -0.13 {
+		t.Fatalf("expected the city coordinates, got %+v", data.Location)
+	}
+}
+
+func TestMapForecastWithNoItemsLeavesCurrentZero(t *testing.T) {
 	svc := NewWeatherService("dummy")
 
-	data := svc.convertForecastResponse(models.OpenWeatherMapForecastResponse{}, 5)
+	data := svc.mapForecast(models.OpenWeatherMapForecastResponse{}, models.ForecastPayload{}, 5)
 
 	if data.Current.Temperature != 0 || data.Current.Condition != "" {
 		t.Fatalf("expected zero current for an empty response, got %+v", data.Current)
@@ -106,10 +396,12 @@ func TestConvertForecastResponseWithNoItemsLeavesCurrentZero(t *testing.T) {
 	if !data.Current.LastUpdated.IsZero() {
 		t.Fatalf("expected zero last_updated, got %s", data.Current.LastUpdated)
 	}
+	if len(data.Forecast) != 0 {
+		t.Fatalf("expected no days for an empty response, got %d", len(data.Forecast))
+	}
 }
 
-func TestConvertForecastResponseReturnsEarliestDaysInOrder(t *testing.T) {
-	svc := NewWeatherService("dummy")
+func TestMapForecastReturnsEarliestDaysInOrder(t *testing.T) {
 	owm := models.OpenWeatherMapForecastResponse{
 		List: []models.ForecastItem{
 			{Dt: thirdFeb, Main: models.Main{Temp: 13}},
@@ -117,13 +409,21 @@ func TestConvertForecastResponseReturnsEarliestDaysInOrder(t *testing.T) {
 			{Dt: secondFeb, Main: models.Main{Temp: 12}},
 		},
 	}
+	payload := models.ForecastPayload{List: []models.ForecastPayloadItem{{}, {}, {}}}
 
-	data := svc.convertForecastResponse(owm, 2)
+	data := NewWeatherService("dummy").mapForecast(owm, payload, 2)
 
 	if len(data.Forecast) != 2 {
 		t.Fatalf("expected 2 forecast days, got %d", len(data.Forecast))
 	}
-	want := []string{"2026-02-01", "2026-02-02"}
+	// The three slots are noon UTC on three consecutive UTC dates, and the route
+	// groups by the date a timestamp formats to in this process's zone, so the
+	// expected keys are derived the same way. On a UTC host they read 2026-02-01 and
+	// 2026-02-02.
+	want := []string{
+		time.Unix(firstFeb, 0).Format("2006-01-02"),
+		time.Unix(secondFeb, 0).Format("2006-01-02"),
+	}
 	for i, day := range data.Forecast {
 		if got := day.Date.Format("2006-01-02"); got != want[i] {
 			t.Fatalf("expected day %d to be %s got %s", i, want[i], got)

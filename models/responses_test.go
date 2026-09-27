@@ -156,3 +156,109 @@ var currentPayloadNarrowed = map[string]string{
 	"name":            alwaysSent,
 	"cod":             alwaysSent,
 }
+
+// The forecast route has the same drift hazard as the current route, and more of
+// it: a slot whose rain window measures 0 must not collapse into the same report as
+// a slot that never sent a rain block. OpenWeatherMapForecastResponse and
+// ForecastPayload are the pair to keep in step.
+func TestForecastPayloadCoversDecodedFields(t *testing.T) {
+	upstream := jsonMemberPaths(reflect.TypeOf(OpenWeatherMapForecastResponse{}))
+	// jsonMemberPaths reports a slice as a leaf, and list is a slice, so the slot
+	// members are walked separately. They are most of what this payload is for: the
+	// envelope is five unconditional members and a city block, the slots are the
+	// body.
+	collectJSONMemberPaths(reflect.TypeOf(ForecastItem{}), "list", upstream)
+
+	payload := jsonMemberPaths(reflect.TypeOf(ForecastPayload{}))
+	collectJSONMemberPaths(reflect.TypeOf(ForecastPayloadItem{}), "list", payload)
+
+	if len(upstream) == 0 {
+		t.Fatal("the upstream walk found no members, so this check would pass on anything")
+	}
+
+	var uncovered []string
+	for name := range upstream {
+		if payload[name] || forecastPayloadNarrowed[name] != "" {
+			continue
+		}
+		uncovered = append(uncovered, name)
+	}
+	sort.Strings(uncovered)
+	if len(uncovered) > 0 {
+		t.Errorf("OpenWeatherMapForecastResponse declares members the forecast payload omits and the allowlist does not cover: %s\n"+
+			"add each one to ForecastPayload, or allowlist it with the reason it is deliberately narrower",
+			strings.Join(uncovered, ", "))
+	}
+
+	// The payload must not invent a name the upstream never sends. Three are
+	// deliberate: city, clouds and sys are tracked for presence, and the walk
+	// reports the upstream block as its members rather than as a member of its own.
+	for _, name := range []string{"city", "list.clouds", "list.sys"} {
+		delete(payload, name)
+	}
+	var invented []string
+	for name := range payload {
+		if !upstream[name] {
+			invented = append(invented, name)
+		}
+	}
+	sort.Strings(invented)
+	if len(invented) > 0 {
+		t.Errorf("ForecastPayload declares members the upstream never sends: %s", strings.Join(invented, ", "))
+	}
+}
+
+const (
+	// forecastEnvelopeSent names a member of the /data/2.5/forecast envelope the
+	// upstream documents as unconditionally sent, so its zero in the decode struct
+	// is a real reading and never an absent member.
+	forecastEnvelopeSent = "documented as always sent in the /data/2.5/forecast envelope, so its zero is a real reading, not an absent member"
+	// forecastCitySent names a member of the city block the upstream documents as
+	// unconditionally sent. The payload records only whether the block was there.
+	forecastCitySent = "documented as always sent in the /data/2.5/forecast city block, whose members the payload tracks for presence only"
+	// forecastSlotSent names a member the upstream documents as unconditionally sent
+	// on a three hour slot.
+	forecastSlotSent = "documented as always sent on a /data/2.5/forecast slot, so its zero is a real reading, not an absent member"
+	// forecastNoHourWindow names a member this endpoint does not document. The
+	// response omits the key entirely rather than reporting it null.
+	forecastNoHourWindow = "not documented for /data/2.5/forecast, which reports the 3h precipitation window only"
+	// forecastNoKelvinFactor names main.temp_kf, which the current weather endpoint
+	// documents and the three hour endpoint does not.
+	forecastNoKelvinFactor = "not documented for a /data/2.5/forecast slot, so the day and slot blocks report it as null"
+)
+
+// forecastPayloadNarrowed lists every JSON member OpenWeatherMapForecastResponse
+// declares that ForecastPayload deliberately does not, each with the reason. An
+// entry is a claim that the upstream always sends the member, so remove the entry
+// and let the test fail if that ever stops being true.
+var forecastPayloadNarrowed = map[string]string{
+	"cod":             forecastEnvelopeSent,
+	"message":         forecastEnvelopeSent,
+	"cnt":             forecastEnvelopeSent,
+	"city.id":         forecastCitySent,
+	"city.name":       forecastCitySent,
+	"city.coord.lon":  forecastCitySent,
+	"city.coord.lat":  forecastCitySent,
+	"city.country":    forecastCitySent,
+	"city.population": forecastCitySent,
+	"city.timezone":   forecastCitySent,
+	"city.sunrise":    forecastCitySent,
+	"city.sunset":     forecastCitySent,
+
+	"list.dt":              forecastSlotSent,
+	"list.dt_txt":          forecastSlotSent,
+	"list.weather":         forecastSlotSent,
+	"list.main.temp":       forecastSlotSent,
+	"list.main.feels_like": forecastSlotSent,
+	"list.main.temp_min":   forecastSlotSent,
+	"list.main.temp_max":   forecastSlotSent,
+	"list.main.pressure":   forecastSlotSent,
+	"list.main.humidity":   forecastSlotSent,
+	"list.main.temp_kf":    forecastNoKelvinFactor,
+	"list.clouds.all":      forecastSlotSent,
+	"list.wind.speed":      forecastSlotSent,
+	"list.wind.deg":        forecastSlotSent,
+	"list.rain.1h":         forecastNoHourWindow,
+	"list.snow.1h":         forecastNoHourWindow,
+	"list.sys.pod":         forecastSlotSent,
+}

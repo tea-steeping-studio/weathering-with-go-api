@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -118,7 +119,7 @@ func (w *WeatherService) fetchCurrentWeather(location, units, apikey string) (*m
 }
 
 // GetWeatherForecast fetches weather forecast data for a given location
-func (w *WeatherService) GetWeatherForecast(location, units string, days int, apikey string) (*models.WeatherData, bool, error) {
+func (w *WeatherService) GetWeatherForecast(location, units string, days int, apikey string) (*models.ForecastResponse, bool, error) {
 	if location == "" {
 		return nil, false, fmt.Errorf("location cannot be empty")
 	}
@@ -132,12 +133,12 @@ func (w *WeatherService) GetWeatherForecast(location, units string, days int, ap
 	}
 
 	key := weatherCacheKey(apikey, forecastCacheEndpoint, location, units, days)
-	return cachedFetchTracked(w, key, func() (*models.WeatherData, error) {
+	return cachedFetchTracked(w, key, func() (*models.ForecastResponse, error) {
 		return w.fetchWeatherForecast(location, units, days, apikey)
 	})
 }
 
-func (w *WeatherService) fetchWeatherForecast(location, units string, days int, apikey string) (*models.WeatherData, error) {
+func (w *WeatherService) fetchWeatherForecast(location, units string, days int, apikey string) (*models.ForecastResponse, error) {
 	// Build URL
 	endpoint := fmt.Sprintf("%s%s", OpenWeatherMapBaseURL, ForecastEndpoint)
 	params := url.Values{}
@@ -160,14 +161,28 @@ func (w *WeatherService) fetchWeatherForecast(location, units string, days int, 
 		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
+	// Read the body once and decode it twice: once into the upstream structs and
+	// once into the pointer view of the members they cannot express, which is where
+	// a measured zero and an absent member are told apart. This is one upstream
+	// request, not two.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse API response: %w", err)
+	}
+
 	// Parse response
 	var owmResp models.OpenWeatherMapForecastResponse
-	if err := json.NewDecoder(resp.Body).Decode(&owmResp); err != nil {
+	if err := json.Unmarshal(body, &owmResp); err != nil {
+		return nil, fmt.Errorf("failed to parse API response: %w", err)
+	}
+
+	var payload models.ForecastPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("failed to parse API response: %w", err)
 	}
 
 	// Convert to our internal model
-	weatherData := w.convertForecastResponse(owmResp, days)
+	weatherData := w.mapForecast(owmResp, payload, days)
 	return weatherData, nil
 }
 
@@ -467,43 +482,319 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 	}
 }
 
-// convertForecastResponse converts OpenWeatherMap forecast response to our internal model
-func (w *WeatherService) convertForecastResponse(owm models.OpenWeatherMapForecastResponse, days int) *models.WeatherData {
-	// Group forecast items by date
-	forecastMap := make(map[string][]models.ForecastItem)
-
-	for _, item := range owm.List {
+// mapForecast builds the forecast route's response: a faithful mirror of the
+// /data/2.5/forecast envelope, the daily rollup this route has always reported, and
+// the raw three hour slots behind each day. Values come from owm, presence from
+// payload, and every key is assigned in one struct literal from the same locals, so
+// a legacy key cannot drift away from the faithful value it aliases.
+//
+// The legacy current block is still derived from list[0] rather than observed; see
+// currentFromForecast. Filling it costs no upstream call, and the route must not
+// start making one.
+func (w *WeatherService) mapForecast(owm models.OpenWeatherMapForecastResponse, payload models.ForecastPayload, days int) *models.ForecastResponse {
+	// Group by the date a slot's timestamp formats to, as the route always has.
+	// time.Unix returns local time, so the boundary is this process's midnight, not
+	// UTC and not the city's: a slot at 23:00 UTC and one at 01:00 UTC the next
+	// morning are two days only when the offset is zero. The grouping is not this
+	// change's to make and is kept as it is. The two decodes read the same array in
+	// the same order, so index i of payload.List is the presence view of
+	// owm.List[i].
+	slotsByDate := make(map[string][]models.ForecastSlot)
+	for i, item := range owm.List {
+		var presence models.ForecastPayloadItem
+		if i < len(payload.List) {
+			presence = payload.List[i]
+		}
 		date := time.Unix(item.Dt, 0).Format("2006-01-02")
-		forecastMap[date] = append(forecastMap[date], item)
+		slotsByDate[date] = append(slotsByDate[date], mapForecastSlot(item, presence))
 	}
 
 	// Walk the dates in chronological order so the returned days are deterministic.
-	dates := make([]string, 0, len(forecastMap))
-	for date := range forecastMap {
+	dates := make([]string, 0, len(slotsByDate))
+	for date := range slotsByDate {
 		dates = append(dates, date)
 	}
 	sort.Strings(dates)
 
-	// Convert to daily forecasts
-	forecasts := make([]models.Forecast, 0, min(len(dates), days))
+	// Convert to daily forecasts. days takes the earliest days, as it always has.
+	forecasts := make([]models.ForecastDay, 0, min(len(dates), days))
 	for _, date := range dates {
 		if len(forecasts) >= days {
 			break
 		}
-		forecasts = append(forecasts, w.calculateDailyForecast(date, forecastMap[date]))
+		forecasts = append(forecasts, forecastDay(date, slotsByDate[date]))
 	}
 
-	return &models.WeatherData{
+	// The faithful city block and the legacy location read the same four members.
+	name, country := owm.City.Name, owm.City.Country
+	lat, lon := owm.City.Coord.Lat, owm.City.Coord.Lon
+	city := owm.City
+	var cityBlock *models.City
+	if payload.City != nil {
+		cityBlock = &city
+	}
+
+	return &models.ForecastResponse{
+		Cod:     owm.Cod,
+		Message: owm.Message,
+		Cnt:     owm.Cnt,
+		City:    cityBlock,
 		Location: models.Location{
-			Name:      owm.City.Name,
-			Country:   owm.City.Country,
-			Latitude:  owm.City.Coord.Lat,
-			Longitude: owm.City.Coord.Lon,
+			Name:      name,
+			Country:   country,
+			Latitude:  lat,
+			Longitude: lon,
 		},
 		Current:     currentFromForecast(owm.List),
 		Forecast:    forecasts,
 		RequestTime: w.now(),
 	}
+}
+
+// mapForecastSlot maps one raw three hour slot. A block the upstream did not send
+// stays nil, so an absent block, a block whose members are all null and a block
+// measuring zero are three different things, exactly as on the current route.
+func mapForecastSlot(item models.ForecastItem, presence models.ForecastPayloadItem) models.ForecastSlot {
+	slot := models.ForecastSlot{
+		Dt:      item.Dt,
+		Weather: item.Weather,
+		DtTxt:   item.DtTxt,
+		// pop and visibility are read from the payload rather than the upstream
+		// struct. The endpoint does not send pop on every slot, and reading its zero
+		// from a non-pointer field would report a probability nobody measured.
+		Pop:        presence.Pop,
+		Visibility: presence.Visibility,
+	}
+
+	temp, feelsLike := item.Main.Temp, item.Main.FeelsLike
+	tempMin, tempMax := item.Main.TempMin, item.Main.TempMax
+	pressure, humidity := item.Main.Pressure, item.Main.Humidity
+	if presence.Main != nil {
+		slot.Main = &models.MainBlock{
+			Temp:      &temp,
+			FeelsLike: &feelsLike,
+			TempMin:   &tempMin,
+			TempMax:   &tempMax,
+			Pressure:  &pressure,
+			Humidity:  &humidity,
+			SeaLevel:  presence.Main.SeaLevel,
+			GrndLevel: presence.Main.GrndLevel,
+			// TempKF stays null: /data/2.5/forecast does not document it for a slot.
+		}
+	}
+
+	speed, deg := item.Wind.Speed, item.Wind.Deg
+	if presence.Wind != nil {
+		slot.Wind = &models.WindBlock{Speed: &speed, Deg: &deg, Gust: presence.Wind.Gust}
+	}
+
+	if presence.Clouds != nil {
+		cloudCover := item.Clouds.All
+		slot.Clouds = &models.CloudsBlock{All: &cloudCover}
+	}
+
+	// Only the 3h window is documented on this endpoint, so OneHour stays nil. The
+	// shared RainBlock tags 1h as a required key, so it is present and null here
+	// rather than absent; see models.ForecastSlot.
+	if presence.Rain != nil {
+		slot.Rain = &models.RainBlock{ThreeHour: presence.Rain.ThreeHour}
+	}
+	if presence.Snow != nil {
+		slot.Snow = &models.SnowBlock{ThreeHour: presence.Snow.ThreeHour}
+	}
+	if presence.Sys != nil {
+		sys := item.Sys
+		slot.Sys = &sys
+	}
+
+	return slot
+}
+
+// forecastDay rolls one UTC date of slots up into the day the route reports.
+//
+// Nearly everything a day carries is a derivation, because the three hour endpoint
+// reports per slot and nothing per day. Both vocabularies are assigned from the
+// same accumulators, so chance_of_rain cannot drift away from pop and
+// max_temperature cannot drift away from temp.max.
+//
+// A mean is taken over the slots that carry the member, not over every slot: a day
+// whose first slot reports no pop has a probability stated over the slots that have
+// one, and saying null would lose the reading entirely.
+//
+// dateStr and slots always come from mapForecast's grouping, so slots is never
+// empty: a day is created from a slot, never the other way round.
+func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay {
+	date, _ := time.Parse("2006-01-02", dateStr)
+	day := models.ForecastDay{Date: date, Hourly: slots}
+	// The endpoint reports no feels_like breakdown at all, so the block is present
+	// with every member null. Its presence must not depend on whether the slots
+	// carried a main block: the key is documented, the readings are not.
+	day.FeelsLike = &models.FeelsLikePoint{}
+
+	var (
+		tempSum, tempMin, tempMax float64
+		humiditySum               float64
+		windSum, fastest, gustMax float64
+		cloudSum, visibilitySum   float64
+		popSum, popMin, popMax    float64
+		rainSum, snowSum          float64
+		tempCount, humidityCount  int
+		windCount, cloudCount     int
+		visibilityCount, popCount int
+		windDeg                   int
+		tempSeen, fastestSeen     bool
+		gustSeen, popSeen         bool
+		rainSeen, snowSeen        bool
+	)
+
+	for _, slot := range slots {
+		if main := slot.Main; main != nil {
+			temp := *main.Temp
+			if !tempSeen || temp < tempMin {
+				tempMin = temp
+			}
+			if !tempSeen || temp > tempMax {
+				tempMax = temp
+			}
+			tempSum += temp
+			tempSeen = true
+			tempCount++
+
+			humiditySum += float64(*main.Humidity)
+			humidityCount++
+		}
+
+		if wind := slot.Wind; wind != nil {
+			speed := *wind.Speed
+			windSum += speed
+			windCount++
+			// deg is the direction relevant to the maximum wind speed, which is what
+			// the daily endpoints document it as, so the day reports the direction of
+			// its fastest slot rather than a mean of headings.
+			if !fastestSeen || speed > fastest {
+				fastest = speed
+				windDeg = *wind.Deg
+				fastestSeen = true
+			}
+			if wind.Gust != nil && (!gustSeen || *wind.Gust > gustMax) {
+				gustMax = *wind.Gust
+				gustSeen = true
+			}
+		}
+
+		if clouds := slot.Clouds; clouds != nil {
+			cloudSum += float64(*clouds.All)
+			cloudCount++
+		}
+
+		if slot.Visibility != nil {
+			visibilitySum += float64(*slot.Visibility)
+			visibilityCount++
+		}
+
+		if slot.Pop != nil {
+			pop := *slot.Pop
+			if !popSeen || pop > popMax {
+				popMax = pop
+			}
+			if !popSeen || pop < popMin {
+				popMin = pop
+			}
+			popSum += pop
+			popSeen = true
+			popCount++
+		}
+
+		if rain := slot.Rain; rain != nil && rain.ThreeHour != nil {
+			rainSum += *rain.ThreeHour
+			rainSeen = true
+		}
+
+		if snow := slot.Snow; snow != nil && snow.ThreeHour != nil {
+			snowSum += *snow.ThreeHour
+			snowSeen = true
+		}
+	}
+
+	if tempSeen {
+		day.AvgTemp = tempSum / float64(tempCount)
+		// Derived, not measured: the extremes of the day's slot temperatures. A
+		// slot's own main.temp_min and main.temp_max are a different measurement, the
+		// upstream's own three hour window, and the two are not interchangeable.
+		// The three hour endpoint has no time of day breakdown, no feels_like
+		// breakdown and no uvi, so those members stay null.
+		day.Temp = &models.TempPoint{Min: &tempMin, Max: &tempMax}
+		// The legacy aliases of the same two numbers, so a consumer of the old
+		// response and a reader of the faithful one never see different values.
+		day.MinTemp = tempMin
+		day.MaxTemp = tempMax
+	}
+
+	if humidityCount > 0 {
+		// Truncated rather than rounded, which is what the legacy value has always
+		// been, so the JSON of this key is unchanged.
+		humidity := int(humiditySum / float64(humidityCount))
+		day.Humidity = &humidity
+	}
+
+	if windCount > 0 {
+		windSpeed := windSum / float64(windCount)
+		day.WindSpeed = &windSpeed
+		day.WindDeg = &windDeg
+	}
+	if gustSeen {
+		day.WindGust = &gustMax
+	}
+	// clouds and visibility are integer keys, so their means are truncated the same
+	// way humidity is. wind_speed stays a float mean, unrounded, which is the
+	// legacy value unchanged.
+	if cloudCount > 0 {
+		clouds := int(cloudSum / float64(cloudCount))
+		day.Clouds = &clouds
+	}
+	if visibilityCount > 0 {
+		visibility := int(visibilitySum / float64(visibilityCount))
+		day.Visibility = &visibility
+	}
+
+	if popSeen {
+		// The mean of the fractional probabilities, not of their percentages, and
+		// rounded to four places so the mean of 0.1, 0.8, 0.3 and 0.2 is reported as
+		// 0.35 rather than as 0.35000000000000003. Every slot with no pop is excluded
+		// from all three, so a day is not diluted by slots nobody measured.
+		popMean := math.Round(popSum/float64(popCount)*10000) / 10000
+		day.Pop = &popMax
+		day.PopMin = &popMin
+		day.PopMean = &popMean
+		// The legacy alias of the same maximum, so the two cannot disagree.
+		chanceOfRain := int(popMax * 100)
+		day.ChanceOfRain = &chanceOfRain
+	}
+
+	if rainSeen {
+		day.Rain = &models.RainBlock{ThreeHour: &rainSum}
+	}
+	if snowSeen {
+		day.Snow = &models.SnowBlock{ThreeHour: &snowSum}
+	}
+	// The legacy precipitation is the same two sums as one number, so it is 0 for a
+	// day no slot reported precipitation for: a total of zero is a reading, and the
+	// legacy key has always been a number rather than an absent member.
+	day.Precipitation = rainSum + snowSum
+
+	// weather comes from the middle slot, as the route always has, and the legacy
+	// condition, description and icon are that same entry rather than a second read
+	// of it.
+	day.Weather = slots[len(slots)/2].Weather
+	if len(day.Weather) > 0 {
+		day.Condition = day.Weather[0].Main
+		day.Description = strings.Title(day.Weather[0].Description)
+		day.Icon = day.Weather[0].Icon
+	}
+
+	// uv_index and uvi stay null: the three hour endpoint reports no uvi, and the
+	// decode struct has no field that could hold one.
+	return day
 }
 
 // currentFromForecast maps the nearest forecast slot onto our model. The 5 day
@@ -540,65 +831,5 @@ func currentFromForecast(items []models.ForecastItem) models.Current {
 		MinTemp:       nearest.Main.TempMin,
 		CloudCover:    nearest.Clouds.All,
 		LastUpdated:   time.Unix(nearest.Dt, 0),
-	}
-}
-
-// calculateDailyForecast calculates daily forecast from 3-hour intervals
-func (w *WeatherService) calculateDailyForecast(dateStr string, items []models.ForecastItem) models.Forecast {
-	date, _ := time.Parse("2006-01-02", dateStr)
-
-	if len(items) == 0 {
-		return models.Forecast{Date: date}
-	}
-
-	var minTemp, maxTemp, avgTemp, totalTemp float64
-	var totalHumidity, totalWind float64
-	var condition, description, icon string
-	var precipitation float64
-
-	minTemp = items[0].Main.TempMin
-	maxTemp = items[0].Main.TempMax
-
-	for i, item := range items {
-		if item.Main.TempMin < minTemp {
-			minTemp = item.Main.TempMin
-		}
-		if item.Main.TempMax > maxTemp {
-			maxTemp = item.Main.TempMax
-		}
-
-		totalTemp += item.Main.Temp
-		totalHumidity += float64(item.Main.Humidity)
-		totalWind += item.Wind.Speed
-
-		if item.Rain.ThreeHour > 0 {
-			precipitation += item.Rain.ThreeHour
-		}
-		if item.Snow.ThreeHour > 0 {
-			precipitation += item.Snow.ThreeHour
-		}
-
-		// Use the middle of the day for main condition
-		if i == len(items)/2 && len(item.Weather) > 0 {
-			condition = item.Weather[0].Main
-			description = item.Weather[0].Description
-			icon = item.Weather[0].Icon
-		}
-	}
-
-	count := float64(len(items))
-	avgTemp = totalTemp / count
-
-	return models.Forecast{
-		Date:          date,
-		MaxTemp:       maxTemp,
-		MinTemp:       minTemp,
-		AvgTemp:       avgTemp,
-		Condition:     condition,
-		Description:   strings.Title(description),
-		Icon:          icon,
-		Humidity:      int(totalHumidity / count),
-		WindSpeed:     totalWind / count,
-		Precipitation: precipitation,
 	}
 }
