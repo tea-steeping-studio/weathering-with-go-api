@@ -54,7 +54,7 @@ func NewWeatherService(apiKey string) *WeatherService {
 }
 
 // GetCurrentWeather fetches current weather data for a given location
-func (w *WeatherService) GetCurrentWeather(location, units, apikey string) (*models.WeatherData, bool, error) {
+func (w *WeatherService) GetCurrentWeather(location, units, apikey string) (*models.CurrentWeatherResponse, bool, error) {
 	if location == "" {
 		return nil, false, fmt.Errorf("location cannot be empty")
 	}
@@ -64,12 +64,44 @@ func (w *WeatherService) GetCurrentWeather(location, units, apikey string) (*mod
 	}
 
 	key := weatherCacheKey(apikey, currentCacheEndpoint, location, units, 0)
-	return cachedFetchTracked(w, key, func() (*models.WeatherData, error) {
+	return cachedFetchTracked(w, key, func() (*models.CurrentWeatherResponse, error) {
 		return w.fetchCurrentWeather(location, units, apikey)
 	})
 }
 
-func (w *WeatherService) fetchCurrentWeather(location, units, apikey string) (*models.WeatherData, error) {
+// currentOptional is a second, pointer-shaped view of the /data/2.5/weather body.
+// The upstream structs in models are non-pointer decode targets, so a member the
+// upstream measured as 0 is indistinguishable there from one it never sent, and
+// the response has to tell the two apart. Decoding the same bytes twice is the
+// cheapest way to recover which members were actually present.
+type currentOptional struct {
+	Main currentOptionalMain    `json:"main"`
+	Wind currentOptionalWind    `json:"wind"`
+	Rain *currentOptionalPrecip `json:"rain"`
+	Snow *currentOptionalPrecip `json:"snow"`
+	// timezone is documented for this endpoint but has no field on
+	// models.OpenWeatherMapResponse, so it is bound here.
+	Timezone *int `json:"timezone"`
+}
+
+type currentOptionalMain struct {
+	SeaLevel  *int     `json:"sea_level"`
+	GrndLevel *int     `json:"grnd_level"`
+	TempKF    *float64 `json:"temp_kf"`
+}
+
+type currentOptionalWind struct {
+	Gust *float64 `json:"gust"`
+}
+
+// currentOptionalPrecip covers the 1h window both rain and snow report on this
+// endpoint. A nil block means upstream sent no block at all, which is not the
+// same as a block whose window measures 0.
+type currentOptionalPrecip struct {
+	OneHour *float64 `json:"1h"`
+}
+
+func (w *WeatherService) fetchCurrentWeather(location, units, apikey string) (*models.CurrentWeatherResponse, error) {
 	// Build URL
 	endpoint := fmt.Sprintf("%s%s", OpenWeatherMapBaseURL, CurrentWeatherEndpoint)
 	params := url.Values{}
@@ -92,14 +124,27 @@ func (w *WeatherService) fetchCurrentWeather(location, units, apikey string) (*m
 		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
+	// Read the body once and decode it twice: once into the upstream structs and
+	// once into the pointer view of the members they cannot express. This is one
+	// upstream request, not two.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse API response: %w", err)
+	}
+
 	// Parse response
 	var owmResp models.OpenWeatherMapResponse
-	if err := json.NewDecoder(resp.Body).Decode(&owmResp); err != nil {
+	if err := json.Unmarshal(body, &owmResp); err != nil {
+		return nil, fmt.Errorf("failed to parse API response: %w", err)
+	}
+
+	var optional currentOptional
+	if err := json.Unmarshal(body, &optional); err != nil {
 		return nil, fmt.Errorf("failed to parse API response: %w", err)
 	}
 
 	// Convert to our internal model
-	weatherData := w.convertCurrentWeatherResponse(owmResp)
+	weatherData := w.mapCurrentWeather(owmResp, optional)
 	return weatherData, nil
 }
 
@@ -331,8 +376,18 @@ func (w *WeatherService) resolveAPIKey(apikey string) string {
 	return w.APIKey
 }
 
-// convertCurrentWeatherResponse converts OpenWeatherMap response to our internal model
-func (w *WeatherService) convertCurrentWeatherResponse(owm models.OpenWeatherMapResponse) *models.WeatherData {
+// mapCurrentWeather builds the current route's response: a faithful mirror of
+// the /data/2.5/weather schema plus the legacy vocabulary. Both are assigned in
+// one struct literal from the same locals, so a legacy key cannot drift away from
+// the faithful value it aliases.
+//
+// A rain or snow block the upstream omitted is nil; a block whose window measures
+// 0 keeps that 0. The legacy blocks keep their own omitempty, so an absent gust
+// stays absent in current.wind_gust while the faithful wind.gust reports it null.
+// The legacy current block's max_temperature and min_temperature stay at 0, as
+// they have always been on this route: changing them is a change to the legacy
+// vocabulary, not a faithfulness fix.
+func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, optional currentOptional) *models.CurrentWeatherResponse {
 	var condition, description, icon string
 	if len(owm.Weather) > 0 {
 		condition = owm.Weather[0].Main
@@ -340,27 +395,84 @@ func (w *WeatherService) convertCurrentWeatherResponse(owm models.OpenWeatherMap
 		icon = owm.Weather[0].Icon
 	}
 
-	return &models.WeatherData{
+	name := owm.Name
+	country := owm.Sys.Country
+	lat, lon := owm.Coord.Lat, owm.Coord.Lon
+	temp, feelsLike := owm.Main.Temp, owm.Main.FeelsLike
+	tempMin, tempMax := owm.Main.TempMin, owm.Main.TempMax
+	pressure, humidity := owm.Main.Pressure, owm.Main.Humidity
+	visibility := owm.Visibility
+	speed, deg, gust := owm.Wind.Speed, owm.Wind.Deg, owm.Wind.Gust
+	cloudCover := owm.Clouds.All
+	dt := owm.Dt
+	sysType, sysID := owm.Sys.Type, owm.Sys.ID
+	sunrise, sunset := owm.Sys.Sunrise, owm.Sys.Sunset
+
+	var rain *models.RainBlock
+	if optional.Rain != nil {
+		rain = &models.RainBlock{OneHour: optional.Rain.OneHour}
+	}
+	var snow *models.SnowBlock
+	if optional.Snow != nil {
+		snow = &models.SnowBlock{OneHour: optional.Snow.OneHour}
+	}
+
+	return &models.CurrentWeatherResponse{
+		Coord:   models.Coordinates{Lon: lon, Lat: lat},
+		Weather: owm.Weather,
+		Base:    owm.Base,
+		Main: &models.MainBlock{
+			Temp:      &temp,
+			FeelsLike: &feelsLike,
+			TempMin:   &tempMin,
+			TempMax:   &tempMax,
+			Pressure:  &pressure,
+			Humidity:  &humidity,
+			SeaLevel:  optional.Main.SeaLevel,
+			GrndLevel: optional.Main.GrndLevel,
+			TempKF:    optional.Main.TempKF,
+		},
+		Visibility: visibility,
+		Wind: &models.WindBlock{
+			Speed: &speed,
+			Deg:   &deg,
+			Gust:  optional.Wind.Gust,
+		},
+		Clouds: &models.CloudsBlock{All: &cloudCover},
+		Rain:   rain,
+		Snow:   snow,
+		Dt:     dt,
+		Sys: &models.SysBlock{
+			Type:    &sysType,
+			ID:      &sysID,
+			Country: &country,
+			Sunrise: &sunrise,
+			Sunset:  &sunset,
+		},
+		ID:       owm.ID,
+		Timezone: optional.Timezone,
+		Name:     name,
+		Cod:      owm.Cod,
 		Location: models.Location{
-			Name:      owm.Name,
-			Country:   owm.Sys.Country,
-			Latitude:  owm.Coord.Lat,
-			Longitude: owm.Coord.Lon,
+			Name:      name,
+			Country:   country,
+			Latitude:  lat,
+			Longitude: lon,
 		},
 		Current: models.Current{
-			Temperature:   owm.Main.Temp,
-			FeelsLike:     owm.Main.FeelsLike,
-			Humidity:      owm.Main.Humidity,
-			Pressure:      float64(owm.Main.Pressure),
-			WindSpeed:     owm.Wind.Speed,
-			WindDirection: owm.Wind.Deg,
-			WindGust:      owm.Wind.Gust,
-			Visibility:    float64(owm.Visibility),
+			Temperature:   temp,
+			FeelsLike:     feelsLike,
+			Humidity:      humidity,
+			Pressure:      float64(pressure),
+			WindSpeed:     speed,
+			WindDirection: deg,
+			WindGust:      gust,
+			Visibility:    float64(visibility),
 			Condition:     condition,
 			Description:   strings.Title(description),
 			Icon:          icon,
-			CloudCover:    owm.Clouds.All,
-			LastUpdated:   time.Unix(owm.Dt, 0),
+			CloudCover:    cloudCover,
+			LastUpdated:   time.Unix(dt, 0),
 		},
 		RequestTime: w.now(),
 	}
