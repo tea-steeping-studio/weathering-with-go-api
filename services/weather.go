@@ -725,7 +725,8 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 	}
 
 	if tempSeen {
-		day.AvgTemp = tempSum / float64(tempCount)
+		avgTemp := tempSum / float64(tempCount)
+		day.AvgTemp = &avgTemp
 		// Derived, not measured: the extremes of the day's slot temperatures. A
 		// slot's own main.temp_min and main.temp_max are a different measurement, the
 		// upstream's own three hour window, and the two are not interchangeable.
@@ -733,9 +734,11 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 		// breakdown and no uvi, so those members stay null.
 		day.Temp = &models.TempPoint{Min: &tempMin, Max: &tempMax}
 		// The legacy aliases of the same two numbers, so a consumer of the old
-		// response and a reader of the faithful one never see different values.
-		day.MinTemp = tempMin
-		day.MaxTemp = tempMax
+		// response and a reader of the faithful one never see different values. They
+		// are pointers, so a day whose slots reported no main block reports all three
+		// as null rather than as three zeroes beside a null temp.
+		day.MinTemp = &tempMin
+		day.MaxTemp = &tempMax
 	}
 
 	if humidityCount > 0 {
@@ -753,28 +756,32 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 	if gustSeen {
 		day.WindGust = &gustMax
 	}
-	// clouds, visibility and pressure are integer keys, so their means are truncated
-	// the same way humidity is. wind_speed stays a float mean, unrounded, which is
-	// the legacy value unchanged.
+	// clouds, visibility and pressure round their means; humidity truncates. The
+	// three have no legacy counterpart, so nothing constrains them and the nearest
+	// integer is the honest answer, while humidity's legacy field is an int that has
+	// always truncated and changing it would move a number consumers already read for
+	// no accuracy. See the ForecastDay doc. wind_speed stays a float mean, unrounded,
+	// which is the legacy value unchanged.
 	if cloudCount > 0 {
-		clouds := int(cloudSum / float64(cloudCount))
+		clouds := int(math.Round(cloudSum / float64(cloudCount)))
 		day.Clouds = &clouds
 	}
 	if visibilityCount > 0 {
-		visibility := int(visibilitySum / float64(visibilityCount))
+		visibility := int(math.Round(visibilitySum / float64(visibilityCount)))
 		day.Visibility = &visibility
 	}
 	if pressureCount > 0 {
-		pressure := int(pressureSum / float64(pressureCount))
+		pressure := int(math.Round(pressureSum / float64(pressureCount)))
 		day.Pressure = &pressure
 	}
 
 	if popSeen {
-		// The mean of the fractional probabilities, not of their percentages, and
-		// rounded to four places so the mean of 0.1, 0.8, 0.3 and 0.2 is reported as
-		// 0.35 rather than as 0.35000000000000003. Every slot with no pop is excluded
-		// from all three, so a day is not diluted by slots nobody measured.
-		popMean := math.Round(popSum/float64(popCount)*10000) / 10000
+		// The mean of the fractional probabilities, not of their percentages, and the
+		// raw arithmetic mean: quantising it to four places would report a mean of one
+		// third as 0.3333, which is a small lie about precision in the one number this
+		// route exists to get right. Every slot with no pop is excluded from all three,
+		// so a day is not diluted by slots nobody measured.
+		popMean := popSum / float64(popCount)
 		day.Pop = &popMax
 		day.PopMin = &popMin
 		day.PopMean = &popMean

@@ -276,24 +276,38 @@ type ForecastSlot struct {
 // been. WindSpeed is the day's mean, which is what legacy Forecast.WindSpeed has
 // always been. Their JSON is byte identical to the response this type replaces.
 //
-// MaxTemp, MinTemp and AvgTemp are value fields because the route always produces
-// them. ChanceOfRain, UVIndex and Pressure are pointers because it does not: no
-// slot carrying pop leaves chance_of_rain null rather than reporting a fabricated
-// zero, the three hour endpoint reports no uvi at all, and a day whose slots
-// reported no main block has no pressure to average.
+// Every numeric key here is a pointer, precipitation excepted and explained below,
+// because the route cannot always produce one: a day whose slots reported no main
+// block has no temperature to report, and three fabricated zeroes beside a null temp
+// block is worse than saying so. For a real body the JSON is byte identical, because
+// a non-nil pointer to a value serialises as that value.
+//
+// ChanceOfRain is null when no slot carried pop, UVIndex is always null because the
+// three hour endpoint reports no uvi, and Pressure is null when no slot carried a
+// main block.
 type ForecastDay struct {
-	Date          time.Time `json:"date"`
-	MaxTemp       float64   `json:"max_temperature"`
-	MinTemp       float64   `json:"min_temperature"`
-	AvgTemp       float64   `json:"avg_temperature"`
-	Condition     string    `json:"condition"`
-	Description   string    `json:"description"`
-	Icon          string    `json:"icon"`
-	Humidity      *int      `json:"humidity"`
-	WindSpeed     *float64  `json:"wind_speed"`
-	Precipitation float64   `json:"precipitation"`
-	ChanceOfRain  *int      `json:"chance_of_rain"`
-	UVIndex       *float64  `json:"uv_index"`
+	Date        time.Time `json:"date"`
+	MaxTemp     *float64  `json:"max_temperature"`
+	MinTemp     *float64  `json:"min_temperature"`
+	AvgTemp     *float64  `json:"avg_temperature"`
+	Condition   string    `json:"condition"`
+	Description string    `json:"description"`
+	Icon        string    `json:"icon"`
+	// Humidity truncates its daily mean while Pressure, Clouds and Visibility round
+	// theirs, and the split is deliberate. Humidity's legacy counterpart is an int
+	// field that has always truncated, so rounding it would change a number existing
+	// consumers already read and buy no accuracy: a mean of 67.5 percent is 67 either
+	// way as far as a legacy int key is concerned. The other three have no legacy
+	// counterpart, so nothing constrains them and they carry the nearest integer.
+	//
+	// Precipitation is the one numeric key that stays a value: a total of zero is a
+	// real answer for a day nothing fell on, not an absence, and the legacy key has
+	// always been a number.
+	Humidity      *int     `json:"humidity"`
+	WindSpeed     *float64 `json:"wind_speed"`
+	Precipitation float64  `json:"precipitation"`
+	ChanceOfRain  *int     `json:"chance_of_rain"`
+	UVIndex       *float64 `json:"uv_index"`
 
 	// Pop is the highest probability any slot of the day reported, PopMin the
 	// lowest and PopMean the mean of the slots that carried one. All three are null

@@ -3,7 +3,6 @@ package services
 import (
 	"encoding/json"
 	"math"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -100,19 +99,16 @@ func assertClose(t *testing.T, what string, got, want float64) {
 // one day on every host, whatever the test process's own zone happens to be.
 var forecastUTCMidnight = time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
 
-// popSlots renders a day of three hour slots, carrying only dt and the members a pop
-// test names. Index i of pops is the offset from the anchor in three hour steps, so
-// a missing index is a slot the upstream sent no pop for.
-func popSlots(t *testing.T, at time.Time, pops map[int]float64) string {
+// popSlots renders a day of count three hour slots, carrying only dt and the members
+// a pop test names. The slot count and the pop map are separate arguments on purpose:
+// index i of pops is the slot that carries pop, so omitting an index leaves a slot
+// the upstream measured no probability for instead of removing the slot. A helper
+// that emitted one slot per pop could not express that day at all, which is how the
+// rule this task exists to implement went untested.
+func popSlots(t *testing.T, at time.Time, count int, pops map[int]float64) string {
 	t.Helper()
-	indexes := make([]int, 0, len(pops))
-	for i := range pops {
-		indexes = append(indexes, i)
-	}
-	sort.Ints(indexes)
-
-	slots := make([]string, 0, len(indexes))
-	for _, i := range indexes {
+	slots := make([]string, 0, count)
+	for i := range count {
 		slot := map[string]any{"dt": at.Add(time.Duration(3*i) * time.Hour).Unix()}
 		if pop, ok := pops[i]; ok {
 			slot["pop"] = pop
@@ -123,7 +119,7 @@ func popSlots(t *testing.T, at time.Time, pops map[int]float64) string {
 }
 
 func TestDailyPopIsMaxAcrossSlots(t *testing.T) {
-	body := popSlots(t, forecastUTCMidnight, map[int]float64{0: 0.1, 1: 0.8, 2: 0.3, 3: 0.2})
+	body := popSlots(t, forecastUTCMidnight, 4, map[int]float64{0: 0.1, 1: 0.8, 2: 0.3, 3: 0.2})
 
 	day := mapForecastBody(t, body, 5).Forecast[0]
 
@@ -141,11 +137,21 @@ func TestDailyPopIsMaxAcrossSlots(t *testing.T) {
 	assertClose(t, "the day pop_mean", *day.PopMean, 0.35)
 }
 
+// The day genuinely has four slots and only two of them carry pop, so a mean
+// divided by every slot would answer 0.35 rather than 0.7 and the exclusion rule
+// would be caught. The fixture asserts the day really did carry all four, so this
+// cannot quietly go back to a two slot day.
 func TestDailyPopIgnoresSlotsWithoutPop(t *testing.T) {
-	body := popSlots(t, forecastUTCMidnight, map[int]float64{0: 0.5, 2: 0.9})
+	body := popSlots(t, forecastUTCMidnight, 4, map[int]float64{0: 0.5, 2: 0.9})
 
 	day := mapForecastBody(t, body, 5).Forecast[0]
 
+	if len(day.Hourly) != 4 {
+		t.Fatalf("expected the day to carry all 4 slots, got %d", len(day.Hourly))
+	}
+	if day.Hourly[1].Pop != nil || day.Hourly[3].Pop != nil {
+		t.Fatalf("expected slots 1 and 3 to report no pop, got %v and %v", day.Hourly[1].Pop, day.Hourly[3].Pop)
+	}
 	if day.Pop == nil {
 		t.Fatal("expected a day pop, got none")
 	}
@@ -157,8 +163,8 @@ func TestDailyPopIgnoresSlotsWithoutPop(t *testing.T) {
 	if day.PopMean == nil {
 		t.Fatal("expected a day pop_mean, got none")
 	}
-	// The two slots with no pop are excluded from the mean rather than counted as
-	// zero, which would have diluted it to 0.35.
+	// The two pop-less slots are excluded from the mean rather than counted as zero,
+	// which would have diluted it to 0.35.
 	assertClose(t, "the day pop_mean", *day.PopMean, 0.7)
 }
 
@@ -177,7 +183,7 @@ func TestLegacyChanceOfRainMatchesDailyPop(t *testing.T) {
 		{pop: 0.425, want: 43},
 		{pop: 0.0, want: 0},
 	} {
-		body := popSlots(t, forecastUTCMidnight, map[int]float64{0: tc.pop})
+		body := popSlots(t, forecastUTCMidnight, 1, map[int]float64{0: tc.pop})
 
 		day := mapForecastBody(t, body, 5).Forecast[0]
 
@@ -261,6 +267,14 @@ func TestForecastDayHasNoTimeOfDayBreakdown(t *testing.T) {
 // anything this process's own zone would format them as, so the test fails if the
 // .UTC() in the grouping is removed and the suite is run anywhere but UTC.
 func TestForecastDayGroupsSlotsAcrossUtcMidnight(t *testing.T) {
+	// Pin the process zone to a non-zero offset so this test bites on every host,
+	// including the UTC hosts CI runs, where removing the .UTC() from the grouping is
+	// otherwise a semantic no-op and nothing can detect it. Restored on the way out,
+	// and safe because no test in this package runs in parallel.
+	original := time.Local
+	time.Local = time.FixedZone("forecast-test", 3600)
+	t.Cleanup(func() { time.Local = original })
+
 	late := time.Date(2026, 2, 1, 23, 0, 0, 0, time.UTC)
 	slots := []string{
 		mustSlotJSON(t, map[string]any{"dt": late.Unix(), "main": map[string]any{"temp": 4.0}}),
@@ -333,13 +347,15 @@ func TestForecastDayRollsUpSlotMeans(t *testing.T) {
 	if full.Humidity == nil || full.Pressure == nil || full.Clouds == nil || full.Visibility == nil || full.WindSpeed == nil {
 		t.Fatalf("expected every mean to be reported when both slots carry it, got %+v", full)
 	}
-	// Integer means truncate: (1012+1011)/2 is 1011.5 and (70+65)/2 is 67.5, which
-	// is the value the legacy humidity key has always reported.
-	if *full.Pressure != 1011 {
-		t.Fatalf("expected the day pressure mean 1011, got %d", *full.Pressure)
+	// Both means land on a half here, so this fixture is where the rounding policy
+	// shows: pressure rounds to 1012 and clouds and visibility have no legacy
+	// counterpart to constrain them, while humidity truncates to 67 because its legacy
+	// field is an int that has always truncated.
+	if *full.Pressure != 1012 {
+		t.Fatalf("expected the day pressure mean rounded to 1012, got %d", *full.Pressure)
 	}
 	if *full.Humidity != 67 {
-		t.Fatalf("expected the day humidity mean 67, got %d", *full.Humidity)
+		t.Fatalf("expected the day humidity mean truncated to 67, got %d", *full.Humidity)
 	}
 	if *full.Clouds != 40 || *full.Visibility != 9500 {
 		t.Fatalf("expected the day cloud and visibility means 40 and 9500, got %d and %d", *full.Clouds, *full.Visibility)
@@ -373,6 +389,94 @@ func TestForecastDayRollsUpSlotMeans(t *testing.T) {
 	if partial.WindSpeed != nil || partial.WindDeg != nil || partial.WindGust != nil {
 		t.Fatalf("expected no wind rollup when no slot reported wind, got %+v", partial)
 	}
+}
+
+// The day's rain and snow are sums of the slots' 3h windows, and the four states
+// have to stay apart: a sum, a measured zero, a block the upstream sent with no
+// window in it, and no block at all.
+func TestForecastDaySumsSlotPrecipitation(t *testing.T) {
+	slotAt := func(i int, members map[string]any) string {
+		members["dt"] = forecastUTCMidnight.Add(time.Duration(3*i) * time.Hour).Unix()
+		return mustSlotJSON(t, members)
+	}
+
+	summed := mapForecastBody(t, forecastBody(t,
+		slotAt(0, map[string]any{"rain": map[string]any{"3h": 1.2}}),
+		slotAt(1, map[string]any{"rain": map[string]any{"3h": 0.4}, "snow": map[string]any{"3h": 0.2}}),
+		slotAt(2, map[string]any{}),
+	), 5).Forecast[0]
+
+	if summed.Rain == nil || summed.Rain.ThreeHour == nil {
+		t.Fatalf("expected a day rain sum, got %#v", summed.Rain)
+	}
+	assertClose(t, "the day rain sum", *summed.Rain.ThreeHour, 1.6)
+	if summed.Snow == nil || summed.Snow.ThreeHour == nil {
+		t.Fatalf("expected a day snow sum, got %#v", summed.Snow)
+	}
+	assertClose(t, "the day snow sum", *summed.Snow.ThreeHour, 0.2)
+	// The legacy total is the same two sums as one number, so it can never disagree
+	// with the faithful pair.
+	assertClose(t, "the legacy precipitation", summed.Precipitation, 1.8)
+
+	// A window the upstream measured as 0 is a reading: the block is present and the
+	// day is 0, not null.
+	measuredZero := mapForecastBody(t, forecastBody(t,
+		slotAt(0, map[string]any{"rain": map[string]any{"3h": 0}}),
+	), 5).Forecast[0]
+	if measuredZero.Rain == nil || measuredZero.Rain.ThreeHour == nil {
+		t.Fatalf("expected a rain block for a measured zero, got %#v", measuredZero.Rain)
+	}
+	assertClose(t, "a measured zero day rain", *measuredZero.Rain.ThreeHour, 0.0)
+	if measuredZero.Snow != nil {
+		t.Fatalf("expected no snow block when no slot reported snow, got %#v", measuredZero.Snow)
+	}
+	assertClose(t, "the legacy precipitation for a measured zero", measuredZero.Precipitation, 0.0)
+
+	// A block the upstream sent with no window in it stays three states apart on the
+	// slot: the block is present and its window is null. The day is null, because a
+	// slot that reported no window contributes nothing to a sum of windows and there
+	// is no total to report.
+	emptyWindow := mapForecastBody(t, forecastBody(t,
+		slotAt(0, map[string]any{"rain": map[string]any{}}),
+	), 5).Forecast[0]
+	if len(emptyWindow.Hourly) != 1 {
+		t.Fatalf("expected 1 slot, got %d", len(emptyWindow.Hourly))
+	}
+	if slot := emptyWindow.Hourly[0]; slot.Rain == nil {
+		t.Fatal("expected a rain block on the slot for an upstream sent empty block, got none")
+	} else if slot.Rain.ThreeHour != nil {
+		t.Fatalf("expected a null window on the slot, got %v", *slot.Rain.ThreeHour)
+	}
+	if emptyWindow.Rain != nil {
+		t.Fatalf("expected no day rain sum when no slot reported a window, got %#v", emptyWindow.Rain)
+	}
+
+	// No slot reported precipitation at all: both faithful blocks are null, and the
+	// legacy total is a real zero rather than a null.
+	unreported := mapForecastBody(t, forecastBody(t,
+		slotAt(0, map[string]any{}),
+		slotAt(1, map[string]any{}),
+	), 5).Forecast[0]
+	if unreported.Rain != nil || unreported.Snow != nil {
+		t.Fatalf("expected no day precipitation blocks, got %#v and %#v", unreported.Rain, unreported.Snow)
+	}
+	assertClose(t, "the legacy precipitation for an unreported day", unreported.Precipitation, 0.0)
+}
+
+// pop_mean is the raw arithmetic mean, not a value quantised to a fixed number of
+// decimal places. The three probabilities here sum to 0.4 over three slots, so the
+// mean is a repeating decimal; reporting 0.1333 for it would be a small lie about
+// precision in the one number this route exists to get right, and a tolerance based
+// assertion is what catches that rather than hiding it.
+func TestDailyPopMeanIsNotQuantised(t *testing.T) {
+	body := popSlots(t, forecastUTCMidnight, 3, map[int]float64{0: 0.1, 1: 0.1, 2: 0.2})
+
+	day := mapForecastBody(t, body, 5).Forecast[0]
+
+	if day.PopMean == nil {
+		t.Fatal("expected a day pop_mean, got none")
+	}
+	assertClose(t, "the day pop_mean", *day.PopMean, 0.4/3.0)
 }
 
 func TestMapForecastPopulatesCurrent(t *testing.T) {
@@ -441,6 +545,13 @@ func TestMapForecastWithoutAPayloadStillRollsUpDays(t *testing.T) {
 	day := data.Forecast[0]
 	if day.Temp != nil {
 		t.Fatalf("expected no temp block when no slot reported a main block, got %#v", day.Temp)
+	}
+	// The legacy aliases are null in the same case. As value fields they reported
+	// three fabricated zeroes beside a null temp block, which is the one combination
+	// of an absent reading and an invented number this project exists to remove.
+	if day.MaxTemp != nil || day.MinTemp != nil || day.AvgTemp != nil {
+		t.Fatalf("expected null legacy temperatures when no slot reported a main block, got max %v, min %v, avg %v",
+			day.MaxTemp, day.MinTemp, day.AvgTemp)
 	}
 	if day.Humidity != nil || day.WindSpeed != nil || day.Clouds != nil || day.Visibility != nil {
 		t.Fatalf("expected a mean over no members to be null, got %+v", day)

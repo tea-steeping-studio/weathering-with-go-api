@@ -373,6 +373,24 @@ func TestForecastRouteReportsMeasuredZeroRain(t *testing.T) {
 		t.Fatalf("expected no 1h key on a forecast rain block, got %#v", value)
 	}
 	nullKey(t, slots[1], "rain")
+
+	// The day repeats the distinction. A slot that measured a zero gives a day
+	// window of zero, and no snow was reported, so the day's snow block is null
+	// rather than a block of zeroes.
+	day := days[0]
+	dayRain := block(t, day, "rain")
+	if dayRain["3h"] != 0.0 {
+		t.Fatalf("expected a day rain sum of 0, got %#v", dayRain["3h"])
+	}
+	if value, ok := dayRain["1h"]; ok {
+		t.Fatalf("expected no 1h key on the day's rain, got %#v", value)
+	}
+	nullKey(t, day, "snow")
+	// The legacy total is the sum of the two, so a measured zero is a real 0 and
+	// never a null: the day did have an answer.
+	if day["precipitation"] != 0.0 {
+		t.Fatalf("expected the legacy precipitation 0, got %#v", day["precipitation"])
+	}
 }
 
 func TestForecastHandlerReturnsCurrentData(t *testing.T) {
