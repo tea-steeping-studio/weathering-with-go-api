@@ -233,12 +233,12 @@ Abridged: the `hourly` array of each day — the raw three-hour slots behind the
 here. See [Derived daily values on /weather/forecast](#derived-daily-values-on-weatherforecast).
 
 The `current` block on this route is derived from the first three-hour slot of the same upstream
-response, so it costs no extra OpenWeatherMap call. Two consequences: it is a slot's readings rather
-than a live observation, so `last_updated` is that slot's timestamp and can sit either side of
-`request_time` (this example's is 90 minutes ahead, because `list` starts at the next three-hour
-boundary); and its `max_temperature` and `min_temperature` are that slot's own `main.temp_max` and
-`main.temp_min`, which OpenWeatherMap documents as extremes in the city at the moment of calculation
-rather than the day's extremes. Use `/weather/current` when you need a live reading.
+response, so it costs no extra OpenWeatherMap call. Two consequences: it is a forecast slot's readings
+rather than a live observation, so `last_updated` marks that slot and sits *ahead* of `request_time`
+by up to three hours (90 minutes in this example) rather than behind it; and its `max_temperature` and
+`min_temperature` are that slot's own `main.temp_max` and `main.temp_min`, which OpenWeatherMap
+documents as extremes in the city at the moment of calculation rather than the day's extremes. Use
+`/weather/current` when you need a live reading.
 
 #### POST /weather/forecast
 Get weather forecast using JSON request body.
@@ -543,10 +543,10 @@ current.
 
 `/forecast` is. Its block comes from the first three-hour slot of the forecast payload, not from a
 second upstream call, which is why the route cannot also be reporting live conditions. `last_updated`
-is that slot's timestamp, and it can sit on either side of `request_time`: OpenWeatherMap's `list`
-starts at the *next* three-hour boundary, so shortly after an hour boundary `list[0]` is in the future
-by up to three hours, and shortly before one it can be an hour or more old. Read it as "this is the
-slot this reading came from", not as an age.
+is that slot's timestamp, and it marks the forecast slot rather than an observation. Because OpenWeatherMap's
+`list` starts at the *next* three-hour boundary, the slot sits ahead of `request_time` rather than
+behind it — never stale, and by up to three hours. Read it as "this is the slot these readings came
+from", not as an age.
 
 ### Breaking changes
 
