@@ -165,20 +165,28 @@ const oneCallOptInBlocks = `,"minutely":[{"dt":1772000060,"precipitation":0.12}]
 // mustOneCallBody renders a whole /data/3.0/onecall body around rendered days. An
 // empty current block leaves the member out of the body entirely, which is how a
 // fixture says the upstream sent no current conditions at all, as distinct from
-// sending a current block with members missing from it.
-func mustOneCallBody(t *testing.T, current string, days []string) string {
+// sending a current block with members missing from it. The opt-in blocks are a
+// parameter for the same reason: an empty string is a body with no minutely, hourly or
+// alerts key, which is different from one carrying empty arrays.
+func mustOneCallBody(t *testing.T, current, optIn string, days []string) string {
 	t.Helper()
 	body := `{"lat":51.5074,"lon":-0.1278,"timezone":"Europe/London","timezone_offset":0,`
 	if current != "" {
 		body += `"current":` + current + `,`
 	}
-	return body + `"daily":[` + strings.Join(days, ",") + `]` + oneCallOptInBlocks + `}`
+	return body + `"daily":[` + strings.Join(days, ",") + `]` + optIn + `}`
 }
 
 // sevenDayRouteFullJSON carries sevenDayRouteDayCount days with every member the
 // One Call daily block documents, so the faithful mirror has something to mirror.
-// Day i is offset by i on every reading, so a test can tell one day from another.
 func sevenDayRouteFullJSON(t *testing.T) string {
+	t.Helper()
+	return mustOneCallBody(t, oneCallCurrentBlock, oneCallOptInBlocks, sevenDayRouteDays(t))
+}
+
+// sevenDayRouteDays renders those days. Day i is offset by i on every reading, so a
+// test can tell one day from another.
+func sevenDayRouteDays(t *testing.T) []string {
 	t.Helper()
 	days := make([]string, 0, sevenDayRouteDayCount)
 	for i := range sevenDayRouteDayCount {
@@ -211,7 +219,7 @@ func sevenDayRouteFullJSON(t *testing.T) string {
 		}
 		days = append(days, string(rendered))
 	}
-	return mustOneCallBody(t, oneCallCurrentBlock, days)
+	return days
 }
 
 // sevenDayRouteSparseDayJSON is the pair of states the faithful mirror has to keep
@@ -240,7 +248,7 @@ func sevenDayRouteSparseDayJSON(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("failed to render the zero rain day fixture: %v", err)
 	}
-	return mustOneCallBody(t, oneCallCurrentBlock, []string{string(sparse), string(zeroRain)})
+	return mustOneCallBody(t, oneCallCurrentBlock, oneCallOptInBlocks, []string{string(sparse), string(zeroRain)})
 }
 
 // sevenDayRouteNoCurrentJSON is a body whose current block is missing entirely. The
@@ -265,7 +273,7 @@ func sevenDayRouteNoCurrentJSON(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("failed to render the no current fixture: %v", err)
 	}
-	return mustOneCallBody(t, "", []string{string(day)})
+	return mustOneCallBody(t, "", oneCallOptInBlocks, []string{string(day)})
 }
 
 // newSevenDayRouteRouter serves one fixed upstream body to the seven day route, so
@@ -297,6 +305,13 @@ func newSevenDayRouteRouter(t *testing.T, upstream string) *gin.Engine {
 	router := gin.New()
 	router.GET("/api/v1/weather/forecast/7day", NewWeatherHandler(svc).GetSevenDayForecast)
 	return router
+}
+
+// requestSevenDayRouteBody serves one body to a throwaway router and returns the data
+// object, for a test that builds its body inline.
+func requestSevenDayRouteBody(t *testing.T, body string) map[string]any {
+	t.Helper()
+	return requestSevenDayRoute(t, newSevenDayRouteRouter(t, body))
 }
 
 // requestSevenDayRoute returns the whole data object, so a test can read the
@@ -1024,11 +1039,10 @@ func TestSevenDayRouteNullsUnmeasurableDailyMembers(t *testing.T) {
 	} {
 		nullKey(t, legacySparse, name)
 	}
-	// A total of zero is a reading rather than an absence, so precipitation stays a
-	// number: nothing fell, and that is an answer.
-	if legacySparse["precipitation"] != 0.0 {
-		t.Fatalf("expected a legacy precipitation of 0 for a day with no precipitation, got %#v", legacySparse["precipitation"])
-	}
+	// Nothing fell on day 0 and the upstream reported no volume, so there is no total
+	// and the key is null: 0 here would claim a measurement nobody made, and it would
+	// sit beside a faithful rain and snow that are both null.
+	nullKey(t, legacySparse, "precipitation")
 
 	// Day 1 measured a rain volume of 0 and sent no snow, so the day repeats the
 	// difference: a measured zero and an absent member are two readings.
@@ -1042,6 +1056,58 @@ func TestSevenDayRouteNullsUnmeasurableDailyMembers(t *testing.T) {
 	nullKey(t, legacy[1], "chance_of_rain")
 	if legacy[1]["max_temperature"] != 21.0 {
 		t.Fatalf("expected day 1 max_temperature 21, got %#v", legacy[1]["max_temperature"])
+	}
+	// Day 1 did report a volume, measured as 0, so the total is a real 0 rather than a
+	// null. That is the pair the key exists to separate: two days, one number and no
+	// reading, or a reading of nothing.
+	if legacy[1]["precipitation"] != 0.0 {
+		t.Fatalf("expected a legacy precipitation of 0 for a measured zero, got %#v", legacy[1]["precipitation"])
+	}
+}
+
+func TestSevenDayOptInBlockKeysDistinguishAbsentFromEmpty(t *testing.T) {
+	// Three states a caller has to tell apart, and a plain slice with omitempty cannot
+	// hold the middle one: nil and an empty slice are both dropped.
+	for _, tc := range []struct {
+		name    string
+		optIn   string
+		wantKey bool
+		wantLen int
+	}{
+		// The upstream sent entries.
+		{"populated", oneCallOptInBlocks, true, 1},
+		// The upstream sent "alerts":[] and nothing else. A caller that asked for
+		// alerts has to be told there are none, which is not the same as being told
+		// nothing.
+		{"empty", `,"alerts":[]`, true, 0},
+		// The upstream sent no alerts key at all, so the block is absent. This is also
+		// the state a projection produces for a block the caller did not ask for, and
+		// the response is built the same way in both cases.
+		{"absent", "", false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := requestSevenDayRouteBody(t, mustOneCallBody(t, oneCallCurrentBlock, tc.optIn, sevenDayRouteDays(t)))
+			onecall := block(t, data, "onecall")
+
+			if !tc.wantKey {
+				// Absent means no key at all, not a null one and not an empty array.
+				if value, ok := onecall["alerts"]; ok {
+					t.Fatalf("expected no alerts key, got %#v", value)
+				}
+				// The envelope itself is never absent, whatever the opt-in state is.
+				if onecall["lat"] == nil {
+					t.Fatal("expected the envelope to be reported whatever the alerts state is")
+				}
+				return
+			}
+			alerts, ok := onecall["alerts"].([]any)
+			if !ok {
+				t.Fatalf("expected an alerts array, got %#v", onecall["alerts"])
+			}
+			if len(alerts) != tc.wantLen {
+				t.Fatalf("expected %d alerts, got %d", tc.wantLen, len(alerts))
+			}
+		})
 	}
 }
 
@@ -1079,6 +1145,39 @@ func TestSevenDayLegacyCurrentAliasesFaithfulCurrent(t *testing.T) {
 	nullKey(t, legacy, "min_temperature")
 	if _, ok := current["temp_max"]; ok {
 		t.Fatalf("expected no max_temperature on the faithful current block, got %#v", current["temp_max"])
+	}
+}
+
+// last_updated is an instant rather than a calendar day, so this is not a correctness
+// question the way the legacy date is. It is a cache question: the response is cached
+// per process, and a member that renders in the server's zone means the same upstream
+// body serialises differently on two hosts, which is wrong for anything a caller
+// compares or stores.
+//
+// The three expected strings are literals derived from the three fixture timestamps
+// (1234567890 on the current fixture, 1772000000 on the other two), not from the
+// mapper's own expression. The process zone is pinned, so this fails with a .UTC()
+// removed in every zone rather than only in one that has an offset.
+func TestLastUpdatedRendersInUTCOnEveryRoute(t *testing.T) {
+	original := time.Local
+	time.Local = time.FixedZone("last-updated-test", 5*60*60)
+	t.Cleanup(func() { time.Local = original })
+
+	router := newStubbedRouter(t, &upstreamStub{})
+	for target, want := range map[string]string{
+		"/api/v1/weather/current?location=London,UK&units=metric":       "2009-02-13T23:31:30Z",
+		"/api/v1/weather/forecast?location=London,UK&units=metric":      "2026-02-25T06:13:20Z",
+		"/api/v1/weather/forecast/7day?location=London,UK&units=metric": "2026-02-25T06:13:20Z",
+	} {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: expected 200 got %d body=%s", target, w.Code, w.Body.String())
+		}
+		if got := decodeCurrent(t, w.Body)["last_updated"]; got != want {
+			t.Fatalf("%s: expected last_updated %q, got %#v", target, want, got)
+		}
 	}
 }
 

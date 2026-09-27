@@ -111,19 +111,17 @@ func TestGetSevenDayForecastReturnsSevenDays(t *testing.T) {
 	requireFloat(t, "the first max_temperature", first.MaxTemp, 20)
 	requireFloat(t, "the first min_temperature", first.MinTemp, 10)
 	requireFloat(t, "the first avg_temperature", first.AvgTemp, 15)
-	if first.Condition != "Clouds" || first.Icon != "03d" {
-		t.Fatalf("unexpected condition %+v", first)
-	}
+	requireString(t, "the first condition", first.Condition, "Clouds")
+	requireString(t, "the first icon", first.Icon, "03d")
 	requireInt(t, "chance_of_rain", first.ChanceOfRain, 25)
-	if first.Precipitation != 1.5 {
-		t.Fatalf("expected precipitation 1.5, got %v", first.Precipitation)
-	}
+	// The fixture reports rain 1.5 and a measured snow of 0, so there is a total and it
+	// is 1.5. A day whose upstream reported no volume at all gets null instead, which
+	// is what TestSevenDayLegacyPrecipitationSeparatesAMeasuredZeroFromNoReading pins.
+	requireFloat(t, "the first precipitation", first.Precipitation, 1.5)
 	requireFloat(t, "the first uv_index", first.UVIndex, 3.5)
 	requireInt(t, "the first humidity", first.Humidity, 60)
 	requireFloat(t, "the first wind_speed", first.WindSpeed, 4)
-	if first.Description != "Scattered Clouds" {
-		t.Fatalf("expected title-cased description, got %q", first.Description)
-	}
+	requireString(t, "the first description", first.Description, "Scattered Clouds")
 
 	// The faithful twin of the same day reads from the same upstream entry, so the
 	// legacy key and the faithful key cannot report two different numbers.
@@ -459,6 +457,160 @@ func TestMapOneCallCurrentReportsAbsentMeasurementsAsNull(t *testing.T) {
 	if legacy := data.Forecast[0]; legacy.ChanceOfRain != nil || legacy.UVIndex == nil {
 		t.Fatalf("expected a null legacy chance_of_rain and a reported uv_index, got %#v and %#v", legacy.ChanceOfRain, legacy.UVIndex)
 	}
+	// The day's upstream reported no rain and no snow, so there is no total to report
+	// and the legacy key is null rather than 0.
+	if data.Forecast[0].Precipitation != nil {
+		t.Fatalf("expected no legacy precipitation total, got %v", *data.Forecast[0].Precipitation)
+	}
+}
+
+// oneCallBodyNoWeather is a body whose single day carries no weather array at all.
+// The endpoint documents one on every day, so this is not a shape a real body has; it
+// is here because the legacy condition, description and icon are read from it, and a
+// day with no weather entry has no condition. The three are null for that reason now,
+// the same reason the current block nulls the same trio.
+const oneCallBodyNoWeather = `{"lat":51.5074,"lon":-0.1278,"timezone":"Europe/London","timezone_offset":0,` +
+	`"daily":[{"dt":1772000000,"sunrise":1771960000,"sunset":1772010000,"moonrise":1771970000,` +
+	`"moonset":1772040000,"moon_phase":0.42,"temp":{"day":15.0,"min":10.0,"max":20.0,"night":9.0,"morn":11.0,"eve":16.0},` +
+	`"feels_like":{"day":14.0,"night":8.0,"morn":10.0,"eve":15.0},"pressure":1015,"humidity":60,` +
+	`"wind_speed":4.0,"wind_deg":200,"clouds":40,"pop":0,"uvi":3.5}]}`
+
+// One route, one case, one rule: a day the upstream sent with no weather entry has no
+// condition, no description and no icon. The current block already reported the same
+// trio as null for the same upstream condition; the day used to keep them as values
+// and answer with three empty strings, which is a value and not an absence.
+func TestSevenDayLegacyDayNullsTheConditionTrioWithoutWeather(t *testing.T) {
+	data := mapOneCallBody(t, oneCallBodyNoWeather)
+
+	if len(data.Forecast) != 1 {
+		t.Fatalf("expected the one legacy day, got %d", len(data.Forecast))
+	}
+	// The faithful array is null too: an array with no omitempty reports nil as null, so
+	// the two vocabularies say the same thing about the missing entry.
+	if data.OneCall.Daily[0].Weather != nil {
+		t.Fatalf("expected a null daily weather array, got %#v", data.OneCall.Daily[0].Weather)
+	}
+
+	legacy := data.Forecast[0]
+	if legacy.Condition != nil || legacy.Description != nil || legacy.Icon != nil {
+		t.Fatalf("expected a null legacy condition trio, got %q %q %q",
+			*legacy.Condition, *legacy.Description, *legacy.Icon)
+	}
+	// The rest of the day is unaffected, so this is a day with one gap rather than an
+	// empty object. pop is there and measured at 0, so the chance of rain is a real
+	// zero: a second 0 on the same day, next to the three nulls, and it means the
+	// opposite thing from the empty strings above.
+	requireFloat(t, "the max_temperature on a day with no weather", legacy.MaxTemp, 20)
+	requireInt(t, "the chance_of_rain on a day with no weather", legacy.ChanceOfRain, 0)
+}
+
+// oneCallBodyPartialBreakdown is a body whose daily temp and feels_like blocks are
+// present but partial: "temp":{"day":15} and "feels_like":{"day":14}. OpenWeatherMap
+// does not send a partial breakdown, which is the assumption every allowlist entry
+// about those members rests on. If it ever did, the members it left out would report
+// 0 rather than null, because the values are read from a non-pointer decode struct
+// and a missing member there is a zero. This fixture pins that behaviour so the
+// assumption is a tested one rather than a comment.
+const oneCallBodyPartialBreakdown = `{"lat":51.5074,"lon":-0.1278,"timezone":"Europe/London","timezone_offset":0,` +
+	`"daily":[{"dt":1772000000,"sunrise":1771960000,"sunset":1772010000,"moonrise":1771970000,` +
+	`"moonset":1772040000,"moon_phase":0.42,"temp":{"day":15.0},"feels_like":{"day":14.0},` +
+	`"pressure":1015,"humidity":60,"dew_point":7.7,"wind_speed":4.0,"wind_deg":200,"clouds":40,` +
+	`"pop":0.2,"uvi":3.5,"weather":[{"id":801,"main":"Clouds","description":"scattered clouds","icon":"03d"}]}]}`
+
+// A block the upstream sent in part has no way to report the part it left out. The
+// temp and feels_like members are allowlisted as unconditionally sent, the values come
+// from a non-pointer decode struct, and a member that was not in the body is a zero
+// there. These two assertions are what that assumption costs, and they are here so a
+// change to it cannot be invisible.
+func TestSevenDayPartialBreakdownReportsZeroForTheMembersItLacks(t *testing.T) {
+	data := mapOneCallBody(t, oneCallBodyPartialBreakdown)
+
+	if len(data.OneCall.Daily) != 1 {
+		t.Fatalf("expected the one upstream day, got %d", len(data.OneCall.Daily))
+	}
+	day := data.OneCall.Daily[0]
+	if day.Temp == nil {
+		t.Fatal("expected the temp block the upstream did send to be reported")
+	}
+	// The one member it carried is a real reading, here and in the legacy array, which
+	// takes its average from that same member.
+	requireFloat(t, "the temp day the upstream sent", day.Temp.Day, 15)
+	requireFloat(t, "the legacy avg_temperature from a partial temp", data.Forecast[0].AvgTemp, 15)
+	// The five and three it did not carry are zeroes, not nulls. OpenWeatherMap does
+	// not send a partial breakdown, so this is unreachable in production; it is pinned
+	// so that anyone who learns otherwise learns it from a failing test.
+	for name, got := range map[string]*float64{
+		"temp.min": day.Temp.Min, "temp.max": day.Temp.Max, "temp.night": day.Temp.Night,
+		"temp.morn": day.Temp.Morn, "temp.eve": day.Temp.Eve,
+		"feels_like.night": day.FeelsLike.Night, "feels_like.morn": day.FeelsLike.Morn,
+		"feels_like.eve": day.FeelsLike.Eve,
+	} {
+		if got == nil {
+			t.Fatalf("expected a fabricated 0 for the missing %s, got null", name)
+		}
+		if *got != 0 {
+			t.Fatalf("expected a fabricated 0 for the missing %s, got %v", name, *got)
+		}
+	}
+	// The same for the legacy extremes: max_temperature and min_temperature read the
+	// two members the partial temp did not carry, so they are zeroes as well.
+	requireFloat(t, "the legacy max_temperature from a partial temp", data.Forecast[0].MaxTemp, 0)
+	requireFloat(t, "the legacy min_temperature from a partial temp", data.Forecast[0].MinTemp, 0)
+}
+
+// oneCallBodyPrecipitationStates is the body that decides whether a summed
+// precipitation is a reading. Its two days are the two cases: the first reported a
+// rain volume the upstream genuinely measured as 0, the second reported no volume at
+// all. Reporting 0 for both claims the same thing twice.
+const oneCallBodyPrecipitationStates = `{"lat":51.5074,"lon":-0.1278,"timezone":"Europe/London","timezone_offset":0,` +
+	`"daily":[` +
+	`{"dt":1772000000,"sunrise":1771960000,"sunset":1772010000,"moonrise":1771970000,` +
+	`"moonset":1772040000,"moon_phase":0.42,"temp":{"day":15.0,"min":10.0,"max":20.0,"night":9.0,"morn":11.0,"eve":16.0},` +
+	`"feels_like":{"day":14.0,"night":8.0,"morn":10.0,"eve":15.0},"pressure":1015,"humidity":60,` +
+	`"wind_speed":4.0,"wind_deg":200,"clouds":40,"pop":0.2,"rain":0,"uvi":3.5,` +
+	`"weather":[{"id":500,"main":"Rain","description":"light rain","icon":"10d"}]},` +
+	`{"dt":1772086400,"sunrise":1772044800,"sunset":1772092800,"moonrise":1772054800,` +
+	`"moonset":1772124800,"moon_phase":0.5,"temp":{"day":16.0,"min":11.0,"max":21.0,"night":9.0,"morn":11.0,"eve":16.0},` +
+	`"feels_like":{"day":14.0,"night":8.0,"morn":10.0,"eve":15.0},"pressure":1015,"humidity":60,` +
+	`"wind_speed":4.0,"wind_deg":200,"clouds":10,"pop":0.0,"uvi":3.5,` +
+	`"weather":[{"id":800,"main":"Clear","description":"clear sky","icon":"01d"}]}]}`
+
+// A summed precipitation is an answer only when there was something to sum. The first
+// day's upstream measured a rain volume of 0, so the total is 0; the second day
+// reported no volume at all, so there is no total and the key is null. Before this
+// round both reported 0, beside a faithful rain and snow that were both null: the one
+// key in the response claiming a measurement nothing had measured.
+func TestSevenDayLegacyPrecipitationSeparatesAMeasuredZeroFromNoReading(t *testing.T) {
+	data := mapOneCallBody(t, oneCallBodyPrecipitationStates)
+
+	if len(data.OneCall.Daily) != 2 || len(data.Forecast) != 2 {
+		t.Fatalf("expected 2 days from the fixture, got %d faithful and %d legacy",
+			len(data.OneCall.Daily), len(data.Forecast))
+	}
+
+	// Day 0 measured a volume of 0. Both the faithful volumes and the legacy total are
+	// real readings, and the total is the sum of the one that exists.
+	measured := data.Forecast[0]
+	requireFloat(t, "the measured zero rain", data.OneCall.Daily[0].Rain, 0)
+	if data.OneCall.Daily[0].Snow != nil {
+		t.Fatalf("expected no snow on the first day, got %v", *data.OneCall.Daily[0].Snow)
+	}
+	requireFloat(t, "the legacy total for a measured zero", measured.Precipitation, 0)
+
+	// Day 1 reported neither, so the faithful volumes are null and the legacy total is
+	// null. A zero here would be a claim that nothing fell, measured.
+	unread := data.Forecast[1]
+	if data.OneCall.Daily[1].Rain != nil || data.OneCall.Daily[1].Snow != nil {
+		t.Fatalf("expected no volumes on the second day, got rain %v snow %v",
+			data.OneCall.Daily[1].Rain, data.OneCall.Daily[1].Snow)
+	}
+	if unread.Precipitation != nil {
+		t.Fatalf("expected no legacy precipitation total on a day with no volumes, got %v", *unread.Precipitation)
+	}
+	// The other readings on that day are unaffected, which is the point: the day is a
+	// day with one gap rather than a day of nothing.
+	requireFloat(t, "the second day's max_temperature", unread.MaxTemp, 21)
+	requireInt(t, "the second day's chance_of_rain", unread.ChanceOfRain, 0)
 }
 
 // oneCallBodyZeroAndAbsent is the body that decides whether the opt-in blocks are
@@ -493,13 +645,16 @@ func TestSevenDayOptInBlocksTellAZeroFromAnAbsentMember(t *testing.T) {
 	if data.OneCall == nil {
 		t.Fatal("expected the onecall envelope, got none")
 	}
-	if len(data.OneCall.Hourly) != 2 || len(data.OneCall.Minutely) != 2 {
+	if data.OneCall.Hourly == nil || data.OneCall.Minutely == nil {
+		t.Fatal("expected the opt-in blocks to be present on a body that sent both")
+	}
+	if len(*data.OneCall.Hourly) != 2 || len(*data.OneCall.Minutely) != 2 {
 		t.Fatalf("expected 2 hourly and 2 minutely entries from the fixture, got %d and %d",
-			len(data.OneCall.Hourly), len(data.OneCall.Minutely))
+			len(*data.OneCall.Hourly), len(*data.OneCall.Minutely))
 	}
 
 	// Entry 0 measured a rain volume of 0 and sent no snow. Entry 1 sent neither.
-	measured, absent := data.OneCall.Hourly[0], data.OneCall.Hourly[1]
+	measured, absent := (*data.OneCall.Hourly)[0], (*data.OneCall.Hourly)[1]
 	requireFloat(t, "the measured zero hourly rain", measured.Rain, 0)
 	if measured.Snow != nil {
 		t.Fatalf("expected no snow reading on the first hourly entry, got %v", *measured.Snow)
@@ -512,10 +667,10 @@ func TestSevenDayOptInBlocksTellAZeroFromAnAbsentMember(t *testing.T) {
 	// A probability the upstream measured as 0 is a reading, on the hourly block and
 	// on the minutely one.
 	requireFloat(t, "the measured zero hourly pop", measured.Pop, 0)
-	requireFloat(t, "the first minutely precipitation", data.OneCall.Minutely[0].Precipitation, 0)
+	requireFloat(t, "the first minutely precipitation", (*data.OneCall.Minutely)[0].Precipitation, 0)
 	// A member the upstream left out of an entry that is otherwise there is null.
-	if data.OneCall.Minutely[1].Precipitation != nil {
-		t.Fatalf("expected a null minutely precipitation on the second entry, got %v", *data.OneCall.Minutely[1].Precipitation)
+	if (*data.OneCall.Minutely)[1].Precipitation != nil {
+		t.Fatalf("expected a null minutely precipitation on the second entry, got %v", *(*data.OneCall.Minutely)[1].Precipitation)
 	}
 	// The entries the upstream did send are still reported, so entry 1 is an entry
 	// with two gaps rather than an empty object.
@@ -525,10 +680,10 @@ func TestSevenDayOptInBlocksTellAZeroFromAnAbsentMember(t *testing.T) {
 	// The same rule for a string: an alert whose sender the upstream omitted is null,
 	// not the empty string. A government warning with no sender is worth telling
 	// apart from one whose sender is blank.
-	if len(data.OneCall.Alerts) != 1 {
-		t.Fatalf("expected the one alert from the fixture, got %d", len(data.OneCall.Alerts))
+	if data.OneCall.Alerts == nil || len(*data.OneCall.Alerts) != 1 {
+		t.Fatalf("expected the one alert from the fixture, got %v", data.OneCall.Alerts)
 	}
-	alert := data.OneCall.Alerts[0]
+	alert := (*data.OneCall.Alerts)[0]
 	if alert.SenderName != nil {
 		t.Fatalf("expected a null alert sender_name, got %q", *alert.SenderName)
 	}
@@ -549,28 +704,32 @@ func TestSevenDayMapperKeepsEveryBlock(t *testing.T) {
 		t.Fatal("expected the onecall envelope to be present, got none")
 	}
 	// The same values the fixture sent, reached through the pointers the opt-in
-	// blocks are now built from.
-	if len(data.OneCall.Minutely) != 1 {
-		t.Fatalf("expected the upstream minutely entry, got %#v", data.OneCall.Minutely)
+	// blocks are now built from. Each block is a pointer to a slice, so a nil one would
+	// mean the upstream sent no such key at all.
+	if data.OneCall.Minutely == nil || len(*data.OneCall.Minutely) != 1 {
+		t.Fatalf("expected the upstream minutely entry, got %v", data.OneCall.Minutely)
 	}
-	minutely := data.OneCall.Minutely[0]
+	minutely := (*data.OneCall.Minutely)[0]
 	requireFloat(t, "the minutely precipitation", minutely.Precipitation, 0.12)
 	requireInt64(t, "the minutely dt", minutely.Dt, 1772000060)
-	if len(data.OneCall.Hourly) != 1 {
-		t.Fatalf("expected the upstream hourly entry, got %#v", data.OneCall.Hourly)
+	if data.OneCall.Hourly == nil || len(*data.OneCall.Hourly) != 1 {
+		t.Fatalf("expected the upstream hourly entry, got %v", data.OneCall.Hourly)
 	}
-	hourly := data.OneCall.Hourly[0]
+	hourly := (*data.OneCall.Hourly)[0]
 	requireFloat(t, "the hourly temp", hourly.Temp, 11.5)
 	requireFloat(t, "the hourly pop", hourly.Pop, 0.2)
 	// A precipitation volume the upstream measured as 0 has to survive as 0 rather
 	// than being dropped by an omitempty anywhere along the way.
 	requireFloat(t, "the measured zero hourly rain", hourly.Rain, 0)
 	requireFloat(t, "the measured zero hourly snow", hourly.Snow, 0)
-	if len(data.OneCall.Alerts) != 1 {
-		t.Fatalf("expected the upstream alert, got %#v", data.OneCall.Alerts)
+	if data.OneCall.Alerts == nil || len(*data.OneCall.Alerts) != 1 {
+		t.Fatalf("expected the upstream alert, got %v", data.OneCall.Alerts)
 	}
-	requireString(t, "the alert event", data.OneCall.Alerts[0].Event, "Flood warning")
-	requireString(t, "the alert sender", data.OneCall.Alerts[0].SenderName, "Met Office")
+	requireString(t, "the alert event", (*data.OneCall.Alerts)[0].Event, "Flood warning")
+	requireString(t, "the alert sender", (*data.OneCall.Alerts)[0].SenderName, "Met Office")
+	// The legacy total of the fixture's day: rain 1.5 plus a measured snow of 0, so
+	// there is a total and it is 1.5.
+	requireFloat(t, "the legacy precipitation", data.Forecast[0].Precipitation, 1.5)
 	if len(data.OneCall.Daily) != 1 {
 		t.Fatalf("expected the one upstream day, got %d", len(data.OneCall.Daily))
 	}
@@ -678,13 +837,11 @@ func TestMapOneCallWithoutAPayloadStillReportsEveryDay(t *testing.T) {
 		legacy.ChanceOfRain != nil || legacy.UVIndex != nil {
 		t.Fatalf("expected null legacy readings with no payload, got %#v", legacy)
 	}
-	// The legacy condition comes from the weather array, which needs no payload.
-	if legacy.Condition != "Clouds" || legacy.Icon != "03d" {
-		t.Fatalf("expected the legacy condition from the weather array, got %#v", legacy)
-	}
-	if legacy.Description != "Scattered Clouds" {
-		t.Fatalf("expected a title cased legacy description, got %q", legacy.Description)
-	}
+	// The legacy condition comes from the weather array, which needs no payload, so it
+	// is the one member that survives while every measurement is null.
+	requireString(t, "the legacy condition", legacy.Condition, "Clouds")
+	requireString(t, "the legacy icon", legacy.Icon, "03d")
+	requireString(t, "the legacy description", legacy.Description, "Scattered Clouds")
 	// The legacy current block is built from the same presence view as the faithful
 	// one, so with no payload it is all nulls too rather than a row of readings read
 	// out of the decode struct. The two vocabularies cannot disagree about whether a

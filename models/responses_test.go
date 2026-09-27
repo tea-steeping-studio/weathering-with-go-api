@@ -279,7 +279,11 @@ var forecastPayloadNarrowed = map[string]string{
 // now, so there is nothing left to allowlist on them: the payload is the full mirror
 // of every block the response reports, and the only remaining entries are claims
 // about members the upstream documents as unconditionally sent.
-func TestSevenDayPayloadCoversDecodedFields(t *testing.T) {
+// oneCallUpstreamPaths is the full member list of the /data/3.0/onecall decode
+// struct, with the four arrays and the current block walked out into their members.
+// Both guards below start from it, so they cannot disagree about what the upstream
+// declares.
+func oneCallUpstreamPaths() map[string]bool {
 	upstream := jsonMemberPaths(reflect.TypeOf(OneCallResponse{}))
 	// jsonMemberPaths reports a slice as a leaf and descends into a block, so the
 	// current block is walked as current.dt and so on by the call above, while the
@@ -290,14 +294,40 @@ func TestSevenDayPayloadCoversDecodedFields(t *testing.T) {
 	collectJSONMemberPaths(reflect.TypeOf(Hourly{}), "hourly", upstream)
 	collectJSONMemberPaths(reflect.TypeOf(Alert{}), "alerts", upstream)
 	collectJSONMemberPaths(reflect.TypeOf(DailyForecast{}), "daily", upstream)
+	return upstream
+}
 
-	// The same four passes over the payload: jsonMemberPaths already walked the
-	// current block as its members and reported the four arrays as leaves.
+// oneCallPayloadPaths is the same walk over the payload.
+func oneCallPayloadPaths() map[string]bool {
+	// jsonMemberPaths already walked the current block as its members and reported the
+	// four arrays as leaves. The three opt-in arrays are the response point types
+	// themselves now, so their element types are the ones to collect.
 	payload := jsonMemberPaths(reflect.TypeOf(SevenDayPayload{}))
-	collectJSONMemberPaths(reflect.TypeOf(SevenDayPayloadMinutely{}), "minutely", payload)
-	collectJSONMemberPaths(reflect.TypeOf(SevenDayPayloadHourly{}), "hourly", payload)
-	collectJSONMemberPaths(reflect.TypeOf(SevenDayPayloadAlert{}), "alerts", payload)
+	collectJSONMemberPaths(reflect.TypeOf(OneCallMinutelyPoint{}), "minutely", payload)
+	collectJSONMemberPaths(reflect.TypeOf(OneCallHourlyPoint{}), "hourly", payload)
+	collectJSONMemberPaths(reflect.TypeOf(OneCallAlertPoint{}), "alerts", payload)
 	collectJSONMemberPaths(reflect.TypeOf(SevenDayPayloadDaily{}), "daily", payload)
+	return payload
+}
+
+// oneCallEnvelopePaths is the same walk over the faithful response body, which is
+// what the second guard below checks.
+func oneCallEnvelopePaths() map[string]bool {
+	envelope := jsonMemberPaths(reflect.TypeOf(OneCallEnvelope{}))
+	collectJSONMemberPaths(reflect.TypeOf(OneCallMinutelyPoint{}), "minutely", envelope)
+	collectJSONMemberPaths(reflect.TypeOf(OneCallHourlyPoint{}), "hourly", envelope)
+	collectJSONMemberPaths(reflect.TypeOf(OneCallAlertPoint{}), "alerts", envelope)
+	collectJSONMemberPaths(reflect.TypeOf(OneCallDailyPoint{}), "daily", envelope)
+	return envelope
+}
+
+// The payload is the presence authority: a member the upstream declares and it does
+// not is a member the response reports as null forever, whatever the response types
+// say about it. A field added to the upstream struct and allowed for here, without
+// being declared, is the case this exists for.
+func TestSevenDayPayloadCoversDecodedFields(t *testing.T) {
+	upstream := oneCallUpstreamPaths()
+	payload := oneCallPayloadPaths()
 
 	if len(upstream) == 0 {
 		t.Fatal("the upstream walk found no members, so this check would pass on anything")
@@ -333,6 +363,79 @@ func TestSevenDayPayloadCoversDecodedFields(t *testing.T) {
 	sort.Strings(invented)
 	if len(invented) > 0 {
 		t.Errorf("SevenDayPayload declares members the upstream never sends: %s", strings.Join(invented, ", "))
+	}
+}
+
+// The payload guard alone is not enough, and its own error message is why. A member
+// added to the upstream struct and allowlisted rather than declared leaves the
+// payload check green, and the response then drops the member silently: the guard says
+// "add it to SevenDayPayload", a developer adds it there, and onecall.daily[] still has
+// no such key. This compares the faithful response body itself against the upstream,
+// so a member that reaches neither is named at the type that is missing it.
+//
+// The allowlist is the same one. Every entry in it is a claim about a member the
+// upstream sends unconditionally, and the response does report all of those: the
+// entries are the presence view's narrowing, not the response's.
+func TestSevenDayResponseCoversUpstreamMembers(t *testing.T) {
+	upstream := oneCallUpstreamPaths()
+	envelope := oneCallEnvelopePaths()
+
+	if len(upstream) == 0 {
+		t.Fatal("the upstream walk found no members, so this check would pass on anything")
+	}
+	if len(envelope) == 0 {
+		t.Fatal("the response walk found no members, so this check would pass on anything")
+	}
+
+	var missing []string
+	for name := range upstream {
+		if envelope[name] || sevenDayPayloadNarrowed[name] != "" {
+			continue
+		}
+		missing = append(missing, name)
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Errorf("OneCallResponse declares members the faithful onecall body omits and the allowlist does not cover: %s\n"+
+			"add each one to the response type that reports it, or allowlist it with the reason it is deliberately narrower",
+			strings.Join(missing, ", "))
+	}
+
+	// Every allowlisted member is a claim that the faithful body reports it from the
+	// decode struct instead of from a presence view, so the body has to declare it.
+	// Without this second check, adding a member to the upstream struct and allowlisting
+	// it silences both guards at once and the response drops the member silently, which
+	// is the failure this whole test exists to prevent.
+	var unbacked []string
+	for name := range sevenDayPayloadNarrowed {
+		if !envelope[name] {
+			unbacked = append(unbacked, name)
+		}
+	}
+	sort.Strings(unbacked)
+	if len(unbacked) > 0 {
+		t.Errorf("the allowlist claims the faithful onecall body reports these upstream members, and it does not: %s\n"+
+			"add each one to the response type that reports it, or drop the allowlist entry and declare it in the payload",
+			strings.Join(unbacked, ", "))
+	}
+
+	// The faithful body must not invent a name the upstream never sends. None are
+	// expected: every key in it is a key in the One Call schema. The two block names
+	// are removed for the same reason as in the payload guard, because the walk
+	// reports the nested breakdown types as their members rather than as a member of
+	// their own.
+	for _, name := range []string{"daily.temp", "daily.feels_like"} {
+		delete(envelope, name)
+	}
+	var invented []string
+	for name := range envelope {
+		if !upstream[name] {
+			invented = append(invented, name)
+		}
+	}
+	sort.Strings(invented)
+	if len(invented) > 0 {
+		t.Errorf("the faithful onecall body declares members the upstream never sends: %s", strings.Join(invented, ", "))
 	}
 }
 

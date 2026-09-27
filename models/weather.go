@@ -57,21 +57,31 @@ type Current struct {
 // are pointers and an unmeasurable day reports null. For a real body the JSON is byte
 // identical, because a non-nil pointer to a value serialises as that value.
 //
-// Date, Condition, Description and Icon stay values: a timestamp and three strings
-// the upstream sends whenever it sends a day. Precipitation stays a value for the
-// reason ForecastDay.Precipitation does: a total of zero is a real answer for a day
-// nothing fell on, not an absence, and the legacy key has always been a number.
+// Date is the one member that stays a value: it is a timestamp the upstream sends on
+// every daily entry, and a time.Time marshals to the same string either way.
+//
+// Precipitation is a pointer, and it is the case that separates two things a value
+// type cannot. A day whose upstream reported a rain volume of 0 and no snow has a
+// total of 0 and that is an answer. A day whose upstream reported neither has no total
+// at all, and reporting 0 for it says the same thing as a dry day with a measurement
+// behind it, right beside rain: null and snow: null on the faithful twin. The pointer
+// separates them: the first day reports 0, the second reports null.
+//
+// Condition, Description and Icon are pointers for the same reason currentFromOneCall
+// nulls the same trio for the same upstream condition: a day sent with no weather
+// entry has no condition, and "" is a value rule 2 says should be null. One route, one
+// case, one rule.
 type Forecast struct {
 	Date          time.Time `json:"date"`
 	MaxTemp       *float64  `json:"max_temperature"`
 	MinTemp       *float64  `json:"min_temperature"`
 	AvgTemp       *float64  `json:"avg_temperature"`
-	Condition     string    `json:"condition"`
-	Description   string    `json:"description"`
-	Icon          string    `json:"icon"`
+	Condition     *string   `json:"condition"`
+	Description   *string   `json:"description"`
+	Icon          *string   `json:"icon"`
 	Humidity      *int      `json:"humidity"`
 	WindSpeed     *float64  `json:"wind_speed"`
-	Precipitation float64   `json:"precipitation"`
+	Precipitation *float64  `json:"precipitation"`
 	ChanceOfRain  *int      `json:"chance_of_rain"`
 	UVIndex       *float64  `json:"uv_index"`
 }

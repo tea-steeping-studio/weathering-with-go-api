@@ -314,18 +314,22 @@ func (w *WeatherService) mapOneCall(owm models.OneCallResponse, payload models.S
 		TimezoneOffset: owm.TimezoneOffset,
 	}
 
-	// The three opt-in blocks are carried as the upstream sent them, mapped one entry
-	// at a time from their own presence views. Whether a caller sees one is a decision
-	// taken after this body is built, so the cached response always holds them all and
-	// one upstream call serves every variant.
-	for i := range owm.Minutely {
-		envelope.Minutely = append(envelope.Minutely, oneCallMinutelyPoint(oneCallMinutelyPresence(payload, i)))
+	// The three opt-in blocks are the response types themselves, decoded from the same
+	// body, so there is no mapping step and no second copy of a member list to keep in
+	// step. Each is a pointer to a slice: a nil payload member is an absent block and
+	// a non-nil empty one is an empty array, which is the distinction a caller who
+	// asked for the block needs and cannot get from a plain slice with omitempty.
+	//
+	// Whether a caller sees one is a decision taken after this body is built, so the
+	// cached response always holds them all and one upstream call serves every variant.
+	if payload.Minutely != nil {
+		envelope.Minutely = &payload.Minutely
 	}
-	for i := range owm.Hourly {
-		envelope.Hourly = append(envelope.Hourly, oneCallHourlyPoint(oneCallHourlyPresence(payload, i)))
+	if payload.Hourly != nil {
+		envelope.Hourly = &payload.Hourly
 	}
-	for i := range owm.Alerts {
-		envelope.Alerts = append(envelope.Alerts, oneCallAlertPoint(oneCallAlertPresence(payload, i)))
+	if payload.Alerts != nil {
+		envelope.Alerts = &payload.Alerts
 	}
 
 	if owm.Current != nil {
@@ -367,87 +371,6 @@ func oneCallPresence(payload models.SevenDayPayload, i int) models.SevenDayPaylo
 		return payload.Daily[i]
 	}
 	return models.SevenDayPayloadDaily{}
-}
-
-// The three opt-in presence lookups follow oneCallPresence, one per array, because
-// one function cannot return three different presence types. Each is a bounds check
-// and nothing else, and each exists so a payload that is somehow shorter than the
-// upstream array reports nulls rather than panicking.
-func oneCallMinutelyPresence(payload models.SevenDayPayload, i int) models.SevenDayPayloadMinutely {
-	if i < len(payload.Minutely) {
-		return payload.Minutely[i]
-	}
-	return models.SevenDayPayloadMinutely{}
-}
-
-func oneCallHourlyPresence(payload models.SevenDayPayload, i int) models.SevenDayPayloadHourly {
-	if i < len(payload.Hourly) {
-		return payload.Hourly[i]
-	}
-	return models.SevenDayPayloadHourly{}
-}
-
-func oneCallAlertPresence(payload models.SevenDayPayload, i int) models.SevenDayPayloadAlert {
-	if i < len(payload.Alerts) {
-		return payload.Alerts[i]
-	}
-	return models.SevenDayPayloadAlert{}
-}
-
-// oneCallMinutelyPoint maps one upstream minutely entry. Precipitation is a
-// probability over the minute rather than a volume, and both the value and its
-// presence come from the payload so an entry the upstream left it out of is null
-// rather than a measured zero.
-func oneCallMinutelyPoint(presence models.SevenDayPayloadMinutely) models.OneCallMinutelyPoint {
-	return models.OneCallMinutelyPoint{
-		Dt:            presence.Dt,
-		Precipitation: presence.Precipitation,
-	}
-}
-
-// oneCallHourlyPoint maps one upstream hourly entry. Every member comes from the
-// payload, value and presence together: the two precipitation volumes are the reason
-// this type exists, since the upstream omits them for an hour nothing fell on and a
-// decode struct's zero would report that omission as a dry hour that measured 0 mm.
-func oneCallHourlyPoint(presence models.SevenDayPayloadHourly) models.OneCallHourlyPoint {
-	point := models.OneCallHourlyPoint{
-		Dt:         presence.Dt,
-		Sunrise:    presence.Sunrise,
-		Sunset:     presence.Sunset,
-		Temp:       presence.Temp,
-		FeelsLike:  presence.FeelsLike,
-		Pressure:   presence.Pressure,
-		Humidity:   presence.Humidity,
-		DewPoint:   presence.DewPoint,
-		Uvi:        presence.Uvi,
-		Clouds:     presence.Clouds,
-		Visibility: presence.Visibility,
-		WindSpeed:  presence.WindSpeed,
-		WindDeg:    presence.WindDeg,
-		WindGust:   presence.WindGust,
-		Pop:        presence.Pop,
-		Rain:       presence.Rain,
-		Snow:       presence.Snow,
-		// The weather array is a slice, so a nil payload member is a null array rather
-		// than a block of nulls, and an empty one is an empty array.
-		Weather: presence.Weather,
-	}
-	return point
-}
-
-// oneCallAlertPoint maps one government alert. The strings are pointers so an alert
-// whose sender the upstream sent as the empty string and one whose sender it left out
-// are different readings, which is the distinction a weather warning is most likely
-// to be misread on.
-func oneCallAlertPoint(presence models.SevenDayPayloadAlert) models.OneCallAlertPoint {
-	return models.OneCallAlertPoint{
-		SenderName:  presence.SenderName,
-		Event:       presence.Event,
-		Start:       presence.Start,
-		End:         presence.End,
-		Description: presence.Description,
-		Tags:        presence.Tags,
-	}
 }
 
 // oneCallCurrentPoint maps the upstream current block. The timestamps and the weather
@@ -561,7 +484,9 @@ func oneCallLegacyDay(day models.DailyForecast, presence models.SevenDayPayloadD
 	var condition, description, icon string
 	if len(day.Weather) > 0 {
 		condition = day.Weather[0].Main
-		description = day.Weather[0].Description
+		// Title cased, as it has always been on this route. The trio becoming pointers
+		// is about nullability, not about the text.
+		description = strings.Title(day.Weather[0].Description)
 		icon = day.Weather[0].Icon
 	}
 
@@ -571,12 +496,9 @@ func oneCallLegacyDay(day models.DailyForecast, presence models.SevenDayPayloadD
 		// component of this string would shift with TZ and the same upstream body
 		// would serialise differently on two hosts. The instant is unchanged either
 		// way; only the rendering is pinned.
-		Date:        time.Unix(day.Dt, 0).UTC(),
-		Condition:   condition,
-		Description: strings.Title(description),
-		Icon:        icon,
-		Humidity:    presence.Humidity,
-		WindSpeed:   presence.WindSpeed,
+		Date:      time.Unix(day.Dt, 0).UTC(),
+		Humidity:  presence.Humidity,
+		WindSpeed: presence.WindSpeed,
 		// The ultraviolet index is the day's uvi when the upstream sent one and null
 		// when it did not, the same rule the faithful day follows and the opposite of
 		// the permanent 0 this key used to carry.
@@ -590,6 +512,15 @@ func oneCallLegacyDay(day models.DailyForecast, presence models.SevenDayPayloadD
 		legacy.AvgTemp = &avg
 	}
 
+	// A day sent with no weather entry has no condition, so the trio stays null rather
+	// than reporting three empty strings, which is the same rule the current block
+	// follows for the same upstream condition.
+	if len(day.Weather) > 0 {
+		legacy.Condition = &condition
+		legacy.Description = &description
+		legacy.Icon = &icon
+	}
+
 	if presence.Pop != nil {
 		// Rounded, and not truncated, because a truncation reports a probability the
 		// upstream never gave: 0.29 is 28.999999999999996 in binary floating point, so
@@ -600,11 +531,18 @@ func oneCallLegacyDay(day models.DailyForecast, presence models.SevenDayPayloadD
 		legacy.ChanceOfRain = &chanceOfRain
 	}
 
-	if presence.Rain != nil {
-		legacy.Precipitation += *presence.Rain
-	}
-	if presence.Snow != nil {
-		legacy.Precipitation += *presence.Snow
+	// The total is reported only when the upstream reported at least one volume. A day
+	// that reported a measured 0 and a day that reported nothing have no answer in
+	// common, and reporting 0 for both is the same key claiming two different things.
+	if presence.Rain != nil || presence.Snow != nil {
+		total := 0.0
+		if presence.Rain != nil {
+			total += *presence.Rain
+		}
+		if presence.Snow != nil {
+			total += *presence.Snow
+		}
+		legacy.Precipitation = &total
 	}
 
 	return legacy
@@ -633,7 +571,11 @@ func currentFromOneCall(current *models.OneCallCurrent, presence *models.SevenDa
 		icon = current.Weather[0].Icon
 	}
 
-	updated := time.Unix(current.Dt, 0)
+	// UTC, so the rendered timestamp is the same on every host. It is an instant
+	// rather than a calendar day, so this is not a correctness question, but the
+	// response is cached per process and host dependent output is wrong in a cacheable
+	// API.
+	updated := time.Unix(current.Dt, 0).UTC()
 
 	legacy := models.Current{
 		Temperature:   presence.Temp,
@@ -714,7 +656,9 @@ func (w *WeatherService) mapCurrentWeather(owm models.OpenWeatherMapResponse, pa
 	// The legacy current block reads the same locals by address, so the two
 	// vocabularies cannot disagree about a value the upstream measured.
 	pressureFloat, visibilityFloat := float64(pressure), float64(visibility)
-	dtTime := time.Unix(dt, 0)
+	// UTC, for the same reason as the seven day route's current block: the same body
+	// must serialise the same way on two hosts.
+	dtTime := time.Unix(dt, 0).UTC()
 	description = strings.Title(description)
 
 	var main *models.MainBlock
@@ -1124,9 +1068,11 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 	if snowSeen {
 		day.Snow = &models.ForecastSnowBlock{ThreeHour: &snowSum}
 	}
-	// The legacy precipitation is the same two sums as one number, so it is 0 for a
-	// day no slot reported precipitation for: a total of zero is a reading, and the
-	// legacy key has always been a number rather than an absent member.
+	// The legacy precipitation is the same two sums as one number, so it is 0 for a day
+	// no slot reported a window for. That is the pre-existing behaviour and the seven
+	// day route no longer does it: there, a day whose upstream reported no volume gets
+	// null rather than a fabricated 0. Left as it is until the two are reconciled; see
+	// the note on ForecastDay.Precipitation.
 	day.Precipitation = rainSum + snowSum
 
 	// weather comes from the middle slot, as the route always has, and the legacy
@@ -1146,8 +1092,8 @@ func forecastDay(dateStr string, slots []models.ForecastSlot) models.ForecastDay
 
 // currentFromForecast maps the nearest forecast slot onto our model. The 5 day
 // endpoint returns 3 hour slots rather than true current conditions, and it carries
-// no visibility, so that field stays 0. The slot timestamp is reported as
-// last_updated so callers can see how stale the reading is.
+// no visibility, so that member is null rather than a visibility of 0 metres. The slot
+// timestamp is reported as last_updated so callers can see how stale the reading is.
 func currentFromForecast(items []models.ForecastItem) models.Current {
 	if len(items) == 0 {
 		return models.Current{}
@@ -1174,7 +1120,9 @@ func currentFromForecast(items []models.ForecastItem) models.Current {
 	speed, deg, gust := nearest.Wind.Speed, nearest.Wind.Deg, nearest.Wind.Gust
 	maxTemp, minTemp := nearest.Main.TempMax, nearest.Main.TempMin
 	cloudCover := nearest.Clouds.All
-	updated := time.Unix(nearest.Dt, 0)
+	// UTC, as on the other two routes: the same body must serialise the same way on
+	// two hosts.
+	updated := time.Unix(nearest.Dt, 0).UTC()
 
 	legacy := models.Current{
 		Temperature:   &temp,
