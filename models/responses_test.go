@@ -267,3 +267,162 @@ var forecastPayloadNarrowed = map[string]string{
 	"list.snow.1h":         forecastNoHourWindow,
 	"list.sys.pod":         forecastSlotSent,
 }
+
+// The one call route has the same drift hazard as the other two, and one more
+// surface: it reports the current block and the whole daily array, so a member
+// added to either decode struct and forgotten here is reported as null forever.
+// OneCallResponse and SevenDayPayload are the pair to keep in step.
+//
+// The walk covers every block, not just the two the payload is pointer-shaped for.
+// The three opt-in arrays are reported through their upstream decode types, so
+// every member of them is a deliberate narrowing and each one is named below rather
+// than left to a paragraph in a comment.
+func TestSevenDayPayloadCoversDecodedFields(t *testing.T) {
+	upstream := jsonMemberPaths(reflect.TypeOf(OneCallResponse{}))
+	// jsonMemberPaths reports a slice as a leaf and descends into a block, so the
+	// current block is walked as current.dt and so on by the call above, while the
+	// three opt-in arrays and the daily array each need their element type collected
+	// under their own prefix. The arrays are most of what this guard is for: the
+	// envelope is four scalars.
+	collectJSONMemberPaths(reflect.TypeOf(Minutely{}), "minutely", upstream)
+	collectJSONMemberPaths(reflect.TypeOf(Hourly{}), "hourly", upstream)
+	collectJSONMemberPaths(reflect.TypeOf(Alert{}), "alerts", upstream)
+	collectJSONMemberPaths(reflect.TypeOf(DailyForecast{}), "daily", upstream)
+
+	// The same two passes over the payload: jsonMemberPaths already walked the
+	// current block as its members and reported the daily array as a leaf.
+	payload := jsonMemberPaths(reflect.TypeOf(SevenDayPayload{}))
+	collectJSONMemberPaths(reflect.TypeOf(SevenDayPayloadDaily{}), "daily", payload)
+
+	if len(upstream) == 0 {
+		t.Fatal("the upstream walk found no members, so this check would pass on anything")
+	}
+
+	var uncovered []string
+	for name := range upstream {
+		if payload[name] || sevenDayPayloadNarrowed[name] != "" {
+			continue
+		}
+		uncovered = append(uncovered, name)
+	}
+	sort.Strings(uncovered)
+	if len(uncovered) > 0 {
+		t.Errorf("OneCallResponse declares members the seven day payload omits and the allowlist does not cover: %s\n"+
+			"add each one to SevenDayPayload, or allowlist it with the reason it is deliberately narrower",
+			strings.Join(uncovered, ", "))
+	}
+
+	// The payload must not invent a name the upstream never sends. Two are
+	// deliberate: the temp and feels_like blocks are tracked for presence, and the
+	// walk reports a decode-side struct as its members rather than as a member of its
+	// own, so the two block names look invented.
+	for _, name := range []string{"daily.temp", "daily.feels_like"} {
+		delete(payload, name)
+	}
+	var invented []string
+	for name := range payload {
+		if !upstream[name] {
+			invented = append(invented, name)
+		}
+	}
+	sort.Strings(invented)
+	if len(invented) > 0 {
+		t.Errorf("SevenDayPayload declares members the upstream never sends: %s", strings.Join(invented, ", "))
+	}
+}
+
+const (
+	// oneCallEnvelopeSent names a member of the /data/3.0/onecall envelope the
+	// upstream documents as unconditionally sent. A latitude of 0 and a timezone
+	// offset of 0 are both real readings there, so the values are read from the
+	// decode struct and no second view is kept.
+	oneCallEnvelopeSent = "documented as always sent in the /data/3.0/onecall envelope, so its zero is a real reading, not an absent member"
+	// oneCallTimeSent names a timestamp or a phase the upstream documents as sent
+	// on every current and daily entry. A moonrise of 0 means the moon does not
+	// rise on that day at that latitude, which is a reading rather than a gap.
+	oneCallTimeSent = "documented as sent on every current and daily entry, so its zero is a real reading, not an absent member"
+	// oneCallBreakdownSent names a member the upstream fills inside the daily
+	// temp and feels_like blocks. The payload tracks those two blocks for presence
+	// as a whole, because the response reports them as pointer-shaped blocks whose
+	// six and four members are unconditionally sent.
+	oneCallBreakdownSent = "unconditionally sent inside the documented daily temp or feels_like block, whose presence the payload tracks as a whole"
+	// oneCallWeatherArray names a weather array. The response reports it as a slice
+	// with no omitempty, so an upstream that sent none is already a null array and
+	// the payload needs no second view of it.
+	oneCallWeatherArray = "reported as a slice the response leaves null when the upstream sent no entry, so the payload needs no second view"
+	// oneCallDailySent names a daily reading the upstream documents as sent on every
+	// entry and that no legacy key on this route is built from. The two questions
+	// SevenDayPayload asks of a member both come out no, so the mapper reads the
+	// value from the decode struct and its zero is a real reading.
+	oneCallDailySent = "documented as sent on every /data/3.0/onecall daily entry, and read by no legacy key on this route, so its zero is a real reading, not an absent member"
+	// oneCallOptInBlock names a member of the three opt-in arrays. The brief fixes
+	// their response types as the upstream decode types, which cannot tell a
+	// measured zero from an absent member, so every one of these is a narrowing the
+	// guard records rather than one it can close. It is the one place on this route
+	// where a measured zero and an absent member are reported identically.
+	oneCallOptInBlock = "reported through its upstream decode type, which cannot tell a measured zero from an absent member; only the current and daily blocks are pointer-shaped"
+)
+
+// sevenDayPayloadNarrowed lists every JSON member OneCallResponse declares that
+// SevenDayPayload deliberately does not, each with the reason. An entry is a claim,
+// so remove the entry and let the test fail if that ever stops being true.
+var sevenDayPayloadNarrowed = map[string]string{
+	"lat":              oneCallEnvelopeSent,
+	"lon":              oneCallEnvelopeSent,
+	"timezone":         oneCallEnvelopeSent,
+	"timezone_offset":  oneCallEnvelopeSent,
+	"current.dt":       oneCallTimeSent,
+	"current.sunrise":  oneCallTimeSent,
+	"current.sunset":   oneCallTimeSent,
+	"current.weather":  oneCallWeatherArray,
+	"daily.dt":         oneCallTimeSent,
+	"daily.sunrise":    oneCallTimeSent,
+	"daily.sunset":     oneCallTimeSent,
+	"daily.moonrise":   oneCallTimeSent,
+	"daily.moonset":    oneCallTimeSent,
+	"daily.moon_phase": oneCallTimeSent,
+	"daily.weather":    oneCallWeatherArray,
+	"daily.pressure":   oneCallDailySent,
+	"daily.clouds":     oneCallDailySent,
+
+	"daily.temp.day":         oneCallBreakdownSent,
+	"daily.temp.min":         oneCallBreakdownSent,
+	"daily.temp.max":         oneCallBreakdownSent,
+	"daily.temp.night":       oneCallBreakdownSent,
+	"daily.temp.morn":        oneCallBreakdownSent,
+	"daily.temp.eve":         oneCallBreakdownSent,
+	"daily.feels_like.day":   oneCallBreakdownSent,
+	"daily.feels_like.night": oneCallBreakdownSent,
+	"daily.feels_like.morn":  oneCallBreakdownSent,
+	"daily.feels_like.eve":   oneCallBreakdownSent,
+
+	"minutely":               oneCallOptInBlock,
+	"minutely.dt":            oneCallOptInBlock,
+	"minutely.precipitation": oneCallOptInBlock,
+	"hourly":                 oneCallOptInBlock,
+	"hourly.dt":              oneCallOptInBlock,
+	"hourly.sunrise":         oneCallOptInBlock,
+	"hourly.sunset":          oneCallOptInBlock,
+	"hourly.temp":            oneCallOptInBlock,
+	"hourly.feels_like":      oneCallOptInBlock,
+	"hourly.pressure":        oneCallOptInBlock,
+	"hourly.humidity":        oneCallOptInBlock,
+	"hourly.dew_point":       oneCallOptInBlock,
+	"hourly.uvi":             oneCallOptInBlock,
+	"hourly.clouds":          oneCallOptInBlock,
+	"hourly.visibility":      oneCallOptInBlock,
+	"hourly.wind_speed":      oneCallOptInBlock,
+	"hourly.wind_deg":        oneCallOptInBlock,
+	"hourly.wind_gust":       oneCallOptInBlock,
+	"hourly.pop":             oneCallOptInBlock,
+	"hourly.rain":            oneCallOptInBlock,
+	"hourly.snow":            oneCallOptInBlock,
+	"hourly.weather":         oneCallOptInBlock,
+	"alerts":                 oneCallOptInBlock,
+	"alerts.sender_name":     oneCallOptInBlock,
+	"alerts.event":           oneCallOptInBlock,
+	"alerts.start":           oneCallOptInBlock,
+	"alerts.end":             oneCallOptInBlock,
+	"alerts.description":     oneCallOptInBlock,
+	"alerts.tags":            oneCallOptInBlock,
+}

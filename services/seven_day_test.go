@@ -1,13 +1,17 @@
 package services
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"weathering-with-go/models"
 )
 
 // transportRedirect rewrites upstream requests to the test server.
@@ -104,26 +108,31 @@ func TestGetSevenDayForecastReturnsSevenDays(t *testing.T) {
 	if !first.Date.Equal(wantDate) {
 		t.Fatalf("expected first day %s got %s", wantDate, first.Date)
 	}
-	if first.MaxTemp != 20 || first.MinTemp != 10 || first.AvgTemp != 15 {
-		t.Fatalf("unexpected temperatures %+v", first)
-	}
+	requireFloat(t, "the first max_temperature", first.MaxTemp, 20)
+	requireFloat(t, "the first min_temperature", first.MinTemp, 10)
+	requireFloat(t, "the first avg_temperature", first.AvgTemp, 15)
 	if first.Condition != "Clouds" || first.Icon != "03d" {
 		t.Fatalf("unexpected condition %+v", first)
 	}
-	if first.ChanceOfRain != 25 {
-		t.Fatalf("expected chance_of_rain 25 from pop 0.25, got %d", first.ChanceOfRain)
-	}
+	requireInt(t, "chance_of_rain", first.ChanceOfRain, 25)
 	if first.Precipitation != 1.5 {
 		t.Fatalf("expected precipitation 1.5, got %v", first.Precipitation)
 	}
-	if first.UVIndex != 3.5 {
-		t.Fatalf("expected uv_index 3.5, got %v", first.UVIndex)
-	}
-	if first.Humidity != 60 || first.WindSpeed != 4 {
-		t.Fatalf("unexpected humidity/wind %+v", first)
-	}
+	requireFloat(t, "the first uv_index", first.UVIndex, 3.5)
+	requireInt(t, "the first humidity", first.Humidity, 60)
+	requireFloat(t, "the first wind_speed", first.WindSpeed, 4)
 	if first.Description != "Scattered Clouds" {
 		t.Fatalf("expected title-cased description, got %q", first.Description)
+	}
+
+	// The faithful twin of the same day reads from the same upstream entry, so the
+	// legacy key and the faithful key cannot report two different numbers.
+	day := data.OneCall.Daily[0]
+	if day.Temp == nil || day.Temp.Max == nil || *day.Temp.Max != 20 {
+		t.Fatalf("expected the faithful daily temp max 20, got %#v", day.Temp)
+	}
+	if day.Pop == nil || *day.Pop != 0.25 {
+		t.Fatalf("expected the faithful daily pop 0.25, got %#v", day.Pop)
 	}
 
 	if got := atomic.LoadInt32(&stub.geocodeCalls); got != 1 {
@@ -131,6 +140,29 @@ func TestGetSevenDayForecastReturnsSevenDays(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&stub.oneCallCalls); got != 1 {
 		t.Fatalf("expected 1 one call request, got %d", got)
+	}
+}
+
+// requireFloat asserts a pointer-shaped legacy reading against the value the upstream
+// sent. Every legacy numeric key on this route is a pointer, because a day the
+// upstream could not measure has to report null rather than a fabricated zero.
+func requireFloat(t *testing.T, what string, got *float64, want float64) {
+	t.Helper()
+	if got == nil {
+		t.Fatalf("expected %s to be %v, got null", what, want)
+	}
+	if *got != want {
+		t.Fatalf("expected %s to be %v, got %v", what, want, *got)
+	}
+}
+
+func requireInt(t *testing.T, what string, got *int, want int) {
+	t.Helper()
+	if got == nil {
+		t.Fatalf("expected %s to be %d, got null", what, want)
+	}
+	if *got != want {
+		t.Fatalf("expected %s to be %d, got %d", what, want, *got)
 	}
 }
 
@@ -247,5 +279,293 @@ func TestGetSevenDayForecastDoesNotCacheUnknownLocation(t *testing.T) {
 
 	if got := atomic.LoadInt32(&stub.geocodeCalls); got != 2 {
 		t.Fatalf("expected a fresh geocode call per attempt, got %d", got)
+	}
+}
+
+// The exclude parameter is gone. Asking for all of minutely, hourly and alerts
+// costs no extra request, and it is the only way the mapper can carry them.
+func TestGetSevenDayForecastNoLongerSendsExclude(t *testing.T) {
+	stub := &sevenDayStub{}
+	svc := newSevenDayService(t, stub)
+
+	var query string
+	svc.HTTPClient.Transport = &recordingTransport{inner: svc.HTTPClient.Transport, query: &query}
+
+	if _, _, err := svc.GetSevenDayForecast("London,UK", "metric", "user-key"); err != nil {
+		t.Fatalf("GetSevenDayForecast returned error: %v", err)
+	}
+
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		t.Fatalf("failed to parse the forwarded query %q: %v", query, err)
+	}
+	if values.Has("exclude") {
+		t.Fatalf("expected no exclude parameter upstream, got %q", values.Get("exclude"))
+	}
+	// The rest of the query is unchanged, so the fixture cannot pass on a request
+	// that lost its coordinates or its key along with the parameter.
+	if values.Get("lat") != "51.5074" || values.Get("lon") != "-0.1278" {
+		t.Fatalf("expected the geocoded coordinates to be forwarded, got lat %q lon %q", values.Get("lat"), values.Get("lon"))
+	}
+	if values.Get("appid") != "user-key" || values.Get("units") != "metric" {
+		t.Fatalf("expected the caller key and units to be forwarded, got appid %q units %q", values.Get("appid"), values.Get("units"))
+	}
+}
+
+// oneCallBodyWithBlocks is a /data/3.0/onecall body carrying one entry in each of
+// the three blocks the route used to exclude, so the mapper can be asked what it
+// does with them.
+const oneCallBodyWithBlocks = `{"lat":51.5074,"lon":-0.1278,"timezone":"Europe/London","timezone_offset":0,` +
+	`"current":{"dt":1772000000,"sunrise":1771960000,"sunset":1772010000,"temp":11.5,"feels_like":10.2,` +
+	`"pressure":1009,"humidity":78,"dew_point":7.7,"uvi":1.8,"clouds":75,"visibility":8000,` +
+	`"wind_speed":6.2,"wind_deg":240,"wind_gust":9.1,"weather":[{"id":803,"main":"Clouds","description":"broken clouds","icon":"04d"}]},` +
+	`"minutely":[{"dt":1772000060,"precipitation":0.12}],` +
+	`"hourly":[{"dt":1772000000,"temp":11.5,"pop":0.2,"rain":0,"snow":0,"weather":[{"id":803,"main":"Clouds","description":"broken clouds","icon":"04d"}]}],` +
+	`"alerts":[{"sender_name":"Met Office","event":"Flood warning","start":1772000000,"end":1772600000,` +
+	`"description":"Flooding is possible.","tags":["Flood"]}],` +
+	`"daily":[{"dt":1772000000,"sunrise":1771960000,"sunset":1772010000,"moonrise":1771970000,` +
+	`"moonset":1772040000,"moon_phase":0.42,"temp":{"day":15.0,"min":10.0,"max":20.0,"night":9.0,"morn":11.0,"eve":16.0},` +
+	`"feels_like":{"day":14.0,"night":8.0,"morn":10.0,"eve":15.0},"pressure":1015,"humidity":60,"dew_point":7.7,` +
+	`"wind_speed":4.0,"wind_deg":200,"wind_gust":9.1,"clouds":40,"pop":0.29,"rain":1.5,"snow":0,"uvi":3.5,` +
+	`"weather":[{"id":801,"main":"Clouds","description":"scattered clouds","icon":"03d"}]}]}`
+
+// decodeOneCallBody decodes a body into both structs the mapper takes, exactly as
+// fetchSevenDayForecast does. Going through the raw bytes is what lets a fixture
+// distinguish a member the upstream sent as 0 from one it never sent.
+func decodeOneCallBody(t *testing.T, body string) (models.OneCallResponse, models.SevenDayPayload) {
+	t.Helper()
+	var owm models.OneCallResponse
+	if err := json.Unmarshal([]byte(body), &owm); err != nil {
+		t.Fatalf("failed to decode the fixture into the upstream struct: %v", err)
+	}
+	var payload models.SevenDayPayload
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("failed to decode the fixture into the payload: %v", err)
+	}
+	return owm, payload
+}
+
+func mapOneCallBody(t *testing.T, body string) *models.SevenDayResponse {
+	t.Helper()
+	owm, payload := decodeOneCallBody(t, body)
+	return NewWeatherService("dummy").mapOneCall(owm, payload, &models.Location{Name: "London", Country: "GB"})
+}
+
+// The mapper is what produces every block; whether a block reaches a caller is a
+// later decision. A mapper that dropped one would be invisible, because the legacy
+// array does not carry any of the three.
+// oneCallBodySparseCurrent is a /data/3.0/onecall body whose current block carries
+// no dew_point, uvi or wind_gust. Those three arrived after the first release of the
+// API, so a response body from older coverage is missing them, and reading their zero
+// out of a non-pointer decode field would report a dew point of 0 degrees and a
+// measured gust of 0 m/s: a real reading nobody made.
+const oneCallBodySparseCurrent = `{"lat":51.5074,"lon":-0.1278,"timezone":"Europe/London","timezone_offset":0,` +
+	`"current":{"dt":1772000000,"sunrise":1771960000,"sunset":1772010000,"temp":11.5,"feels_like":10.2,` +
+	`"pressure":1009,"humidity":78,"clouds":75,"visibility":8000,"wind_speed":6.2,"wind_deg":240,` +
+	`"weather":[{"id":803,"main":"Clouds","description":"broken clouds","icon":"04d"}]},` +
+	`"daily":[{"dt":1772000000,"sunrise":1771960000,"sunset":1772010000,"moonrise":1771970000,` +
+	`"moonset":1772040000,"moon_phase":0.42,"temp":{"day":15.0,"min":10.0,"max":20.0,"night":9.0,"morn":11.0,"eve":16.0},` +
+	`"feels_like":{"day":14.0,"night":8.0,"morn":10.0,"eve":15.0},"pressure":1015,"humidity":60,` +
+	`"wind_speed":4.0,"wind_deg":200,"clouds":40,"uvi":3.5,` +
+	`"weather":[{"id":801,"main":"Clouds","description":"scattered clouds","icon":"03d"}]}]}`
+
+// The three late additions to the current block are optional in practice, so the
+// faithful half reports them null when the upstream left them out. The legacy half has
+// no way to say null for a gust, so its key is absent instead, which is the same
+// statement in the vocabulary it has always used.
+func TestMapOneCallCurrentReportsAbsentMeasurementsAsNull(t *testing.T) {
+	data := mapOneCallBody(t, oneCallBodySparseCurrent)
+
+	if data.OneCall == nil || data.OneCall.Current == nil {
+		t.Fatal("expected the current block to be reported, got none")
+	}
+	current := data.OneCall.Current
+	if current.DewPoint != nil {
+		t.Fatalf("expected a null current dew_point, got %v", *current.DewPoint)
+	}
+	if current.Uvi != nil {
+		t.Fatalf("expected a null current uvi, got %v", *current.Uvi)
+	}
+	if current.WindGust != nil {
+		t.Fatalf("expected a null current wind_gust, got %v", *current.WindGust)
+	}
+	// The members the fixture did send are still reported, so this is a block with
+	// three gaps rather than an empty one.
+	if current.Temp == nil || *current.Temp != 11.5 {
+		t.Fatalf("expected the current temp 11.5, got %#v", current.Temp)
+	}
+	if current.Visibility == nil || *current.Visibility != 8000 {
+		t.Fatalf("expected the current visibility 8000, got %#v", current.Visibility)
+	}
+	// The legacy gust carries omitempty, so an absent gust is an absent key rather
+	// than a fabricated 0. That is the only null the legacy vocabulary can express
+	// for a float.
+	if data.Current.WindGust != 0 {
+		t.Fatalf("expected the legacy wind_gust to stay 0, got %v", data.Current.WindGust)
+	}
+	// The day's own late additions are optional too, and this body omits dew_point,
+	// wind_gust, pop, rain and snow on its one day.
+	day := data.OneCall.Daily[0]
+	for _, member := range []struct {
+		name string
+		gone bool
+	}{
+		{"dew_point", day.DewPoint == nil},
+		{"wind_gust", day.WindGust == nil},
+		{"pop", day.Pop == nil},
+		{"rain", day.Rain == nil},
+		{"snow", day.Snow == nil},
+	} {
+		if !member.gone {
+			t.Fatalf("expected a null daily %s on a body that omitted it, got a value", member.name)
+		}
+	}
+	if legacy := data.Forecast[0]; legacy.ChanceOfRain != nil || legacy.UVIndex == nil {
+		t.Fatalf("expected a null legacy chance_of_rain and a reported uv_index, got %#v and %#v", legacy.ChanceOfRain, legacy.UVIndex)
+	}
+}
+
+func TestSevenDayMapperKeepsEveryBlock(t *testing.T) {
+	data := mapOneCallBody(t, oneCallBodyWithBlocks)
+
+	if data.OneCall == nil {
+		t.Fatal("expected the onecall envelope to be present, got none")
+	}
+	if len(data.OneCall.Minutely) != 1 || data.OneCall.Minutely[0].Precipitation != 0.12 {
+		t.Fatalf("expected the upstream minutely entry, got %#v", data.OneCall.Minutely)
+	}
+	if data.OneCall.Minutely[0].Dt != 1772000060 {
+		t.Fatalf("expected the minutely dt to be kept, got %d", data.OneCall.Minutely[0].Dt)
+	}
+	if len(data.OneCall.Hourly) != 1 || data.OneCall.Hourly[0].Temp != 11.5 || data.OneCall.Hourly[0].Pop != 0.2 {
+		t.Fatalf("expected the upstream hourly entry, got %#v", data.OneCall.Hourly)
+	}
+	// A precipitation volume the upstream measured as 0 has to survive as 0 rather
+	// than being dropped by an omitempty anywhere along the way.
+	if data.OneCall.Hourly[0].Rain != 0 || data.OneCall.Hourly[0].Snow != 0 {
+		t.Fatalf("expected the measured zero hourly precipitation to survive, got rain %v snow %v",
+			data.OneCall.Hourly[0].Rain, data.OneCall.Hourly[0].Snow)
+	}
+	if len(data.OneCall.Alerts) != 1 || data.OneCall.Alerts[0].Event != "Flood warning" {
+		t.Fatalf("expected the upstream alert, got %#v", data.OneCall.Alerts)
+	}
+	if len(data.OneCall.Daily) != 1 {
+		t.Fatalf("expected the one upstream day, got %d", len(data.OneCall.Daily))
+	}
+	if data.OneCall.Current == nil {
+		t.Fatal("expected the faithful current block, got none")
+	}
+	if data.OneCall.Lat != 51.5074 || data.OneCall.Lon != -0.1278 || data.OneCall.Timezone != "Europe/London" {
+		t.Fatalf("expected the envelope scalars to be mirrored, got %#v", data.OneCall)
+	}
+}
+
+// The whole response is built from two decodes of one body, so a body that has
+// members the mapper cannot see any more still answers. Nothing here is a crash
+// path: the route has to return something, and what it returns has to say which
+// readings it does not have.
+func TestMapOneCallWithoutAPayloadStillReportsEveryDay(t *testing.T) {
+	owm, payload := decodeOneCallBody(t, oneCallBodyWithBlocks)
+	payload = models.SevenDayPayload{}
+
+	data := NewWeatherService("dummy").mapOneCall(owm, payload, &models.Location{Name: "London"})
+
+	if data.OneCall == nil {
+		t.Fatal("expected the onecall envelope to be present, got none")
+	}
+	if len(data.OneCall.Daily) != 1 {
+		t.Fatalf("expected the one upstream day, got %d", len(data.OneCall.Daily))
+	}
+	day := data.OneCall.Daily[0]
+	if day.Dt == nil || *day.Dt != 1772000000 {
+		t.Fatalf("expected the daily dt with no payload, got %#v", day.Dt)
+	}
+	// The timestamps are unconditionally sent, so they survive with no payload. Every
+	// measurement reports null, and the day is still a day. The members are checked
+	// through their own nil test rather than through an any, because a nil pointer
+	// stored in an interface is not itself nil.
+	for _, member := range []struct {
+		name string
+		gone bool
+	}{
+		{"temp", day.Temp == nil},
+		{"feels_like", day.FeelsLike == nil},
+		{"humidity", day.Humidity == nil},
+		{"dew_point", day.DewPoint == nil},
+		{"wind_speed", day.WindSpeed == nil},
+		{"wind_deg", day.WindDeg == nil},
+		{"wind_gust", day.WindGust == nil},
+		{"pop", day.Pop == nil},
+		{"rain", day.Rain == nil},
+		{"snow", day.Snow == nil},
+		{"uvi", day.Uvi == nil},
+	} {
+		if !member.gone {
+			t.Fatalf("expected a null daily %s with no payload, got a value", member.name)
+		}
+	}
+	// The members the allowlist covers are read from the decode struct rather than
+	// from a presence view, so they keep their values with no payload at all. That is
+	// the whole claim an allowlist entry makes, and the cascade is the honest answer:
+	// the upstream documents them as sent, so there is a reading to report.
+	if day.Dt == nil || day.Pressure == nil || day.Clouds == nil || day.MoonPhase == nil || day.Weather == nil {
+		t.Fatalf("expected the always-sent daily members to survive a missing payload, got %#v", day)
+	}
+	if *day.Pressure != 1015 || *day.Clouds != 40 {
+		t.Fatalf("expected the always-sent daily readings to come from the decode struct, got pressure %v clouds %v",
+			*day.Pressure, *day.Clouds)
+	}
+	// The same thirteen readings on the current block, and the block itself is still
+	// there: the upstream sent it, so the response says so and reports its
+	// measurements as null.
+	if data.OneCall.Current == nil {
+		t.Fatal("expected the current block to survive a missing payload, got none")
+	}
+	for _, member := range []struct {
+		name string
+		gone bool
+	}{
+		{"temp", data.OneCall.Current.Temp == nil},
+		{"feels_like", data.OneCall.Current.FeelsLike == nil},
+		{"pressure", data.OneCall.Current.Pressure == nil},
+		{"humidity", data.OneCall.Current.Humidity == nil},
+		{"dew_point", data.OneCall.Current.DewPoint == nil},
+		{"uvi", data.OneCall.Current.Uvi == nil},
+		{"clouds", data.OneCall.Current.Clouds == nil},
+		{"visibility", data.OneCall.Current.Visibility == nil},
+		{"wind_speed", data.OneCall.Current.WindSpeed == nil},
+		{"wind_deg", data.OneCall.Current.WindDeg == nil},
+		{"wind_gust", data.OneCall.Current.WindGust == nil},
+	} {
+		if !member.gone {
+			t.Fatalf("expected a null current %s with no payload, got a value", member.name)
+		}
+	}
+	if data.OneCall.Current.Dt == nil || *data.OneCall.Current.Dt != 1772000000 {
+		t.Fatalf("expected the current dt with no payload, got %#v", data.OneCall.Current.Dt)
+	}
+
+	// The legacy array is still capped and still present. With no payload the route
+	// can measure nothing, so every legacy numeric reading is null rather than 0.
+	if len(data.Forecast) != 1 {
+		t.Fatalf("expected 1 legacy day, got %d", len(data.Forecast))
+	}
+	legacy := data.Forecast[0]
+	if legacy.MaxTemp != nil || legacy.MinTemp != nil || legacy.AvgTemp != nil ||
+		legacy.Humidity != nil || legacy.WindSpeed != nil ||
+		legacy.ChanceOfRain != nil || legacy.UVIndex != nil {
+		t.Fatalf("expected null legacy readings with no payload, got %#v", legacy)
+	}
+	// The legacy condition comes from the weather array, which needs no payload.
+	if legacy.Condition != "Clouds" || legacy.Icon != "03d" {
+		t.Fatalf("expected the legacy condition from the weather array, got %#v", legacy)
+	}
+	// The legacy current block is derived from the decode struct alone and is
+	// unchanged by the missing payload.
+	if legacy.Description != "Scattered Clouds" {
+		t.Fatalf("expected a title cased legacy description, got %q", legacy.Description)
+	}
+	if data.Current.Temperature != 11.5 || data.Current.Humidity != 78 {
+		t.Fatalf("expected the legacy current block to survive a missing payload, got %#v", data.Current)
 	}
 }

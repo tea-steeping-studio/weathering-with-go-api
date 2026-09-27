@@ -110,6 +110,208 @@ func sevenDayJSON() string {
 	return fmt.Sprintf(`{"lat":51.5074,"lon":-0.1278,"timezone":"Europe/London","current":{"dt":1772000000,"sunrise":1771960000,"sunset":1772010000,"temp":11.5,"feels_like":10.2,"pressure":1009,"humidity":78,"dew_point":7.7,"uvi":1.8,"clouds":75,"visibility":8000,"wind_speed":6.2,"wind_deg":240,"wind_gust":9.1,"weather":[{"id":803,"main":"Clouds","description":"broken clouds","icon":"04d"}]},"daily":[%s]}`, strings.Join(days, ","))
 }
 
+// The seven day route has no grouping step: the upstream sends a daily entry per
+// day and the response reports them in the order it received them. That makes a
+// fixed UTC anchor sufficient here, where the forecast route needs one because it
+// groups slots by date. Noon UTC keeps every day on its own calendar date in every
+// host zone.
+var sevenDayRouteBase = time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+
+// sevenDayRouteDayCount is the number of daily entries the shared seven day
+// fixtures carry. It is deliberately more than the legacy cap of 7: the faithful
+// daily[] is uncapped, so a fixture with more entries than the legacy array is the
+// only thing that makes the difference visible, and a test that asserts 8 is what
+// stops the fixture from quietly shrinking to 7.
+const sevenDayRouteDayCount = 8
+
+// sevenDayDay renders one raw /data/3.0/onecall daily entry. A member absent from
+// members is absent from the body, which is how a fixture says the upstream never
+// sent it, as distinct from sending it as 0.
+func sevenDayDay(at time.Time, members map[string]any) map[string]any {
+	day := map[string]any{
+		"dt":         at.Unix(),
+		"sunrise":    at.Add(-6 * time.Hour).Unix(),
+		"sunset":     at.Add(6 * time.Hour).Unix(),
+		"moonrise":   at.Add(-9 * time.Hour).Unix(),
+		"moonset":    at.Add(9 * time.Hour).Unix(),
+		"moon_phase": 0.42,
+		"pressure":   1015,
+		"clouds":     40,
+		"weather":    []any{map[string]any{"id": 801, "main": "Clouds", "description": "scattered clouds", "icon": "03d"}},
+	}
+	for name, value := range members {
+		day[name] = value
+	}
+	return day
+}
+
+// oneCallCurrentBlock is the upstream current block the seven day fixtures carry.
+// It is a literal rather than a map because no fixture omits a member of it.
+const oneCallCurrentBlock = `{"dt":1772000000,"sunrise":1771960000,"sunset":1772010000,` +
+	`"temp":11.5,"feels_like":10.2,"pressure":1009,"humidity":78,"dew_point":7.7,"uvi":1.8,` +
+	`"clouds":75,"visibility":8000,"wind_speed":6.2,"wind_deg":240,"wind_gust":9.1,` +
+	`"weather":[{"id":803,"main":"Clouds","description":"broken clouds","icon":"04d"}]}`
+
+// oneCallOptInBlocks are the three blocks the route used to ask the upstream to
+// exclude. They are here so the tests can assert the mapper carries them through.
+const oneCallOptInBlocks = `,"minutely":[{"dt":1772000060,"precipitation":0.12}],` +
+	`"hourly":[{"dt":1772000000,"sunrise":1771960000,"sunset":1772010000,"temp":11.5,` +
+	`"feels_like":10.2,"pressure":1009,"humidity":78,"dew_point":7.7,"uvi":1.8,"clouds":75,` +
+	`"visibility":8000,"wind_speed":6.2,"wind_deg":240,"wind_gust":9.1,"pop":0.2,"rain":0,` +
+	`"snow":0,"weather":[{"id":803,"main":"Clouds","description":"broken clouds","icon":"04d"}]}],` +
+	`"alerts":[{"sender_name":"Met Office","event":"Flood warning","start":1772000000,` +
+	`"end":1772600000,"description":"Flooding is possible.","tags":["Flood"]}]`
+
+// mustOneCallBody renders a whole /data/3.0/onecall body around rendered days.
+func mustOneCallBody(t *testing.T, days []string) string {
+	t.Helper()
+	return `{"lat":51.5074,"lon":-0.1278,"timezone":"Europe/London","timezone_offset":0,` +
+		`"current":` + oneCallCurrentBlock +
+		`,"daily":[` + strings.Join(days, ",") + `]` + oneCallOptInBlocks + `}`
+}
+
+// sevenDayRouteFullJSON carries sevenDayRouteDayCount days with every member the
+// One Call daily block documents, so the faithful mirror has something to mirror.
+// Day i is offset by i on every reading, so a test can tell one day from another.
+func sevenDayRouteFullJSON(t *testing.T) string {
+	t.Helper()
+	days := make([]string, 0, sevenDayRouteDayCount)
+	for i := range sevenDayRouteDayCount {
+		day := sevenDayDay(sevenDayRouteBase.AddDate(0, 0, i), map[string]any{
+			"temp": map[string]any{
+				"day":   float64(15 + i),
+				"min":   float64(10 + i),
+				"max":   float64(20 + i),
+				"night": 9.0,
+				"morn":  11.0,
+				"eve":   16.0,
+			},
+			"feels_like": map[string]any{"day": 14.0, "night": 8.0, "morn": 10.0, "eve": 15.0},
+			"humidity":   60 + i,
+			"dew_point":  7.7,
+			"wind_speed": 4.0,
+			"wind_deg":   200,
+			"wind_gust":  9.1,
+			// 0.29 is the probability whose percentage truncates: 0.29*100 is
+			// 28.999999999999996 in binary floating point, so chance_of_rain has to
+			// be rounded to answer 29 rather than 28.
+			"pop":  0.29,
+			"rain": 1.5,
+			"snow": 0,
+			"uvi":  3.5,
+		})
+		rendered, err := json.Marshal(day)
+		if err != nil {
+			t.Fatalf("failed to render a seven day fixture: %v", err)
+		}
+		days = append(days, string(rendered))
+	}
+	return mustOneCallBody(t, days)
+}
+
+// sevenDayRouteSparseDayJSON is the pair of states the faithful mirror has to keep
+// apart. Day 0 reports no temp, feels_like, humidity, dew_point, wind, pop, rain,
+// snow or uvi at all, so every one of those is a key with no value and the response
+// has to say null. Day 1 reports a rain volume the upstream genuinely measured as 0
+// and no snow, so 0 and an absent member are two different readings on the same day
+// array.
+func sevenDayRouteSparseDayJSON(t *testing.T) string {
+	t.Helper()
+	sparse, err := json.Marshal(sevenDayDay(sevenDayRouteBase, nil))
+	if err != nil {
+		t.Fatalf("failed to render the sparse day fixture: %v", err)
+	}
+	zeroRain, err := json.Marshal(sevenDayDay(sevenDayRouteBase.AddDate(0, 0, 1), map[string]any{
+		"temp":       map[string]any{"day": 16.0, "min": 11.0, "max": 21.0, "night": 9.0, "morn": 11.0, "eve": 16.0},
+		"feels_like": map[string]any{"day": 14.0, "night": 8.0, "morn": 10.0, "eve": 15.0},
+		"humidity":   61,
+		"dew_point":  7.7,
+		"wind_speed": 4.0,
+		"wind_deg":   200,
+		"wind_gust":  9.1,
+		"rain":       0,
+		"uvi":        3.5,
+	}))
+	if err != nil {
+		t.Fatalf("failed to render the zero rain day fixture: %v", err)
+	}
+	return mustOneCallBody(t, []string{string(sparse), string(zeroRain)})
+}
+
+// newSevenDayRouteRouter serves one fixed upstream body to the seven day route, so
+// the faithful mirror can be asserted member by member. It answers the geocoding
+// call too, because this route geocodes before it fetches, and it builds its own
+// server rather than reusing the shared stub because the shared fixture carries
+// neither the opt-in blocks nor the members this route's tests read.
+func newSevenDayRouteRouter(t *testing.T, upstream string) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/geo/1.0/direct"):
+			fmt.Fprintln(w, `[{"name":"London","lat":51.5074,"lon":-0.1278,"country":"GB","state":"England"}]`)
+		case strings.HasPrefix(r.URL.Path, "/data/3.0/onecall"):
+			fmt.Fprintln(w, upstream)
+		default:
+			t.Errorf("unexpected upstream path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := services.NewWeatherService("dummy")
+	svc.HTTPClient = &http.Client{Transport: &transportRedirect{target: srv.URL}}
+
+	router := gin.New()
+	router.GET("/api/v1/weather/forecast/7day", NewWeatherHandler(svc).GetSevenDayForecast)
+	return router
+}
+
+// requestSevenDayRoute returns the whole data object, so a test can read the
+// faithful onecall namespace and the legacy keys from the same body.
+func requestSevenDayRoute(t *testing.T, router *gin.Engine) map[string]any {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/weather/forecast/7day?location=London,UK&units=metric", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d body=%s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Success bool           `json:"success"`
+		Data    map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response %q: %v", w.Body.String(), err)
+	}
+	if !resp.Success {
+		t.Fatalf("expected a success response, got %q", w.Body.String())
+	}
+	return resp.Data
+}
+
+// array returns an array member as a slice of objects.
+func array(t *testing.T, parent map[string]any, key string) []map[string]any {
+	t.Helper()
+	raw, ok := parent[key].([]any)
+	if !ok {
+		t.Fatalf("expected an array at %q, got %#v", key, parent[key])
+	}
+	entries := make([]map[string]any, 0, len(raw))
+	for _, entry := range raw {
+		object, ok := entry.(map[string]any)
+		if !ok {
+			t.Fatalf("expected an object in %q, got %#v", key, entry)
+		}
+		entries = append(entries, object)
+	}
+	return entries
+}
+
 type upstreamStub struct {
 	currentCalls  int32
 	forecastCalls int32
@@ -564,6 +766,306 @@ func TestSevenDayForecastHandlerForwardsCallerKey(t *testing.T) {
 	}
 	if values.Get("appid") != "caller-key" {
 		t.Fatalf("expected caller key to be forwarded, got %q", values.Get("appid"))
+	}
+}
+
+// The seven day route must mirror the whole One Call daily block, not a rollup of
+// it. The time of day breakdown is the part a rollup throws away, and it is the
+// part a client reading a forecast for a picnic or a commute actually needs.
+func TestSevenDayRouteExposesFullDailyBreakdown(t *testing.T) {
+	data := requestSevenDayRoute(t, newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t)))
+
+	onecall := block(t, data, "onecall")
+	days := array(t, onecall, "daily")
+	// Both numbers are literals, not the constant that drives the fixture. A
+	// self-referential assertion shrinks with the fixture and proves nothing, which
+	// is the failure mode this test is here to catch on the production side.
+	if sevenDayRouteDayCount != 8 {
+		t.Fatalf("expected the fixture to carry 8 days, got %d", sevenDayRouteDayCount)
+	}
+	if len(days) != 8 {
+		t.Fatalf("expected the faithful daily[] to carry all 8 days the fixture sent, got %d", len(days))
+	}
+
+	day := days[0]
+	temp := block(t, day, "temp")
+	for name, want := range map[string]float64{
+		"day": 15, "min": 10, "max": 20, "night": 9, "morn": 11, "eve": 16,
+	} {
+		if temp[name] != want {
+			t.Fatalf("expected daily[0].temp.%s to be %v, got %#v", name, want, temp[name])
+		}
+	}
+
+	feelsLike := block(t, day, "feels_like")
+	for name, want := range map[string]float64{
+		"day": 14, "night": 8, "morn": 10, "eve": 15,
+	} {
+		if feelsLike[name] != want {
+			t.Fatalf("expected daily[0].feels_like.%s to be %v, got %#v", name, want, feelsLike[name])
+		}
+	}
+
+	// The lunar members are documented for this endpoint and are part of the day.
+	if day["moon_phase"] != 0.42 {
+		t.Fatalf("expected daily[0].moon_phase 0.42, got %#v", day["moon_phase"])
+	}
+	moonrise := sevenDayRouteBase.Add(-9 * time.Hour).Unix()
+	moonset := sevenDayRouteBase.Add(9 * time.Hour).Unix()
+	if day["moonrise"] != float64(moonrise) || day["moonset"] != float64(moonset) {
+		t.Fatalf("expected daily[0] moonrise %d and moonset %d, got %#v and %#v", moonrise, moonset, day["moonrise"], day["moonset"])
+	}
+	if day["dt"] != float64(sevenDayRouteBase.Unix()) {
+		t.Fatalf("expected daily[0].dt %d, got %#v", sevenDayRouteBase.Unix(), day["dt"])
+	}
+}
+
+// dew_point and wind_gust are the two members the daily endpoint gained after the
+// first release of the API, so a mirror built from an older field list drops them
+// silently and nothing else notices.
+func TestSevenDayRouteExposesDewPointAndWindGust(t *testing.T) {
+	data := requestSevenDayRoute(t, newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t)))
+
+	days := array(t, block(t, data, "onecall"), "daily")
+	day := days[0]
+	if day["dew_point"] != 7.7 {
+		t.Fatalf("expected daily[0].dew_point 7.7, got %#v", day["dew_point"])
+	}
+	if day["wind_gust"] != 9.1 {
+		t.Fatalf("expected daily[0].wind_gust 9.1, got %#v", day["wind_gust"])
+	}
+}
+
+// The faithful daily array is whatever the upstream sent. The legacy array keeps
+// its cap of seven, because that is part of the contract consumers already read.
+func TestSevenDayDailyMayExceedLegacyForecastLength(t *testing.T) {
+	data := requestSevenDayRoute(t, newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t)))
+
+	onecall := block(t, data, "onecall")
+	days := array(t, onecall, "daily")
+	legacy := array(t, data, "forecast")
+	// Literals again, and the two are different numbers on purpose: that difference is
+	// the whole claim, and an assertion that read one constant for both would pass on
+	// a mapper that capped both.
+	if len(days) != 8 {
+		t.Fatalf("expected the faithful daily[] to carry all 8 days the fixture sent, got %d", len(days))
+	}
+	if len(legacy) != 7 {
+		t.Fatalf("expected the legacy forecast[] to stay capped at 7, got %d", len(legacy))
+	}
+	// The eighth day is only in the faithful array, and it is a day the legacy cut
+	// would have taken had it not stopped.
+	if days[7]["dt"] == legacy[6]["dt"] {
+		t.Fatal("expected the eighth day to be absent from the capped legacy array")
+	}
+}
+
+// The envelope scalars are the coordinates the route geocoded and the zone the
+// upstream reports, and they are always present: the onecall key is not an opt-in.
+func TestSevenDayRouteMirrorsOneCallEnvelope(t *testing.T) {
+	data := requestSevenDayRoute(t, newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t)))
+
+	onecall := block(t, data, "onecall")
+	if onecall["lat"] != 51.5074 || onecall["lon"] != -0.1278 {
+		t.Fatalf("expected the onecall coordinates from the upstream body, got %#v and %#v", onecall["lat"], onecall["lon"])
+	}
+	if onecall["timezone"] != "Europe/London" || onecall["timezone_offset"] != 0.0 {
+		t.Fatalf("expected the onecall timezone, got %#v at offset %#v", onecall["timezone"], onecall["timezone_offset"])
+	}
+
+	current := block(t, onecall, "current")
+	if current["temp"] != 11.5 || current["dew_point"] != 7.7 || current["uvi"] != 1.8 || current["wind_gust"] != 9.1 {
+		t.Fatalf("expected the faithful current block to mirror the upstream, got %#v", current)
+	}
+	// The current block documents no probability, so the response must not invent
+	// one beside the block.
+	if _, ok := current["pop"]; ok {
+		t.Fatalf("expected no pop on the faithful current block, got %#v", current["pop"])
+	}
+
+	// The legacy block keeps its own vocabulary at the top level, alongside the
+	// namespace rather than inside it.
+	if location := block(t, data, "location"); location["name"] != "London" {
+		t.Fatalf("expected the legacy location.name London, got %#v", location)
+	}
+	if current := block(t, data, "current"); current["temperature"] != 11.5 {
+		t.Fatalf("expected the legacy current.temperature 11.5, got %#v", current)
+	}
+	if _, ok := data["request_time"]; !ok {
+		t.Fatalf("expected a request_time key, got %#v", data)
+	}
+}
+
+// The three opt-in blocks used to be excluded upstream. The route has to ask for
+// all of them: a missing exclude costs no extra request and no extra quota, and the
+// blocks are the whole reason a client would choose this route over the 5 day one.
+func TestSevenDayRouteAlwaysFetchesEveryBlock(t *testing.T) {
+	stub := &upstreamStub{}
+	router := newStubbedRouter(t, stub)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/weather/forecast/7day?location=London,UK&units=metric", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d body=%s", w.Code, w.Body.String())
+	}
+	if got := atomic.LoadInt32(&stub.oneCallCalls); got != 1 {
+		t.Fatalf("expected 1 one call request, got %d", got)
+	}
+
+	query, _ := stub.lastQuery.Load().(string)
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		t.Fatalf("failed to parse upstream query %q: %v", query, err)
+	}
+	if values.Has("exclude") {
+		t.Fatalf("expected no exclude parameter upstream, got %q", values.Get("exclude"))
+	}
+}
+
+// Every block the mapper is given has to reach the response. minutely, hourly and
+// alerts are opt-in at the route level, which is an exposure decision taken after
+// the mapper runs, not a reason for the mapper to drop them.
+func TestSevenDayRouteCarriesEveryUpstreamBlock(t *testing.T) {
+	data := requestSevenDayRoute(t, newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t)))
+
+	onecall := block(t, data, "onecall")
+	minutely := array(t, onecall, "minutely")
+	if len(minutely) != 1 || minutely[0]["precipitation"] != 0.12 {
+		t.Fatalf("expected the fixture's single minutely entry, got %#v", minutely)
+	}
+	// minutely[].precipitation is a probability, not a volume, and dt is the minute
+	// it applies to. A test that only counted the entries would pass on a mapper
+	// that swapped them.
+	if minutely[0]["dt"] != 1772000060.0 {
+		t.Fatalf("expected minutely[0].dt 1772000060, got %#v", minutely[0]["dt"])
+	}
+
+	hourly := array(t, onecall, "hourly")
+	if len(hourly) != 1 || hourly[0]["temp"] != 11.5 || hourly[0]["pop"] != 0.2 {
+		t.Fatalf("expected the fixture's single hourly entry, got %#v", hourly)
+	}
+
+	alerts := array(t, onecall, "alerts")
+	if len(alerts) != 1 || alerts[0]["event"] != "Flood warning" || alerts[0]["sender_name"] != "Met Office" {
+		t.Fatalf("expected the fixture's single alert, got %#v", alerts)
+	}
+}
+
+// A day the upstream could not measure reports null, in both vocabularies. The
+// failure this guards against is a day that reported nothing emitting a row of
+// zeroes, which reads as a forecast of exactly average weather rather than as a
+// gap.
+func TestSevenDayRouteNullsUnmeasurableDailyMembers(t *testing.T) {
+	data := requestSevenDayRoute(t, newSevenDayRouteRouter(t, sevenDayRouteSparseDayJSON(t)))
+
+	days := array(t, block(t, data, "onecall"), "daily")
+	legacy := array(t, data, "forecast")
+	if len(days) != 2 || len(legacy) != 2 {
+		t.Fatalf("expected 2 days from the fixture, got %d faithful and %d legacy", len(days), len(legacy))
+	}
+
+	// Day 0 sent no temp, feels_like, humidity, dew_point, wind, pop, rain, snow
+	// or uvi. Every one of those is a key the schema documents, so each is present
+	// and null rather than dropped or zeroed.
+	sparse := days[0]
+	nullKey(t, sparse, "temp")
+	nullKey(t, sparse, "feels_like")
+	for _, name := range []string{
+		"humidity", "dew_point", "wind_speed", "wind_deg", "wind_gust",
+		"pop", "rain", "snow", "uvi",
+	} {
+		nullKey(t, sparse, name)
+	}
+	// The members the fixture did send are still reported, so the day is a day with
+	// gaps rather than an empty one.
+	if sparse["dt"] != float64(sevenDayRouteBase.Unix()) || sparse["pressure"] != 1015.0 || sparse["clouds"] != 40.0 {
+		t.Fatalf("expected the sparse day to report the members it sent, got %#v", sparse)
+	}
+
+	// The legacy half of the same day is null in exactly the same places. These are
+	// the keys that used to be a value type, so a mapper that assigned a zeroed
+	// local instead of a pointer would compile and emit a fabricated reading.
+	legacySparse := legacy[0]
+	for _, name := range []string{
+		"max_temperature", "min_temperature", "avg_temperature",
+		"humidity", "wind_speed", "chance_of_rain", "uv_index",
+	} {
+		nullKey(t, legacySparse, name)
+	}
+	// A total of zero is a reading rather than an absence, so precipitation stays a
+	// number: nothing fell, and that is an answer.
+	if legacySparse["precipitation"] != 0.0 {
+		t.Fatalf("expected a legacy precipitation of 0 for a day with no precipitation, got %#v", legacySparse["precipitation"])
+	}
+
+	// Day 1 measured a rain volume of 0 and sent no snow, so the day repeats the
+	// difference: a measured zero and an absent member are two readings.
+	measured := days[1]
+	if measured["rain"] != 0.0 {
+		t.Fatalf("expected a measured daily rain of 0, got %#v", measured["rain"])
+	}
+	nullKey(t, measured, "snow")
+	// It sent no pop, so the legacy percentage is null rather than 0: 0 would claim
+	// the upstream measured a zero chance of rain.
+	nullKey(t, legacy[1], "chance_of_rain")
+	if legacy[1]["max_temperature"] != 21.0 {
+		t.Fatalf("expected day 1 max_temperature 21, got %#v", legacy[1]["max_temperature"])
+	}
+}
+
+// The legacy current block and the faithful One Call current block are the same
+// upstream object read twice. If they can disagree, one of them is lying.
+func TestSevenDayLegacyCurrentAliasesFaithfulCurrent(t *testing.T) {
+	data := requestSevenDayRoute(t, newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t)))
+
+	legacy := block(t, data, "current")
+	current := block(t, block(t, data, "onecall"), "current")
+
+	for _, pair := range [][2]string{
+		{"temperature", "temp"},
+		{"feels_like", "feels_like"},
+		{"humidity", "humidity"},
+		{"pressure", "pressure"},
+		{"visibility", "visibility"},
+		{"wind_speed", "wind_speed"},
+		{"wind_direction", "wind_deg"},
+		{"wind_gust", "wind_gust"},
+		{"cloud_cover", "clouds"},
+	} {
+		if legacy[pair[0]] != current[pair[1]] {
+			t.Fatalf("expected legacy current.%s and onecall.current.%s to be the same reading, got %#v and %#v",
+				pair[0], pair[1], legacy[pair[0]], current[pair[1]])
+		}
+	}
+
+	// The legacy temperatures stay at 0 on this route, as they have always been: the
+	// One Call current block reports no min or max, so any value there would be
+	// invented. The faithful twin of the two is a time of day breakdown on the day,
+	// not on the current block.
+	if legacy["max_temperature"] != 0.0 || legacy["min_temperature"] != 0.0 {
+		t.Fatalf("expected the legacy current temperatures to stay 0, got %#v and %#v",
+			legacy["max_temperature"], legacy["min_temperature"])
+	}
+	if _, ok := current["temp_max"]; ok {
+		t.Fatalf("expected no max_temperature on the faithful current block, got %#v", current["temp_max"])
+	}
+}
+
+// 0.29 is the probability whose percentage truncates in binary floating point. A
+// truncation reports 28 for a day the upstream called 29 percent, and the 5 day
+// route rounds, so the same probability would read differently on two routes.
+func TestSevenDayChanceOfRainRoundsTheDailyProbability(t *testing.T) {
+	data := requestSevenDayRoute(t, newSevenDayRouteRouter(t, sevenDayRouteFullJSON(t)))
+
+	days := array(t, block(t, data, "onecall"), "daily")
+	legacy := array(t, data, "forecast")
+	if days[0]["pop"] != 0.29 {
+		t.Fatalf("expected the fixture pop 0.29, got %#v", days[0]["pop"])
+	}
+	if legacy[0]["chance_of_rain"] != 29.0 {
+		t.Fatalf("expected chance_of_rain 29 from pop 0.29, got %#v", legacy[0]["chance_of_rain"])
 	}
 }
 

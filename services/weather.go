@@ -25,7 +25,6 @@ const (
 	GeocodingEndpoint      = "/direct"
 	OneCallBaseURL         = "https://api.openweathermap.org/data/3.0"
 	OneCallEndpoint        = "/onecall"
-	OneCallExcludes        = "minutely,hourly,alerts"
 	SevenDayCount          = 7
 	DefaultUnits           = "metric"
 	DefaultTimeout         = 10 * time.Second
@@ -188,7 +187,7 @@ func (w *WeatherService) fetchWeatherForecast(location, units string, days int, 
 
 // GetSevenDayForecast fetches a seven day daily forecast for a location.
 // The location is geocoded first because One Call 3.0 works on coordinates.
-func (w *WeatherService) GetSevenDayForecast(location, units, apikey string) (*models.WeatherData, bool, error) {
+func (w *WeatherService) GetSevenDayForecast(location, units, apikey string) (*models.SevenDayResponse, bool, error) {
 	if location == "" {
 		return nil, false, fmt.Errorf("location cannot be empty")
 	}
@@ -198,7 +197,7 @@ func (w *WeatherService) GetSevenDayForecast(location, units, apikey string) (*m
 	}
 
 	key := weatherCacheKey(apikey, sevenDayCacheEndpoint, location, units, SevenDayCount)
-	return cachedFetchTracked(w, key, func() (*models.WeatherData, error) {
+	return cachedFetchTracked(w, key, func() (*models.SevenDayResponse, error) {
 		loc, err := w.geocodeLocation(location, apikey)
 		if err != nil {
 			return nil, err
@@ -253,12 +252,14 @@ func (w *WeatherService) fetchGeocodedLocation(location, apikey string) (*models
 	}, nil
 }
 
-func (w *WeatherService) fetchSevenDayForecast(loc *models.Location, units, apikey string) (*models.WeatherData, error) {
+func (w *WeatherService) fetchSevenDayForecast(loc *models.Location, units, apikey string) (*models.SevenDayResponse, error) {
 	params := url.Values{}
 	params.Add("lat", strconv.FormatFloat(loc.Latitude, 'f', -1, 64))
 	params.Add("lon", strconv.FormatFloat(loc.Longitude, 'f', -1, 64))
 	params.Add("units", units)
-	params.Add("exclude", OneCallExcludes)
+	// No exclude parameter. Asking for minutely, hourly and alerts costs no extra
+	// request and no extra quota on this endpoint, and dropping them is what left the
+	// route unable to serve anything the 5 day route cannot.
 	params.Add("appid", w.resolveAPIKey(apikey))
 
 	fullURL := fmt.Sprintf("%s%s?%s", OneCallBaseURL, OneCallEndpoint, params.Encode())
@@ -274,51 +275,245 @@ func (w *WeatherService) fetchSevenDayForecast(loc *models.Location, units, apik
 		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var owmResp models.OneCallResponse
-	if err := json.NewDecoder(resp.Body).Decode(&owmResp); err != nil {
+	// Read the body once and decode it twice: once into the upstream structs and
+	// once into the pointer view of the members they cannot express, which is where
+	// a measured zero and an absent member are told apart. This is one upstream
+	// request, not two.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return nil, fmt.Errorf("failed to parse API response: %w", err)
 	}
 
-	return w.convertOneCallResponse(owmResp, loc), nil
-}
-
-// convertOneCallResponse converts the One Call 3.0 daily forecast to our internal model
-func (w *WeatherService) convertOneCallResponse(owm models.OneCallResponse, loc *models.Location) *models.WeatherData {
-	forecasts := make([]models.Forecast, 0, SevenDayCount)
-	for i, day := range owm.Daily {
-		if i >= SevenDayCount {
-			break
-		}
-
-		var condition, description, icon string
-		if len(day.Weather) > 0 {
-			condition = day.Weather[0].Main
-			description = day.Weather[0].Description
-			icon = day.Weather[0].Icon
-		}
-
-		forecasts = append(forecasts, models.Forecast{
-			Date:          time.Unix(day.Dt, 0),
-			MaxTemp:       day.Temp.Max,
-			MinTemp:       day.Temp.Min,
-			AvgTemp:       day.Temp.Day,
-			Condition:     condition,
-			Description:   strings.Title(description),
-			Icon:          icon,
-			Humidity:      day.Humidity,
-			WindSpeed:     day.WindSpeed,
-			Precipitation: day.Rain + day.Snow,
-			ChanceOfRain:  int(day.Pop * 100),
-			UVIndex:       day.Uvi,
-		})
+	var owmResp models.OneCallResponse
+	if err := json.Unmarshal(body, &owmResp); err != nil {
+		return nil, fmt.Errorf("failed to parse API response: %w", err)
 	}
 
-	return &models.WeatherData{
+	var payload models.SevenDayPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("failed to parse API response: %w", err)
+	}
+
+	return w.mapOneCall(owmResp, payload, loc), nil
+}
+
+// mapOneCall builds the seven day route's response: a faithful mirror of the
+// /data/3.0/onecall body under the onecall key, and the legacy vocabulary beside it.
+// Values come from owm, presence from payload.
+//
+// The faithful daily array is every day the upstream sent, because that is what the
+// upstream measured. The legacy array is the first seven of them, because that cap is
+// part of the contract consumers already read. The two are built from the same
+// presence value for the same day, so a legacy reading and its faithful twin cannot
+// disagree even where they overlap.
+func (w *WeatherService) mapOneCall(owm models.OneCallResponse, payload models.SevenDayPayload, loc *models.Location) *models.SevenDayResponse {
+	envelope := &models.OneCallEnvelope{
+		Lat:            owm.Lat,
+		Lon:            owm.Lon,
+		Timezone:       owm.Timezone,
+		TimezoneOffset: owm.TimezoneOffset,
+		// The three opt-in blocks are carried as the upstream sent them. Whether a
+		// caller sees one is a decision taken after this body is built, so the cached
+		// response always holds them all and one upstream call serves every variant.
+		Minutely: owm.Minutely,
+		Hourly:   owm.Hourly,
+		Alerts:   owm.Alerts,
+	}
+
+	if owm.Current != nil {
+		current := oneCallCurrentPoint(*owm.Current, payload.Current)
+		envelope.Current = &current
+	}
+
+	for i, day := range owm.Daily {
+		envelope.Daily = append(envelope.Daily, oneCallDailyPoint(day, oneCallPresence(payload, i)))
+	}
+
+	forecasts := make([]models.Forecast, 0, min(len(owm.Daily), SevenDayCount))
+	for i, day := range owm.Daily {
+		if len(forecasts) >= SevenDayCount {
+			break
+		}
+		forecasts = append(forecasts, oneCallLegacyDay(day, oneCallPresence(payload, i)))
+	}
+
+	return &models.SevenDayResponse{
+		OneCall: envelope,
+		// The legacy location is the geocoder's answer verbatim, as it has always
+		// been, while onecall.lat and onecall.lon are the upstream's echo of the same
+		// coordinates. Two sources for one pair of numbers, so they are read from
+		// where each has always come from rather than being made to agree here.
 		Location:    *loc,
 		Current:     currentFromOneCall(owm.Current),
 		Forecast:    forecasts,
 		RequestTime: w.now(),
 	}
+}
+
+// oneCallPresence is the presence view of the i-th daily entry. The two decodes walk
+// one array in the same order, so the indexes line up; a payload shorter than the
+// upstream array is not something one body can produce, and a missing presence view
+// is treated as no presence rather than as a panic.
+func oneCallPresence(payload models.SevenDayPayload, i int) models.SevenDayPayloadDaily {
+	if i < len(payload.Daily) {
+		return payload.Daily[i]
+	}
+	return models.SevenDayPayloadDaily{}
+}
+
+// oneCallCurrentPoint maps the upstream current block. The timestamps and the weather
+// array are read from the decode struct, where the upstream documents them as sent
+// and a zero is a real reading; every measurement comes from the payload, so an
+// absent one is null. A nil presence view reports the block with all of them null
+// rather than dropping the block, since the block itself was there.
+func oneCallCurrentPoint(current models.OneCallCurrent, presence *models.SevenDayPayloadCurrent) models.OneCallCurrentPoint {
+	dt, sunrise, sunset := current.Dt, current.Sunrise, current.Sunset
+
+	point := models.OneCallCurrentPoint{
+		Dt:      &dt,
+		Sunrise: &sunrise,
+		Sunset:  &sunset,
+		Weather: current.Weather,
+	}
+	if presence == nil {
+		return point
+	}
+
+	point.Temp = presence.Temp
+	point.FeelsLike = presence.FeelsLike
+	point.Pressure = presence.Pressure
+	point.Humidity = presence.Humidity
+	point.DewPoint = presence.DewPoint
+	point.Uvi = presence.Uvi
+	point.Clouds = presence.Clouds
+	point.Visibility = presence.Visibility
+	point.WindSpeed = presence.WindSpeed
+	point.WindDeg = presence.WindDeg
+	point.WindGust = presence.WindGust
+
+	return point
+}
+
+// oneCallDailyPoint maps one upstream daily entry.
+//
+// The timestamps, the lunar members, the weather array, the pressure and the cloud
+// cover are read from the decode struct: the upstream documents all of them as sent
+// on every day, so their zeroes are readings. A moonrise of 0 is the moon not rising
+// on that day at that latitude, which is a reading and not a gap.
+//
+// The two breakdown blocks are gated on the payload and filled from the decode
+// struct, because their members are documented as unconditionally sent and the block
+// itself is the only thing that can be missing. Everything else is taken from the
+// payload, value and presence together, so a day the upstream could not measure
+// reports null rather than a fabricated zero.
+func oneCallDailyPoint(day models.DailyForecast, presence models.SevenDayPayloadDaily) models.OneCallDailyPoint {
+	dt, sunrise, sunset := day.Dt, day.Sunrise, day.Sunset
+	moonrise, moonset, moonPhase := day.Moonrise, day.Moonset, day.MoonPhase
+	pressure, clouds := day.Pressure, day.Clouds
+
+	point := models.OneCallDailyPoint{
+		Dt:        &dt,
+		Sunrise:   &sunrise,
+		Sunset:    &sunset,
+		Moonrise:  &moonrise,
+		Moonset:   &moonset,
+		MoonPhase: &moonPhase,
+		Pressure:  &pressure,
+		Clouds:    &clouds,
+		Weather:   day.Weather,
+
+		Humidity:  presence.Humidity,
+		DewPoint:  presence.DewPoint,
+		WindSpeed: presence.WindSpeed,
+		WindDeg:   presence.WindDeg,
+		WindGust:  presence.WindGust,
+		Pop:       presence.Pop,
+		Rain:      presence.Rain,
+		Snow:      presence.Snow,
+		Uvi:       presence.Uvi,
+	}
+
+	if presence.Temp != nil {
+		dayTemp, min, max := day.Temp.Day, day.Temp.Min, day.Temp.Max
+		night, morn, eve := day.Temp.Night, day.Temp.Morn, day.Temp.Eve
+		point.Temp = &models.TempPoint{
+			Day:   &dayTemp,
+			Min:   &min,
+			Max:   &max,
+			Night: &night,
+			Morn:  &morn,
+			Eve:   &eve,
+		}
+	}
+	if presence.FeelsLike != nil {
+		dayFeels, night, morn, eve := day.FeelsLike.Day, day.FeelsLike.Night, day.FeelsLike.Morn, day.FeelsLike.Eve
+		point.FeelsLike = &models.FeelsLikePoint{
+			Day:   &dayFeels,
+			Night: &night,
+			Morn:  &morn,
+			Eve:   &eve,
+		}
+	}
+
+	return point
+}
+
+// oneCallLegacyDay builds the legacy day from the same upstream entry and the same
+// presence value the faithful day is built from, so the two vocabularies report one
+// set of readings between them.
+//
+// Every reading the route may be unable to measure is a pointer on models.Forecast,
+// which is what keeps a day the upstream sent without a temp, pop or uvi from
+// becoming a row of zeroes. The condition, description and icon come from the first
+// weather entry, as they always have. Precipitation is the sum of the two volumes the
+// upstream reported, and a day that reported neither is a total of 0 rather than a
+// null, because nothing falling on a day is an answer and not an absence.
+func oneCallLegacyDay(day models.DailyForecast, presence models.SevenDayPayloadDaily) models.Forecast {
+	var condition, description, icon string
+	if len(day.Weather) > 0 {
+		condition = day.Weather[0].Main
+		description = day.Weather[0].Description
+		icon = day.Weather[0].Icon
+	}
+
+	legacy := models.Forecast{
+		Date:        time.Unix(day.Dt, 0),
+		Condition:   condition,
+		Description: strings.Title(description),
+		Icon:        icon,
+		Humidity:    presence.Humidity,
+		WindSpeed:   presence.WindSpeed,
+		// The ultraviolet index is the day's uvi when the upstream sent one and null
+		// when it did not, the same rule the faithful day follows and the opposite of
+		// the permanent 0 this key used to carry.
+		UVIndex: presence.Uvi,
+	}
+
+	if presence.Temp != nil {
+		max, min, avg := day.Temp.Max, day.Temp.Min, day.Temp.Day
+		legacy.MaxTemp = &max
+		legacy.MinTemp = &min
+		legacy.AvgTemp = &avg
+	}
+
+	if presence.Pop != nil {
+		// Rounded, and not truncated, because a truncation reports a probability the
+		// upstream never gave: 0.29 is 28.999999999999996 in binary floating point, so
+		// a plain int() call would answer 28 for a day the upstream called 29 percent.
+		// The five day route rounds the same way, and a probability that reads
+		// differently on two routes is a bug whichever route is right.
+		chanceOfRain := int(math.Round(*presence.Pop * 100))
+		legacy.ChanceOfRain = &chanceOfRain
+	}
+
+	if presence.Rain != nil {
+		legacy.Precipitation += *presence.Rain
+	}
+	if presence.Snow != nil {
+		legacy.Precipitation += *presence.Snow
+	}
+
+	return legacy
 }
 
 // currentFromOneCall maps the One Call current block onto our model. The block is

@@ -2,14 +2,6 @@ package models
 
 import "time"
 
-// WeatherData represents the main weather information
-type WeatherData struct {
-	Location    Location   `json:"location"`
-	Current     Current    `json:"current"`
-	Forecast    []Forecast `json:"forecast,omitempty"`
-	RequestTime time.Time  `json:"request_time"`
-}
-
 // Location represents geographical location information
 type Location struct {
 	Name      string  `json:"name"`
@@ -40,20 +32,34 @@ type Current struct {
 	LastUpdated time.Time `json:"last_updated"`
 }
 
-// Forecast represents weather forecast for a specific day
+// Forecast represents weather forecast for a specific day.
+//
+// This is the legacy vocabulary of the seven day route, and every reading on it is
+// a pointer except the two that are not measurements. The route can fail to measure
+// any of them: a daily entry the upstream sent without a temp block has no
+// temperature, one sent without pop has no probability, and one sent without uvi has
+// no ultraviolet index. As values those three cases would have been a row of zeroes,
+// which reads as a forecast of exactly average weather rather than as a gap, so they
+// are pointers and an unmeasurable day reports null. For a real body the JSON is byte
+// identical, because a non-nil pointer to a value serialises as that value.
+//
+// Date, Condition, Description and Icon stay values: a timestamp and three strings
+// the upstream sends whenever it sends a day. Precipitation stays a value for the
+// reason ForecastDay.Precipitation does: a total of zero is a real answer for a day
+// nothing fell on, not an absence, and the legacy key has always been a number.
 type Forecast struct {
 	Date          time.Time `json:"date"`
-	MaxTemp       float64   `json:"max_temperature"`
-	MinTemp       float64   `json:"min_temperature"`
-	AvgTemp       float64   `json:"avg_temperature"`
+	MaxTemp       *float64  `json:"max_temperature"`
+	MinTemp       *float64  `json:"min_temperature"`
+	AvgTemp       *float64  `json:"avg_temperature"`
 	Condition     string    `json:"condition"`
 	Description   string    `json:"description"`
 	Icon          string    `json:"icon"`
-	Humidity      int       `json:"humidity"`
-	WindSpeed     float64   `json:"wind_speed"`
+	Humidity      *int      `json:"humidity"`
+	WindSpeed     *float64  `json:"wind_speed"`
 	Precipitation float64   `json:"precipitation"`
-	ChanceOfRain  int       `json:"chance_of_rain"`
-	UVIndex       float64   `json:"uv_index"`
+	ChanceOfRain  *int      `json:"chance_of_rain"`
+	UVIndex       *float64  `json:"uv_index"`
 }
 
 // WeatherRequest represents incoming API request parameters

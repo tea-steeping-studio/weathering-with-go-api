@@ -618,7 +618,7 @@ func TestMapForecastReturnsEarliestDaysInOrder(t *testing.T) {
 	}
 }
 
-func TestConvertOneCallResponsePopulatesCurrent(t *testing.T) {
+func TestMapOneCallPopulatesCurrent(t *testing.T) {
 	svc := NewWeatherService("dummy")
 	owm := models.OneCallResponse{
 		Current: &models.OneCallCurrent{
@@ -637,7 +637,14 @@ func TestConvertOneCallResponsePopulatesCurrent(t *testing.T) {
 		},
 	}
 
-	data := svc.convertOneCallResponse(owm, &models.Location{Name: "London"})
+	// The legacy block is derived from the decode struct alone. The faithful twin is
+	// built from the same upstream object and needs a presence view to read a
+	// measurement, which is why the payload is passed here even though the legacy
+	// assertions above would pass without one.
+	temp, humidity := 12.4, 64
+	payload := models.SevenDayPayload{Current: &models.SevenDayPayloadCurrent{Temp: &temp, Humidity: &humidity}}
+
+	data := svc.mapOneCall(owm, payload, &models.Location{Name: "London"})
 
 	wantUpdated := time.Unix(1772000000, 0)
 	got := data.Current
@@ -659,14 +666,35 @@ func TestConvertOneCallResponsePopulatesCurrent(t *testing.T) {
 	if !got.LastUpdated.Equal(wantUpdated) {
 		t.Fatalf("expected last_updated %s got %s", wantUpdated, got.LastUpdated)
 	}
+	// The legacy block is derived from the decode struct alone, so the faithful twin
+	// is built from the same value and reports the same readings beside it.
+	if data.OneCall == nil || data.OneCall.Current == nil {
+		t.Fatal("expected the faithful current block to be present, got none")
+	}
+	faithful := data.OneCall.Current
+	if faithful.Temp == nil || *faithful.Temp != 12.4 {
+		t.Fatalf("expected the faithful current temp 12.4, got %#v", faithful.Temp)
+	}
+	if faithful.Humidity == nil || *faithful.Humidity != 64 {
+		t.Fatalf("expected the faithful current humidity 64, got %#v", faithful.Humidity)
+	}
 }
 
-func TestConvertOneCallResponseWithoutCurrentBlock(t *testing.T) {
+func TestMapOneCallWithoutCurrentBlock(t *testing.T) {
 	svc := NewWeatherService("dummy")
 
-	data := svc.convertOneCallResponse(models.OneCallResponse{}, &models.Location{Name: "London"})
+	data := svc.mapOneCall(models.OneCallResponse{}, models.SevenDayPayload{}, &models.Location{Name: "London"})
 
 	if data.Current.Temperature != 0 || data.Current.Condition != "" {
 		t.Fatalf("expected zero current when the block is absent, got %+v", data.Current)
+	}
+	// The faithful block is the one place the route can say outright that the
+	// upstream reported no current conditions, which the legacy vocabulary has no
+	// way to express.
+	if data.OneCall == nil {
+		t.Fatal("expected the onecall envelope to be present, got none")
+	}
+	if data.OneCall.Current != nil {
+		t.Fatalf("expected no faithful current block, got %#v", data.OneCall.Current)
 	}
 }

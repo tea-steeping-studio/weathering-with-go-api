@@ -18,10 +18,10 @@ import "time"
 // decode targets whose zero values are correct, and several of them carry
 // omitempty, which drops a measured 0 on the floor.
 //
-// CurrentWeatherPayload and ForecastPayload, the last two types in this file, are
-// the decode-side types among them: pointer-shaped views of the same bodies, kept
-// beside the upstream structs they complement and the schemas they feed. Their own
-// doc comments say why they have to exist.
+// CurrentWeatherPayload, ForecastPayload and SevenDayPayload, the last three
+// types in this file, are the decode-side types among them: pointer-shaped views of
+// the same bodies, kept beside the upstream structs they complement and the schemas
+// they feed. Their own doc comments say why they have to exist.
 
 // MainBlock represents the main block of the /data/2.5 endpoints. sea_level and
 // grnd_level are reported only for points near sea level or the ground, so they
@@ -437,4 +437,210 @@ type ForecastPayloadWind struct {
 // because /data/2.5/forecast does not document it; see RainBlock.
 type ForecastPayloadPrecip struct {
 	ThreeHour *float64 `json:"3h"`
+}
+
+// OneCallCurrentPoint is the faithful current block of /data/3.0/onecall, in
+// upstream field order. Every member is a pointer, because the decode struct this
+// is read beside is a non-pointer target where a member the upstream measured as 0
+// and a member it never sent are the same zero.
+//
+// The block documents no probability, so there is no pop here to copy from
+// /forecast's: minutely[].precipitation is a probability and current is not. The
+// legacy current block on this route reports max_temperature and min_temperature as
+// 0 and has always done so, because this block carries no extremes of its own; the
+// day carries them, as a time of day breakdown.
+type OneCallCurrentPoint struct {
+	Dt         *int64    `json:"dt"`
+	Sunrise    *int64    `json:"sunrise"`
+	Sunset     *int64    `json:"sunset"`
+	Temp       *float64  `json:"temp"`
+	FeelsLike  *float64  `json:"feels_like"`
+	Pressure   *int      `json:"pressure"`
+	Humidity   *int      `json:"humidity"`
+	DewPoint   *float64  `json:"dew_point"`
+	Uvi        *float64  `json:"uvi"`
+	Clouds     *int      `json:"clouds"`
+	Visibility *int      `json:"visibility"`
+	WindSpeed  *float64  `json:"wind_speed"`
+	WindDeg    *int      `json:"wind_deg"`
+	WindGust   *float64  `json:"wind_gust"`
+	Weather    []Weather `json:"weather"`
+}
+
+// OneCallDailyPoint is one entry of the faithful daily[] array, in the upstream
+// field order of /data/3.0/onecall. It is uncapped: the array is whatever the
+// upstream sent, which is a different thing from the legacy array this route also
+// reports, capped at seven days.
+//
+// Temp and FeelsLike reuse the shared breakdown types rather than declaring their
+// own. /onecall is the endpoint that fills every member of both, so the nullability
+// rule is the shared one: a member the upstream sent as 0 is 0 and a member it never
+// sent is null. A block the upstream did not send is a nil block, which is a third
+// state distinct from both.
+//
+// Rain and Snow are plain volumes in millimetres and are not the rain and snow
+// blocks of the /data/2.5 endpoints, so they take neither RainBlock nor SnowBlock.
+// Those two types describe a {1h} or {3h} window inside a block; this endpoint
+// reports a total for the day and has no window to describe.
+type OneCallDailyPoint struct {
+	Dt        *int64          `json:"dt"`
+	Sunrise   *int64          `json:"sunrise"`
+	Sunset    *int64          `json:"sunset"`
+	Moonrise  *int64          `json:"moonrise"`
+	Moonset   *int64          `json:"moonset"`
+	MoonPhase *float64        `json:"moon_phase"`
+	Temp      *TempPoint      `json:"temp"`
+	FeelsLike *FeelsLikePoint `json:"feels_like"`
+	Pressure  *int            `json:"pressure"`
+	Humidity  *int            `json:"humidity"`
+	DewPoint  *float64        `json:"dew_point"`
+	WindSpeed *float64        `json:"wind_speed"`
+	WindDeg   *int            `json:"wind_deg"`
+	WindGust  *float64        `json:"wind_gust"`
+	Weather   []Weather       `json:"weather"`
+	Clouds    *int            `json:"clouds"`
+	Pop       *float64        `json:"pop"`
+	Rain      *float64        `json:"rain"`
+	Snow      *float64        `json:"snow"`
+	Uvi       *float64        `json:"uvi"`
+}
+
+// OneCallEnvelope is the faithful /data/3.0/onecall body, namespaced under one key.
+//
+// The namespace is not cosmetic. The legacy current block and the faithful One Call
+// current object both want the JSON key current, and two Go fields cannot share one
+// tag, so grouping the faithful data under onecall removes the collision and leaves
+// the legacy location, current, forecast and request_time keys exactly where they
+// were. The three opt-in arrays live at onecall.minutely, onecall.hourly and
+// onecall.alerts.
+//
+// The envelope is always present, so a caller who asks for no opt-in block still
+// receives lat, lon, timezone, timezone_offset, current and daily. The three opt-in
+// members carry omitempty so an unexposed block is absent rather than a null array
+// that reads as a block the upstream reported and found empty. The array is only
+// cleared after this body is built, so the member being a pointer is what makes that
+// possible: the cached response is shared by every concurrent caller and must never
+// be trimmed in place.
+//
+// The four scalars are values. The upstream documents all of them as sent whenever
+// the endpoint answers, and a latitude of 0 and a timezone offset of 0 are both real
+// readings at the places that have them.
+//
+// Daily has no omitempty, so the key is there even when the upstream sent no day at
+// all, in which case it is null.
+type OneCallEnvelope struct {
+	Lat            float64              `json:"lat"`
+	Lon            float64              `json:"lon"`
+	Timezone       string               `json:"timezone"`
+	TimezoneOffset int                  `json:"timezone_offset"`
+	Current        *OneCallCurrentPoint `json:"current"`
+	Daily          []OneCallDailyPoint  `json:"daily"`
+	// Minutely, Hourly and Alerts reuse the upstream decode types, which is the one
+	// narrowing this route carries: a measured zero inside one of them is
+	// indistinguishable from an absent member. They carry no omitempty of their own,
+	// so nothing in them can drop a reading the upstream measured; see
+	// SevenDayPayload, whose doc says what is pointer-shaped here and what is not.
+	Minutely []Minutely `json:"minutely,omitempty"`
+	Hourly   []Hourly   `json:"hourly,omitempty"`
+	Alerts   []Alert    `json:"alerts,omitempty"`
+}
+
+// SevenDayResponse is the body of GET|POST /api/v1/weather/forecast/7day, served
+// inside the {"success":true,"data":{...}} envelope.
+//
+// The first group is the faithful mirror of /data/3.0/onecall, under one key; see
+// OneCallEnvelope for why it is namespaced. The second group is the legacy
+// vocabulary, unchanged, so existing consumers keep working. Forecast is a slice
+// with no omitempty, where the envelope this type replaces had one, so the key is
+// always present: an upstream with no daily entry now reports "forecast":[] rather
+// than no key at all.
+type SevenDayResponse struct {
+	OneCall *OneCallEnvelope `json:"onecall"`
+
+	Location    Location   `json:"location"`
+	Current     Current    `json:"current"`
+	Forecast    []Forecast `json:"forecast"`
+	RequestTime time.Time  `json:"request_time"`
+}
+
+// SevenDayPayload is a pointer-shaped mirror of the /data/3.0/onecall body and the
+// authority on which members the upstream actually sent.
+//
+// It exists beside OneCallResponse because that struct and every type it holds are
+// non-pointer decode targets, where a member the upstream measured as 0 and a member
+// it never sent are the same zero. A response that has to report the difference
+// cannot be built from them, so the body is decoded twice from the same
+// already-fetched bytes: the mapper takes values from the upstream struct where the
+// upstream documents the member as sent, and reads both value and presence from here
+// for everything else. That is one upstream request, not two. A newly documented
+// upstream field has to be added to both types, because a field missing from this one
+// is reported as null even when the upstream did send it.
+// TestSevenDayPayloadCoversDecodedFields is the guard on that, and its allowlist
+// names every JSON member this type deliberately narrows.
+//
+// The rule for what is declared here is two questions asked of each member of the
+// current and daily blocks: can the upstream omit it for reasons of its own, and does
+// anything the response reports derive from it? A member that fails both is read
+// from the upstream struct and allowlisted, because its zero is a real reading. A
+// member that passes either is declared, so an absent one is null rather than a
+// fabricated number. That is why humidity and wind_speed are here and pressure and
+// clouds are not: the first two are the readings the legacy array is built from, so
+// an absent one has to be able to reach that array as a null.
+//
+// The three opt-in arrays are not declared. Their response types are the upstream
+// decode types, so there is nothing for a payload to tell the mapper that those
+// types could not then act on, and every member of them is allowlisted with that
+// reason rather than left to a comment. That is the one place on this route where a
+// measured zero and an absent member are reported the same way.
+//
+// The current block and the daily array are walked by index: index i of Daily is the
+// presence view of index i of OneCallResponse.Daily. Both decodes read one array in
+// the same order, so a body whose daily array is longer than this one's cannot
+// happen, and a member either of them cannot type fails the request rather than
+// shortening it.
+type SevenDayPayload struct {
+	Current *SevenDayPayloadCurrent `json:"current"`
+	Daily   []SevenDayPayloadDaily  `json:"daily"`
+}
+
+// SevenDayPayloadCurrent declares the current block's measurements. The timestamps
+// and the weather array are read from the upstream struct, where a zero is a real
+// reading and an absent array is already reported as null by the response type.
+type SevenDayPayloadCurrent struct {
+	Temp       *float64 `json:"temp"`
+	FeelsLike  *float64 `json:"feels_like"`
+	Pressure   *int     `json:"pressure"`
+	Humidity   *int     `json:"humidity"`
+	DewPoint   *float64 `json:"dew_point"`
+	Uvi        *float64 `json:"uvi"`
+	Clouds     *int     `json:"clouds"`
+	Visibility *int     `json:"visibility"`
+	WindSpeed  *float64 `json:"wind_speed"`
+	WindDeg    *int     `json:"wind_deg"`
+	WindGust   *float64 `json:"wind_gust"`
+}
+
+// SevenDayPayloadDaily declares the measurements on one daily entry.
+//
+// Temp and FeelsLike carry no members on purpose. The six and four members inside
+// those blocks are documented as unconditionally sent, so the mapper reads those
+// values from the upstream struct and needs only the pointer to know the block was
+// there at all. The eleven measurements below are read from here, value and
+// presence together, so the response and the legacy array cannot report a reading
+// this body did not carry.
+//
+// Rain and Snow are volumes in millimetres. A day nothing fell on carries neither,
+// which is a different reading from a day the upstream measured a volume of 0.
+type SevenDayPayloadDaily struct {
+	Temp      *struct{} `json:"temp"`
+	FeelsLike *struct{} `json:"feels_like"`
+	Humidity  *int      `json:"humidity"`
+	DewPoint  *float64  `json:"dew_point"`
+	WindSpeed *float64  `json:"wind_speed"`
+	WindDeg   *int      `json:"wind_deg"`
+	WindGust  *float64  `json:"wind_gust"`
+	Pop       *float64  `json:"pop"`
+	Rain      *float64  `json:"rain"`
+	Snow      *float64  `json:"snow"`
+	Uvi       *float64  `json:"uvi"`
 }
