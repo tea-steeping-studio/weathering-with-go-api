@@ -475,7 +475,6 @@ var forecastPayloadNarrowed = map[string]string{
 	"list.wind.deg":        forecastSlotSent,
 	"list.rain.1h":         forecastNoHourWindow,
 	"list.snow.1h":         forecastNoHourWindow,
-	"list.sys.pod":         forecastSlotSent,
 }
 
 // The one call route has the same drift hazard as the other two, and a larger

@@ -435,13 +435,12 @@ type ForecastResponse struct {
 // slot, and the daily rollup excludes the slots that carry none from pop, pop_min
 // and pop_mean alike.
 //
-// ForecastItem.Sys is read by nobody, for the reason models.Rain and models.Snow
+// ForecastItem.Sys is still read by nobody, for the reason models.Rain and models.Snow
 // are still decoded on the current route: the decode struct's job is to be a mirror
 // of the upstream schema, and a member dropped from it because no mapper wants it
-// would be a member the guards could no longer see. Its zero is also a real reading,
-// since the endpoint sends a pod whenever the sys block is there, so nothing in this
-// type could have done the job better. Do not read pod from it: a body of "sys":{}
-// decodes to an empty string there, which is a fabrication.
+// would be a member the guards could no longer see. The slot's pod is read from this
+// payload's ForecastPayloadSys instead, because a body of "sys":{} is a block the
+// upstream sent with no pod in it, which is not a pod of "".
 type ForecastPayload struct {
 	// City carries no members on purpose. Every member the block reports is
 	// unconditionally sent, so the mapper reads those values from the upstream
@@ -451,9 +450,9 @@ type ForecastPayload struct {
 }
 
 // ForecastPayloadItem is the presence view of one three hour slot. Its members are
-// the slots' conditional ones; dt, dt_txt, weather, the always sent members of
-// main, wind and clouds, and the always sent members of sys are read from the
-// upstream struct.
+// the slots' conditional ones; dt, dt_txt, weather and the always sent members of
+// main, wind and clouds are read from the upstream struct. The sys block is here
+// because a pod is not guaranteed to be in a block the upstream sent.
 type ForecastPayloadItem struct {
 	Main       *ForecastPayloadMain   `json:"main"`
 	Wind       *ForecastPayloadWind   `json:"wind"`
